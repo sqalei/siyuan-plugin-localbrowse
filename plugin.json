@@ -1,0 +1,36 @@
+{
+    "name": "siyuan-plugin-localbrowse",
+    "author": "sqalei",
+    "url": "https://github.com/sqalei/siyuan-plugin-localbrowse",
+    "version": "0.4.0",
+    "minAppVersion": "3.0.0",
+    "backends": [
+        "windows",
+        "linux",
+        "darwin"
+    ],
+    "frontends": [
+        "desktop",
+        "desktop-window"
+    ],
+    "icon": "icon.png",
+    "displayName": {
+        "default": "LocalBrowse",
+        "zh_CN": "本地文件浏览器"
+    },
+    "description": {
+        "default": "Browse local files in dock panel. Double-click to insert as local link, or right-click to copy to assets",
+        "zh_CN": "在Dock面板快速浏览本地文件，便捷插入本地文件链接为思源附件"
+    },
+    "readme": {
+        "default": "README.md",
+        "zh_CN": "README_zh_CN.md"
+    },
+    "keywords": [
+        "local",
+        "file browser",
+        "mount",
+        "attachment",
+        "本地文件"
+    ]
+}

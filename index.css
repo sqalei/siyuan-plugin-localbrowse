@@ -1,0 +1,140 @@
+/* LocalBrowse Plugin Styles */
+
+.cd-container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 4px;
+    box-sizing: border-box;
+    font-size: 13px;
+    overflow: hidden;
+}
+
+.cd-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--b3-border, #eee);
+    transition: background 0.15s ease;
+    user-select: none;
+}
+
+.cd-item:hover {
+    background: var(--b3-theme-hover, #e3f2fd);
+}
+
+.cd-item.cd-parent {
+    background: var(--b3-theme-surface, #fafafa);
+}
+
+.cd-item.cd-parent:hover {
+    background: var(--b3-theme-hover, #e8f4fd);
+}
+
+.cd-item .cd-icon {
+    font-size: 16px;
+    margin-right: 8px;
+    flex-shrink: 0;
+    width: 22px;
+    text-align: center;
+}
+
+.cd-item .cd-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 13px;
+}
+
+.cd-item .cd-size {
+    font-size: 11px;
+    color: var(--b3-theme-secondary, #999);
+    margin-left: 8px;
+    flex-shrink: 0;
+}
+
+#cd-breadcrumb {
+    font-size: 12px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: "SF Mono", "Cascadia Code", Monaco, monospace;
+    color: var(--b3-theme-on-surface, #666);
+}
+
+#cd-file-list {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--b3-border, #e0e0e0);
+    border-radius: 4px;
+    background: var(--b3-theme-background, #fff);
+    min-height: 0;
+}
+
+#cd-file-list::-webkit-scrollbar {
+    width: 6px;
+}
+
+#cd-file-list::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#cd-file-list::-webkit-scrollbar-thumb {
+    background: var(--b3-border, #ccc);
+    border-radius: 3px;
+}
+
+#cd-file-list::-webkit-scrollbar-thumb:hover {
+    background: var(--b3-theme-secondary, #999);
+}
+
+#cd-status-bar {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--b3-theme-secondary, #999);
+    text-align: center;
+    padding: 4px;
+}
+
+#cd-refresh {
+    padding: 4px 10px;
+    font-size: 11px;
+    background: #2196f3;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+#cd-refresh:hover {
+    background: #1976d2;
+}
+
+/* Loading and empty states */
+.cd-loading,
+.cd-empty,
+.cd-error {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    color: var(--b3-theme-secondary, #999);
+    font-size: 14px;
+    text-align: center;
+}
+
+.cd-error {
+    color: var(--b3-theme-error, #d32f2f);
+}
+
+/* Dark mode support */
+@media (prefers-color-scheme: dark) {
+    .cd-item:hover {
+        background: rgba(66, 133, 244, 0.15);
+    }
+}
