@@ -124,12 +124,7 @@ Browse local mounted drive files directly in SiYuan's dock panel. Click any file
 - Multi-drive support with dropdown selector
 - Improved breadcrumb navigation with home icon
 
-### v0.3.0
-- Rewrote file reading to use Node.js fs instead of SiYuan API
-- Files are now copied to assets folder instead of just linking
-- Added proper image/asset markdown insertion
-- Added duplicate filename handling with timestamps
-- Improved error handling and user feedback
+
 
 ## License
 
