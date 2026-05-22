@@ -128,4 +128,4 @@ Browse local mounted drive files directly in SiYuan's dock panel. Click any file
 
 ## License
 
-Copyright (C) 2026 sqalei. Licensed under the [GNU General Public License v3.0](LICENSE).
+Copyright (C) 2026 sqalei. Licensed under the [GNU General Public License v3.0](https://github.com/sqalei/siyuan-plugin-localbrowse/blob/main/LICENSE).

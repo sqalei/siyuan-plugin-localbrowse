@@ -11,8 +11,15 @@
   },
   "author": "sqalei",
   "minAppVersion": "3.0.0",
-  "backends": ["windows", "linux", "darwin"],
-  "frontends": ["desktop", "desktop-window"],
+  "backends": [
+    "windows",
+    "linux",
+    "darwin"
+  ],
+  "frontends": [
+    "desktop",
+    "desktop-window"
+  ],
   "readme": {
     "default": "README.md",
     "zh_CN": "README_zh_CN.md"
@@ -20,5 +27,13 @@
   "funding": {
     "custom": []
   },
-  "keywords": ["local", "file browser", "mount", "attachment"]
+  "keywords": [
+    "local",
+    "file browser",
+    "mount",
+    "attachment"
+  ],
+  "devDependencies": {
+    "archiver": "^8.0.0"
+  }
 }

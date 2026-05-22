@@ -137,4 +137,4 @@
 
 ## 许可证
 
-Copyright (C) 2026 sqalei. 基于 [GNU General Public License v3.0](LICENSE) 开源。
+Copyright (C) 2026 sqalei. 基于 [GNU General Public License v3.0](https://github.com/sqalei/siyuan-plugin-localbrowse/blob/main/LICENSE) 开源。

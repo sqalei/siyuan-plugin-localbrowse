@@ -92,6 +92,20 @@ class LocalBrowsePlugin extends Plugin {
             this._deepSearchAbort.cancelled = true;
             this._deepSearchAbort = null;
         }
+        // 清理 sortMenu 的 document 点击监听器
+        if (this._sortMenuClickHandler) {
+            document.removeEventListener('click', this._sortMenuClickHandler);
+            this._sortMenuClickHandler = null;
+        }
+    }
+
+    uninstall() {
+        console.log("[LocalBrowse] uninstall");
+        this.removeData('favorites');
+        this.removeData('sortSettings');
+        this.removeData('driveSettings');
+        this.removeData('viewSettings');
+        this.removeData('pathSettings');
     }
 
     registerIcons() {
@@ -2077,8 +2091,10 @@ class LocalBrowsePlugin extends Plugin {
             if (!menu.contains(e.target)) {
                 menu.remove();
                 document.removeEventListener('click', closeMenu);
+                that._sortMenuClickHandler = null;
             }
         };
+        this._sortMenuClickHandler = closeMenu;
         setTimeout(function() {
             document.addEventListener('click', closeMenu);
         }, 0);
