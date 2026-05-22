@@ -127,13 +127,26 @@ class LocalBrowsePlugin extends Plugin {
 
     registerDock() {
         var that = this;
+        // 安全获取 i18n dock 标题
+        var dockTitle = '本地文件';
+        try {
+            if (this.i18n) {
+                if (typeof this.i18n === 'function') {
+                    dockTitle = this.i18n('panel.dockTitle') || dockTitle;
+                } else if (this.i18n.panel && this.i18n.panel.dockTitle) {
+                    dockTitle = this.i18n.panel.dockTitle;
+                }
+            }
+        } catch(e) {
+            console.warn('[LocalBrowse] i18n fallback:', e);
+        }
         try {
             this.addDock({
                 config: {
                     position: 'RightTop',
                     size: { width: 300, height: 600 },
                     icon: 'iconLocalBrowse',
-                    title: this.i18n('panel.dockTitle') || 'Local Files',
+                    title: dockTitle,
                     show: true
                 },
                 data: {},
