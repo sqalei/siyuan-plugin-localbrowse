@@ -220,9 +220,10 @@ class LocalBrowsePlugin extends Plugin {
                 this.textContent = that.currentView === 'icon' ? '⊞' : '☰';
                 this.title = that.currentView === 'icon' ? '切换为列表视图' : '切换为图标视图';
                 that.saveViewSettings();
-                // 重新渲染当前目录
+                // 重新渲染当前目录（先排序，cachedFiles 是未排序的原始列表）
                 if (that.cachedFiles.length && that.cachedPath) {
-                    that.doRender(that.cachedFiles, that.cachedPath, '', that.isDeepSearchMode);
+                    var sorted = that.sortFiles(that.cachedFiles.slice());
+                    that.doRender(sorted, that.cachedPath, '', that.isDeepSearchMode);
                 } else {
                     that.loadDirectory(that.currentPath || that.driveLetter + ':\\');
                 }
