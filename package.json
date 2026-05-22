@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-localbrowse",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "displayName": {
     "default": "LocalBrowse",
     "zh_CN": "本地文件浏览器"
@@ -12,9 +12,7 @@
   "author": "sqalei",
   "minAppVersion": "3.0.0",
   "backends": [
-    "windows",
-    "linux",
-    "darwin"
+    "windows"
   ],
   "frontends": [
     "desktop",
