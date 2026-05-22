@@ -1847,21 +1847,49 @@ class LocalBrowsePlugin extends Plugin {
             var folder = filePath.substring(0, filePath.lastIndexOf('\\')) || filePath;
             var electron = window.require && window.require('electron');
             if (electron && electron.shell && electron.shell.showItemInFolder) {
-                // showItemInFolder 会打开文件夹并选中文件，同时确保窗口在前台
+                // showItemInFolder 会打开文件夹并选中文件
                 electron.shell.showItemInFolder(filePath);
+                // 强制激活资源管理器窗口到最前面（Windows）
+                this._activateExplorerWindow();
                 return;
             }
             if (electron && electron.shell && electron.shell.openPath) {
                 electron.shell.openPath(folder);
+                // 强制激活资源管理器窗口到最前面（Windows）
+                this._activateExplorerWindow();
                 return;
             }
         } catch (e) {}
         try {
             var cp = require('child_process');
-            // 使用 spawn 避免 shell 注入
-            cp.spawn('explorer', ['/select', filePath], { stdio: 'ignore', detached: true }).unref();
+            // 使用 spawn 避免 shell 注入，/separate 确保新窗口在前台
+            cp.spawn('explorer', ['/separate,', '/select,', filePath], { stdio: 'ignore', detached: true }).unref();
         } catch (e) {
             this.showToastMsg('无法打开文件夹，请手动访问');
+        }
+    }
+
+    /**
+     * 强制激活资源管理器窗口到最前面（Windows 专用）
+     */
+    _activateExplorerWindow() {
+        try {
+            var cp = require('child_process');
+            // 使用 PowerShell 激活资源管理器窗口
+            var psScript = [
+                '$shell = New-Object -ComObject Shell.Application',
+                '$windows = $shell.Windows()',
+                'if ($windows.Count -gt 0) {',
+                '    $last = $windows.Item($windows.Count - 1)',
+                '    if ($last) { $last.Activate() }',
+                '}'
+            ].join('; ');
+            cp.spawn('powershell', ['-WindowStyle', 'Hidden', '-Command', psScript], {
+                stdio: 'ignore',
+                detached: true
+            }).unref();
+        } catch (e) {
+            // 静默失败，不影响主功能
         }
     }
 
