@@ -1871,26 +1871,50 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 强制激活资源管理器窗口到最前面（Windows 专用）
+     * 使用 User32 API 的 SetForegroundWindow 确保窗口真正置顶
      */
     _activateExplorerWindow() {
-        try {
-            var cp = require('child_process');
-            // 使用 PowerShell 激活资源管理器窗口
-            var psScript = [
-                '$shell = New-Object -ComObject Shell.Application',
-                '$windows = $shell.Windows()',
-                'if ($windows.Count -gt 0) {',
-                '    $last = $windows.Item($windows.Count - 1)',
-                '    if ($last) { $last.Activate() }',
-                '}'
-            ].join('; ');
-            cp.spawn('powershell', ['-WindowStyle', 'Hidden', '-Command', psScript], {
-                stdio: 'ignore',
-                detached: true
-            }).unref();
-        } catch (e) {
-            // 静默失败，不影响主功能
-        }
+        var that = this;
+        // 延迟执行，等待资源管理器窗口创建完成
+        setTimeout(function() {
+            try {
+                var cp = require('child_process');
+                // 使用 PowerShell 调用 SetForegroundWindow Win32 API
+                var psScript = [
+                    'Add-Type @"',
+                    'using System;',
+                    'using System.Runtime.InteropServices;',
+                    'public class Win32 {',
+                    '    [DllImport("user32.dll")]',
+                    '    public static extern bool SetForegroundWindow(IntPtr hWnd);',
+                    '    [DllImport("user32.dll")]',
+                    '    public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);',
+                    '    [DllImport("user32.dll")]',
+                    '    public static extern bool IsWindow(IntPtr hWnd);',
+                    '}',
+                    '"@',
+                    '$shell = New-Object -ComObject Shell.Application',
+                    '$windows = $shell.Windows()',
+                    'if ($windows.Count -gt 0) {',
+                    '    $last = $windows.Item($windows.Count - 1)',
+                    '    if ($last -and $last.HWND) {',
+                    '        $hwnd = [IntPtr]::new($last.HWND)',
+                    '        if ([Win32]::IsWindow($hwnd)) {',
+                    '            [Win32]::ShowWindowAsync($hwnd, 1) | Out-Null',
+                    '            Start-Sleep -Milliseconds 100',
+                    '            [Win32]::SetForegroundWindow($hwnd) | Out-Null',
+                    '        }',
+                    '    }',
+                    '}'
+                ].join("`n");
+                cp.spawn('powershell', ['-WindowStyle', 'Hidden', '-Command', psScript], {
+                    stdio: 'ignore',
+                    detached: true
+                }).unref();
+            } catch (e) {
+                // 静默失败，不影响主功能
+            }
+        }, 300);
     }
 
     /**
