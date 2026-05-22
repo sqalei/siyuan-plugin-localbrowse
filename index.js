@@ -63,6 +63,37 @@ class LocalBrowsePlugin extends Plugin {
         this.registerDock();
     }
 
+    onunload() {
+        console.log("[LocalBrowse] onunload");
+        // 清理右键菜单残留的 document 级监听器
+        this.hideContextMenu();
+        // 清理滚动监听器
+        if (this._boundIconScroll) {
+            var fileListEl = document.getElementById('cd-file-list');
+            if (fileListEl) {
+                fileListEl.removeEventListener('scroll', this._boundIconScroll);
+            }
+            this._boundIconScroll = null;
+        }
+        // 清理预览计时器
+        if (this._previewTimer) {
+            clearTimeout(this._previewTimer);
+            this._previewTimer = null;
+        }
+        // 清理滚动防抖计时器
+        if (this._scrollTimer) {
+            clearTimeout(this._scrollTimer);
+            this._scrollTimer = null;
+        }
+        // 清理图标渲染状态
+        this.iconRenderState = null;
+        // 取消正在进行的深度搜索
+        if (this._deepSearchAbort) {
+            this._deepSearchAbort.cancelled = true;
+            this._deepSearchAbort = null;
+        }
+    }
+
     registerIcons() {
         // 文件夹图标
         var svg = '<symbol id="iconLocalBrowse" viewBox="0 0 24 24"><path d="M20 6h-8l-2-2H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2zm0 12H4V8h16v10z"/></symbol>';
@@ -221,6 +252,30 @@ class LocalBrowsePlugin extends Plugin {
         }
         if (clearBtn) {
             clearBtn.addEventListener('click', function() {
+                // 如果正在深度搜索，点击叉按钮取消搜索
+                if (that.isDeepSearchMode || that._deepSearchAbort) {
+                    that._searchIsCancelled = true;
+                    if (that._searchRenderTimer) {
+                        clearTimeout(that._searchRenderTimer);
+                        that._searchRenderTimer = null;
+                    }
+                    if (that._deepSearchAbort) {
+                        that._deepSearchAbort.cancelled = true;
+                        that._deepSearchAbort = null;
+                    }
+                    if (searchInput) {
+                        searchInput.disabled = false;
+                        searchInput.value = '';
+                        searchInput.focus();
+                    }
+                    clearBtn.style.display = 'none';
+                    that.isDeepSearchMode = false;
+                    that.cachedFiles = [];
+                    that.cachedPath = '';
+                    that.loadDirectory(that.preSearchPath);
+                    return;
+                }
+                // 普通状态：清空搜索框
                 if (searchInput) {
                     searchInput.value = '';
                     clearBtn.style.display = 'none';
@@ -254,6 +309,18 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadDirectory(dirPath) {
         var that = this;
+
+        // 取消正在进行的深度搜索（如果有）
+        if (this._deepSearchAbort) {
+            this._deepSearchAbort.cancelled = true;
+            this._deepSearchAbort = null;
+        }
+        this._searchIsCancelled = true;
+        if (this._searchRenderTimer) {
+            clearTimeout(this._searchRenderTimer);
+            this._searchRenderTimer = null;
+        }
+
         this.currentPath = dirPath;
         this.savePathSettings();
 
@@ -281,6 +348,7 @@ class LocalBrowsePlugin extends Plugin {
         // 切换目录时清空搜索和深度搜索状态
         if (searchInput) {
             searchInput.value = '';
+            searchInput.disabled = false;
             this.cachedFiles = [];
             this.cachedPath = '';
             this.isDeepSearchMode = false;
@@ -519,8 +587,8 @@ class LocalBrowsePlugin extends Plugin {
         var order = that.sortOrder === 'asc' ? 1 : -1;
 
         files.sort(function(a, b) {
-            // 文件夹始终在文件前面（除非按大小或修改时间排序时混合）
-            if (sortBy === 'name' && a.isDir !== b.isDir) {
+            // 文件夹始终在文件前面（无论按什么排序）
+            if (a.isDir !== b.isDir) {
                 return a.isDir ? -1 : 1;
             }
 
@@ -539,7 +607,7 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 开始深度搜索（递归搜索子目录）
+     * 开始深度搜索（递归搜索子目录，渐进式返回结果）
      */
     startDeepSearch(query) {
         var that = this;
@@ -549,35 +617,101 @@ class LocalBrowsePlugin extends Plugin {
 
         if (!fileListEl) return;
 
+        // 如果正在搜索，先取消上一次
+        if (this._deepSearchAbort) {
+            this._deepSearchAbort.cancelled = true;
+        }
+
         // 保存搜索前的目录，用于返回
         this.preSearchPath = this.currentPath || this.driveLetter + ':\\';
 
-        // 禁用搜索框并显示 loading
+        // 禁用搜索框并显示 loading，同时显示叉按钮用于取消
         if (searchInput) searchInput.disabled = true;
-        that.renderSearchBreadcrumb(query, true);
+        var clearBtn = document.getElementById('cd-clear-search');
+        if (clearBtn) clearBtn.style.display = 'block';
+        that.renderSearchBreadcrumb(query, true, 0);
         fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">正在深度搜索...</div>';
 
-        this.deepSearch(this.currentPath || this.driveLetter + ':\\', query, function(results) {
+        // 渐进式渲染状态
+        var partialResults = [];
+        that._searchRenderTimer = null;
+        var isFinished = false;
+        that._searchIsCancelled = false;
+        var currentSearchedDirs = 0;
+        var currentMatchedFiles = 0;
+
+        var pendingRender = false;
+
+        function scheduleRender() {
+            if (that._searchIsCancelled) return;
+            pendingRender = true;
+            if (that._searchRenderTimer) return; // 已有待渲染的定时器，标记 pending 后返回
+            that._searchRenderTimer = setTimeout(function() {
+                that._searchRenderTimer = null;
+                if (!isFinished && !that._searchIsCancelled) {
+                    pendingRender = false;
+                    // 渐进渲染时更新面包屑进度
+                    that.renderSearchBreadcrumb(query, true, partialResults.length, currentSearchedDirs);
+                    if (partialResults.length > 0) {
+                        that.doRender(partialResults.slice(), that.currentPath, query, true);
+                    } else {
+                        // 没有匹配结果时也更新文件列表区域的进度
+                        fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">正在深度搜索...（已搜索 ' + currentSearchedDirs + ' 个目录）</div>';
+                    }
+                    // 如果在定时器执行期间又有新的更新请求，继续调度下一次渲染
+                    if (pendingRender) {
+                        scheduleRender();
+                    }
+                }
+            }, 200); // 每 200ms 刷新一次结果
+        }
+
+        function onPartialResult(items, searchedDirs, matchedFiles) {
+            if (that._searchIsCancelled) return;
+            partialResults = partialResults.concat(items);
+            currentSearchedDirs = searchedDirs || currentSearchedDirs;
+            currentMatchedFiles = matchedFiles || currentMatchedFiles;
+            scheduleRender();
+        }
+
+        this.deepSearch(this.currentPath || this.driveLetter + ':\\', query, onPartialResult, function(finalResults, wasCancelled) {
+            if (that._searchRenderTimer) {
+                clearTimeout(that._searchRenderTimer);
+                that._searchRenderTimer = null;
+            }
+            isFinished = true;
+
             if (searchInput) searchInput.disabled = false;
+
+            // 如果已取消，且用户已经通过 loadDirectory 导航走了（不在深度搜索模式），则不再更新 UI
+            if (wasCancelled || that._searchIsCancelled) {
+                if (that.isDeepSearchMode) {
+                    // 用户还没导航走，显示"已取消"状态
+                    that.renderSearchBreadcrumb(query, false, 0);
+                    fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">搜索已取消</div>';
+                }
+                return;
+            }
+
             // 保存深度搜索结果到缓存，支持后续实时过滤
-            that.cachedFiles = results;
+            that.cachedFiles = finalResults;
             that.cachedPath = that.currentPath;
             that.isDeepSearchMode = true;
 
-            if (results.length === 0) {
-                that.renderSearchBreadcrumb(query, false);
+            if (finalResults.length === 0) {
+                that.renderSearchBreadcrumb(query, false, 0);
                 fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">未找到匹配文件</div>';
                 return;
             }
-            that.renderSearchBreadcrumb(query, false);
-            that.doRender(results, that.currentPath, query, true);
+            that.renderSearchBreadcrumb(query, false, finalResults.length);
+            that.doRender(finalResults, that.currentPath, query, true);
         });
     }
 
     /**
-     * 渲染深度搜索时的面包屑（带返回按钮）
+     * 渲染深度搜索时的面包屑（带返回按钮和进度信息）
      */
-    renderSearchBreadcrumb(query, isLoading) {
+    renderSearchBreadcrumb(query, isLoading, resultCount, searchedDirs) {
         var that = this;
         var breadcrumbEl = document.getElementById('cd-breadcrumb');
         if (!breadcrumbEl) return;
@@ -586,7 +720,23 @@ class LocalBrowsePlugin extends Plugin {
         breadcrumbEl.style.cursor = 'default';
 
         var searchLabel = document.createElement('span');
-        searchLabel.textContent = isLoading ? '🔍 深度搜索: ' + query + '（搜索中...）' : '🔍 深度搜索: ' + query;
+        if (isLoading) {
+            var progress = '🔍 深度搜索: ' + query + '（';
+            var parts = [];
+            if (typeof searchedDirs === 'number' && searchedDirs > 0) {
+                parts.push('已搜索 ' + searchedDirs + ' 个目录');
+            }
+            if (typeof resultCount === 'number' && resultCount > 0) {
+                parts.push('找到 ' + resultCount + ' 个结果');
+            }
+            if (parts.length === 0) {
+                parts.push('搜索中...');
+            }
+            progress += parts.join('，') + '）';
+            searchLabel.textContent = progress;
+        } else {
+            searchLabel.textContent = '🔍 深度搜索: ' + query;
+        }
         searchLabel.style.fontWeight = 'bold';
         searchLabel.style.color = 'var(--b3-theme-on-background,#333)';
         breadcrumbEl.appendChild(searchLabel);
@@ -597,6 +747,16 @@ class LocalBrowsePlugin extends Plugin {
             sep.style.margin = '0 8px';
             sep.style.color = 'var(--b3-theme-secondary,#999)';
             breadcrumbEl.appendChild(sep);
+
+            // 搜索完成：显示结果计数和返回按钮
+            if (typeof resultCount === 'number') {
+                var countLabel = document.createElement('span');
+                countLabel.textContent = resultCount + ' 个结果';
+                countLabel.style.color = 'var(--b3-theme-secondary,#999)';
+                countLabel.style.marginRight = '8px';
+                countLabel.style.fontSize = '12px';
+                breadcrumbEl.appendChild(countLabel);
+            }
 
             var backBtn = document.createElement('span');
             backBtn.textContent = '↩ 返回';
@@ -624,32 +784,119 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 递归搜索子目录中的文件（最大深度 5）
+     * 递归搜索子目录中的文件（异步版本，无深度限制）
+     * 支持取消：新的搜索会自动取消上一次搜索
+     * 支持渐进式返回：每搜完一个目录就通过 onPartial 回调返回当前批次结果
+     * @param {string} dirPath - 搜索根目录
+     * @param {string} query - 搜索关键词
+     * @param {Function} onPartial - 渐进式回调，参数为新增结果数组
+     * @param {Function} onComplete - 完成回调，参数为全部结果数组
      */
-    deepSearch(dirPath, query, callback) {
+    async deepSearch(dirPath, query, onPartial, onComplete) {
         var that = this;
-        var results = [];
-        var pending = 1;
-        var maxDepth = 5;
-        var lowerQuery = query.toLowerCase();
+        var allResults = [];
+        // 支持多关键词：空格分隔，所有关键词都必须匹配（AND 逻辑）
+        var keywords = query.toLowerCase().split(/\s+/).filter(function(k) { return k.length > 0; });
+        var searchedDirs = 0;
+        var matchedFiles = 0;
+
+        // 取消之前的搜索（如果有）
+        if (this._deepSearchAbort) {
+            this._deepSearchAbort.cancelled = true;
+        }
+        var abortFlag = { cancelled: false };
+        this._deepSearchAbort = abortFlag;
+
+        // 并发池：最多同时执行 CONCURRENCY 个 readdir
+        var CONCURRENCY = 16;
+        var active = 0;
+        var pendingCallbacks = [];
+
+        // 任务计数器：跟踪所有已提交但未完成的搜索任务（包括子目录递归）
+        // 当计数器归零时，表示所有目录搜索完毕
+        var pendingTasks = 0;
+        var allDoneResolve = null;
+        var allDonePromise = new Promise(function(resolve) { allDoneResolve = resolve; });
+
+        function taskStarted() {
+            pendingTasks++;
+        }
+
+        function taskFinished() {
+            pendingTasks--;
+            if (pendingTasks === 0 && allDoneResolve) {
+                allDoneResolve();
+                allDoneResolve = null;
+            }
+        }
+
+        function schedule(fn) {
+            return new Promise(function(resolve, reject) {
+                function tryRun() {
+                    if (abortFlag.cancelled) {
+                        // 取消时，fn 不会执行，但 searchRecursive 已经 taskStarted()，
+                        // 所以必须 taskFinished() 以避免 pendingTasks 永远不归零
+                        taskFinished();
+                        resolve();
+                        return;
+                    }
+                    if (active < CONCURRENCY) {
+                        active++;
+                        fn().then(function(val) {
+                            active--;
+                            resolve(val);
+                            if (pendingCallbacks.length > 0) {
+                                var next = pendingCallbacks.shift();
+                                next();
+                            }
+                        }, function(err) {
+                            active--;
+                            reject(err);
+                            if (pendingCallbacks.length > 0) {
+                                var next = pendingCallbacks.shift();
+                                next();
+                            }
+                        });
+                    } else {
+                        pendingCallbacks.push(tryRun);
+                    }
+                }
+                tryRun();
+            });
+        }
 
         function searchRecursive(currentDir, depth) {
-            if (depth > maxDepth) {
-                pending--;
-                if (pending === 0) callback(results);
-                return;
-            }
+            if (abortFlag.cancelled) return;
 
             var normalizedPath = currentDir;
             if (!normalizedPath.endsWith('\\')) normalizedPath += '\\';
 
-            fs.readdir(normalizedPath, { withFileTypes: true }, function(err, entries) {
-                if (!err && entries) {
+            taskStarted();
+            schedule(function() {
+                if (abortFlag.cancelled) { taskFinished(); return Promise.resolve(); }
+
+                return fs.promises.readdir(normalizedPath, { withFileTypes: true }).then(function(entries) {
+                    var subPromises = [];
+                    var batchResults = [];
+
+                    searchedDirs++;
+
                     for (var i = 0; i < entries.length; i++) {
+                        if (abortFlag.cancelled) break;
+
                         var entry = entries[i];
                         var fullPath = normalizedPath + entry.name;
 
-                        if (entry.name.toLowerCase().indexOf(lowerQuery) !== -1) {
+                        // 多关键词匹配：所有关键词都必须出现在文件名中
+                        var lowerName = entry.name.toLowerCase();
+                        var allMatch = true;
+                        for (var ki = 0; ki < keywords.length; ki++) {
+                            if (lowerName.indexOf(keywords[ki]) === -1) {
+                                allMatch = false;
+                                break;
+                            }
+                        }
+                        if (allMatch) {
                             var item = {
                                 name: entry.name,
                                 isDir: entry.isDirectory(),
@@ -657,28 +904,69 @@ class LocalBrowsePlugin extends Plugin {
                                 relativePath: that.getRelativePath(fullPath, dirPath)
                             };
                             if (!entry.isDirectory()) {
-                                try {
-                                    item.size = fs.statSync(fullPath).size;
-                                } catch(e) {
+                                // 异步取 size 和 mtime
+                                var statP = fs.promises.stat(fullPath).then(function(st) {
+                                    item.size = st.size;
+                                    item.mtime = st.mtime ? st.mtime.getTime() : 0;
+                                }).catch(function() {
                                     item.size = 0;
-                                }
+                                    item.mtime = 0;
+                                });
+                                subPromises.push(statP);
                             }
-                            results.push(item);
+                            batchResults.push(item);
+                            matchedFiles++;
                         }
 
                         if (entry.isDirectory()) {
-                            pending++;
+                            // 子目录递归搜索自行通过 schedule 排队，不阻塞当前目录
+                            // 这样并发池能立即释放当前槽位，调度更多目录搜索
                             searchRecursive(fullPath, depth + 1);
                         }
                     }
-                }
 
-                pending--;
-                if (pending === 0) callback(results);
+                    // 立即回调当前目录的搜索进度，不等子目录完成
+                    allResults = allResults.concat(batchResults);
+                    if (onPartial) {
+                        onPartial(batchResults, searchedDirs, matchedFiles);
+                    }
+
+                    // 只等待 stat 操作完成（获取文件大小/时间），不再等子目录递归
+                    return Promise.all(subPromises);
+                }).catch(function() {
+                    // 目录无权限等错误，静默跳过
+                }).finally(function() {
+                    taskFinished();
+                });
             });
         }
 
-        searchRecursive(dirPath, 0);
+        // 取消搜索时，需要确保 pendingTasks 归零以解除 await
+        function forceFinishAll() {
+            // 清空排队中的回调，防止新任务启动
+            pendingCallbacks.length = 0;
+            // 如果还有 pending 任务，直接归零并 resolve
+            if (pendingTasks > 0 && allDoneResolve) {
+                pendingTasks = 0;
+                allDoneResolve();
+                allDoneResolve = null;
+            }
+        }
+
+        try {
+            searchRecursive(dirPath, 0);
+            await allDonePromise;
+        } catch (e) {
+            console.error('[LocalBrowse] deepSearch error:', e);
+        }
+
+        // 清理 abort 标记
+        if (this._deepSearchAbort === abortFlag) {
+            this._deepSearchAbort = null;
+        }
+
+        // 无论是否取消都回调，让上层统一处理 UI 状态
+        onComplete(allResults, abortFlag.cancelled);
     }
 
     /**
@@ -695,6 +983,7 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 根据搜索词过滤当前目录文件
+     * 支持多关键词：空格分隔，所有关键词都必须匹配（AND 逻辑）
      */
     applyFilter(query) {
         if (!this.cachedFiles.length || !this.cachedPath) return;
@@ -703,9 +992,15 @@ class LocalBrowsePlugin extends Plugin {
         if (!query) {
             filtered = this.cachedFiles.slice();
         } else {
-            var lowerQuery = query.toLowerCase();
+            var keywords = query.toLowerCase().split(/\s+/).filter(function(k) { return k.length > 0; });
             filtered = this.cachedFiles.filter(function(f) {
-                return f.name.toLowerCase().indexOf(lowerQuery) !== -1;
+                var lowerName = f.name.toLowerCase();
+                for (var i = 0; i < keywords.length; i++) {
+                    if (lowerName.indexOf(keywords[i]) === -1) {
+                        return false;
+                    }
+                }
+                return true;
             });
         }
 
@@ -968,10 +1263,6 @@ class LocalBrowsePlugin extends Plugin {
      * 处理文件点击：插入本地文件链接
      */
     handleFileClick(filePath, fileName) {
-        var that = this;
-        
-        this.showToastMsg('正在插入: ' + fileName);
-        
         // 直接插入本地文件链接
         this.insertLocalFileLink(filePath, fileName);
     }
@@ -980,26 +1271,12 @@ class LocalBrowsePlugin extends Plugin {
      * 插入本地文件链接到编辑器
      */
     insertLocalFileLink(filePath, fileName) {
-        var ext = fileName.split('.').pop().toLowerCase();
-        var normalizedPath = filePath.replace(/\\/g, '/');
-        
-        // 确保路径以 file:/// 开头（三个斜杠）
-        var fileUrl;
-        if (normalizedPath.startsWith('file:///')) {
-            fileUrl = normalizedPath;
-        } else if (normalizedPath.startsWith('file://')) {
-            fileUrl = 'file:///' + normalizedPath.substring(7);
-        } else if (normalizedPath.startsWith('/')) {
-            fileUrl = 'file://' + normalizedPath;
-        } else {
-            // Windows 路径如 T:/Videos/xxx.mkv
-            fileUrl = 'file:///' + normalizedPath;
-        }
+        var that = this;
+        var fileUrl = this.toFileUrl(filePath);
         
         var markdown;
-        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1};
         
-        if (imageExts[ext]) {
+        if (this.isImageFile(fileName)) {
             // 图片：直接显示
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         } else {
@@ -1009,45 +1286,26 @@ class LocalBrowsePlugin extends Plugin {
         
         console.log('[LocalBrowse] Inserting link:', markdown);
         
-        // 尝试插入到编辑器
-        var inserted = this.tryInsertToEditor(markdown);
-        
-        if (inserted) {
-            this.showToastMsg('✅ 已插入链接: ' + fileName);
-        } else {
-            // 如果插入失败，复制到剪贴板
-            this.copyToClipboard(markdown);
-            this.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
-        }
-    }
-
-    /**
-     * 复制文件链接到剪贴板（降级方案）
-     */
-    copyFileLink(filePath, fileName) {
-        var ext = fileName.split('.').pop().toLowerCase();
-        var normalizedPath = filePath.replace(/\\/g, '/');
-        var markdown;
-        
-        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1};
-        if (imageExts[ext]) {
-            markdown = '![](' + normalizedPath + ')';
-        } else {
-            markdown = '[' + fileName + '](' + normalizedPath + ')';
-        }
-        
-        this.copyToClipboard(markdown);
+        // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
+        this.tryInsertToEditor(markdown, function(success) {
+            if (success) {
+                that.showToastMsg('✅ 已插入链接: ' + fileName);
+            } else {
+                // 重试全部失败，降级到剪贴板
+                that.copyToClipboard(markdown);
+                that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
+            }
+        });
     }
 
     /**
      * 插入资源到编辑器
      */
     insertAssetToEditor(assetPath, fileName) {
-        var ext = fileName.split('.').pop().toLowerCase();
+        var that = this;
         var markdown;
         
-        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1};
-        if (imageExts[ext]) {
+        if (this.isImageFile(fileName)) {
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + assetPath + ')';
         } else {
             markdown = '[' + this.escapeMarkdown(fileName) + '](' + assetPath + ')';
@@ -1055,13 +1313,16 @@ class LocalBrowsePlugin extends Plugin {
         
         console.log('[LocalBrowse] Inserting asset:', markdown);
         
-        // 尝试多种方式插入
-        var inserted = this.tryInsertToEditor(markdown);
-        
-        if (!inserted) {
-            this.copyToClipboard(markdown);
-            this.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
-        }
+        // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
+        this.tryInsertToEditor(markdown, function(success) {
+            if (success) {
+                that.showToastMsg('✅ 已插入: ' + fileName);
+            } else {
+                // 重试全部失败，降级到剪贴板
+                that.copyToClipboard(markdown);
+                that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
+            }
+        });
     }
 
     /**
@@ -1191,45 +1452,89 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 尝试插入到编辑器
+     * 尝试插入到编辑器（带重试，解决首次启动时编辑器尚未就绪的问题）
+     * @param {string} text - 要插入的文本
+     * @param {Function} callback - 可选回调，参数为 boolean 表示是否成功
+     * @returns {boolean} - 同步返回首次尝试结果
      */
-    tryInsertToEditor(text) {
-        // 方式1: 直接操作 DOM，在光标位置插入（不换行）
-        try {
-            var protyle = document.querySelector('.protyle-wysiwyg[contenteditable="true"]');
-            if (protyle) {
+    tryInsertToEditor(text, callback) {
+        var that = this;
+
+        // 内部：执行单次插入尝试
+        function attempt() {
+            try {
+                var protyle = document.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+                if (!protyle) return false;
+
                 protyle.focus();
                 var selection = window.getSelection();
-                if (selection && selection.rangeCount > 0) {
-                    var range = selection.getRangeAt(0);
-                    
-                    // 检查是否在编辑器内
-                    if (protyle.contains(range.commonAncestorContainer)) {
-                        range.deleteContents();
-                        var textNode = document.createTextNode(text);
-                        range.insertNode(textNode);
-                        range.setStartAfter(textNode);
-                        range.collapse(true);
-                        selection.removeAllRanges();
-                        selection.addRange(range);
-                        
-                        // 触发输入事件
-                        var inputEvent = new InputEvent('input', {
-                            bubbles: true,
-                            cancelable: true,
-                            inputType: 'insertText',
-                            data: text
-                        });
-                        protyle.dispatchEvent(inputEvent);
-                        
-                        return true;
-                    }
+                if (!selection || selection.rangeCount === 0) return false;
+
+                var range = selection.getRangeAt(0);
+
+                // 检查是否在编辑器内
+                if (!protyle.contains(range.commonAncestorContainer)) {
+                    // 选区在编辑器外（如 dock 面板）: 创建新选区到编辑器末尾
+                    var newRange = document.createRange();
+                    newRange.selectNodeContents(protyle);
+                    newRange.collapse(false);
+                    selection.removeAllRanges();
+                    selection.addRange(newRange);
+                    range = newRange;
+                }
+
+                range.deleteContents();
+                var textNode = document.createTextNode(text);
+                range.insertNode(textNode);
+                range.setStartAfter(textNode);
+                range.collapse(true);
+                selection.removeAllRanges();
+                selection.addRange(range);
+
+                // 触发输入事件，让思源感知内容变更
+                var inputEvent = new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: text
+                });
+                protyle.dispatchEvent(inputEvent);
+
+                return true;
+            } catch (e) {
+                console.error('[LocalBrowse] insert error:', e);
+                return false;
+            }
+        }
+
+        // 首次同步尝试
+        if (attempt()) {
+            if (callback) callback(true);
+            return true;
+        }
+
+        // 异步重试（用于编辑器尚未就绪的场景）
+        if (callback) {
+            var retryDelay = 200;
+            var maxRetries = 4;
+            var retryCount = 0;
+
+            function retry() {
+                retryCount++;
+                if (attempt()) {
+                    callback(true);
+                    return;
+                }
+                if (retryCount < maxRetries) {
+                    setTimeout(retry, retryDelay);
+                } else {
+                    callback(false);
                 }
             }
-        } catch (e) {
-            console.error('[LocalBrowse] insert error:', e);
+
+            setTimeout(retry, retryDelay);
         }
-        
+
         return false;
     }
 
@@ -1444,10 +1749,10 @@ class LocalBrowsePlugin extends Plugin {
                 return;
             }
         } catch (e) {}
-        // 降级：尝试用 child_process
+        // 降级：使用 spawn 避免 shell 注入（cp.exec 拼接字符串有命令注入风险）
         try {
             var cp = require('child_process');
-            cp.exec('start "" "' + filePath + '"');
+            cp.spawn('cmd', ['/c', 'start', '""', filePath], { stdio: 'ignore', detached: true }).unref();
         } catch (e) {
             this.showToastMsg('无法打开文件，请手动访问：' + filePath);
         }
@@ -1472,8 +1777,8 @@ class LocalBrowsePlugin extends Plugin {
         } catch (e) {}
         try {
             var cp = require('child_process');
-            // 使用 explorer /select 打开并选中文件
-            cp.exec('explorer /select,"' + filePath + '"');
+            // 使用 spawn 避免 shell 注入
+            cp.spawn('explorer', ['/select', filePath], { stdio: 'ignore', detached: true }).unref();
         } catch (e) {
             this.showToastMsg('无法打开文件夹，请手动访问');
         }
@@ -1491,21 +1796,9 @@ class LocalBrowsePlugin extends Plugin {
      * 复制 Markdown 链接到剪贴板
      */
     copyMarkdownLink(filePath, fileName) {
-        var ext = fileName.split('.').pop().toLowerCase();
-        var normalizedPath = filePath.replace(/\\/g, '/');
-        var fileUrl;
-        if (normalizedPath.startsWith('file:///')) {
-            fileUrl = normalizedPath;
-        } else if (normalizedPath.startsWith('file://')) {
-            fileUrl = 'file:///' + normalizedPath.substring(7);
-        } else if (normalizedPath.startsWith('/')) {
-            fileUrl = 'file://' + normalizedPath;
-        } else {
-            fileUrl = 'file:///' + normalizedPath;
-        }
-        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1};
+        var fileUrl = this.toFileUrl(filePath);
         var markdown;
-        if (imageExts[ext]) {
+        if (this.isImageFile(fileName)) {
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         } else {
             markdown = '[' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
@@ -2058,18 +2351,6 @@ class LocalBrowsePlugin extends Plugin {
 
             (function(favPath, favName) {
                 btn.addEventListener('click', function() {
-                    // 提取收藏路径的盘符并同步到下拉框
-                    var match = favPath.match(/^([A-Za-z]):/);
-                    if (match) {
-                        var newDrive = match[1].toUpperCase();
-                        if (newDrive !== that.driveLetter) {
-                            that.driveLetter = newDrive;
-                            var driveSelect = document.getElementById('cd-drive-select');
-                            if (driveSelect) {
-                                driveSelect.value = newDrive;
-                            }
-                        }
-                    }
                     that.loadDirectory(favPath);
                 });
                 btn.addEventListener('mouseenter', function() {
@@ -2143,7 +2424,8 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     formatSize(bytes) {
-        if (!bytes || bytes === 0) return '';
+        if (bytes === 0) return '0 B';
+        if (!bytes) return '';
         var units = ['B', 'KB', 'MB', 'GB', 'TB'];
         var i = 0;
         var size = bytes;
@@ -2171,13 +2453,13 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     escapeHtml(text) {
-        var div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
+        return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
     escapeMarkdown(text) {
-        return text.replace(/[\[\]\(\)\*\_\`]/g, '\\$&');
+        // 转义 Markdown 特殊字符：[]()*
+        // 反引号 \` 在大多数 Markdown 解析器中不生效，替换为 Unicode 全角反引号
+        return String(text).replace(/[\[\]\(\)\*]/g, '\\$&').replace(/`/g, '\uFF40');
     }
 
     /**
