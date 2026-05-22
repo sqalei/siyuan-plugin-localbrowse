@@ -97,6 +97,13 @@ class LocalBrowsePlugin extends Plugin {
             document.removeEventListener('click', this._sortMenuClickHandler);
             this._sortMenuClickHandler = null;
         }
+        // 清理搜索渲染计时器
+        if (this._searchRenderTimer) {
+            clearTimeout(this._searchRenderTimer);
+            this._searchRenderTimer = null;
+        }
+        // 清理 Dock 面板引用，避免内存泄漏
+        this.dockPanel = null;
     }
 
     uninstall() {
@@ -137,6 +144,24 @@ class LocalBrowsePlugin extends Plugin {
                 },
                 destroy: function() {
                     console.log('[LocalBrowse] Dock destroyed');
+                    // Dock 销毁时清理资源，防止长时间闲置后重建时的冲突
+                    that.hideContextMenu();
+                    if (that._boundIconScroll) {
+                        var fileListEl = document.getElementById('cd-file-list');
+                        if (fileListEl) {
+                            fileListEl.removeEventListener('scroll', that._boundIconScroll);
+                        }
+                        that._boundIconScroll = null;
+                    }
+                    if (that._previewTimer) {
+                        clearTimeout(that._previewTimer);
+                        that._previewTimer = null;
+                    }
+                    if (that._searchRenderTimer) {
+                        clearTimeout(that._searchRenderTimer);
+                        that._searchRenderTimer = null;
+                    }
+                    that.hideImagePreview();
                 }
             });
             console.log("[LocalBrowse] Dock registered");
@@ -1544,6 +1569,17 @@ class LocalBrowsePlugin extends Plugin {
                     data: text
                 });
                 protyle.dispatchEvent(inputEvent);
+
+                // 额外触发 protyle 的 input 事件，确保长时间闲置后也能同步
+                try {
+                    var protyleInputEvent = new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: text
+                    });
+                    protyle.dispatchEvent(protyleInputEvent);
+                } catch (e) {}
 
                 return true;
             } catch (e) {
