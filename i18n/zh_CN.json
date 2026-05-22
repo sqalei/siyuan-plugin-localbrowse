@@ -5,6 +5,7 @@
     },
     "panel": {
         "title": "从本地驱动器选择文件",
+        "dockTitle": "本地文件",
         "browse": "浏览文件",
         "noDrive": "未检测到挂载的驱动器",
         "insert": "插入为附件",

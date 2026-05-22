@@ -133,7 +133,7 @@ class LocalBrowsePlugin extends Plugin {
                     position: 'RightTop',
                     size: { width: 300, height: 600 },
                     icon: 'iconLocalBrowse',
-                    title: '本地文件',
+                    title: this.i18n('panel.dockTitle') || 'Local Files',
                     show: true
                 },
                 data: {},

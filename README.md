@@ -22,7 +22,7 @@ Browse local mounted drive files directly in SiYuan's dock panel. Click any file
 ## Requirements
 
 - SiYuan Note v3.0.0+ (desktop version)
-- Windows, macOS, or Linux desktop environment
+- **Windows desktop** environment
 - Optional: CloudDrive2, Alist, or any drive mounting tool
 
 ## Installation

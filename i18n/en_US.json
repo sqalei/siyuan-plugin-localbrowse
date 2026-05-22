@@ -5,6 +5,7 @@
     },
     "panel": {
         "title": "Select a file from local drive",
+        "dockTitle": "Local Files",
         "browse": "Browse Files",
         "noDrive": "No mounted drive detected",
         "insert": "Insert as Attachment",
