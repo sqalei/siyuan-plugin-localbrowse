@@ -1477,7 +1477,38 @@ class LocalBrowsePlugin extends Plugin {
         // 内部：执行单次插入尝试
         function attempt() {
             try {
-                var protyle = document.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+                // 优先获取当前激活/聚焦的编辑器，避免插入到后台文档
+                var protyle = null;
+                var activeElement = document.activeElement;
+                if (activeElement) {
+                    // 如果焦点在编辑器内，直接使用该编辑器
+                    if (activeElement.classList && activeElement.classList.contains('protyle-wysiwyg')) {
+                        protyle = activeElement;
+                    } else {
+                        // 向上查找最近的编辑器祖先
+                        var parent = activeElement.closest ? activeElement.closest('.protyle-wysiwyg') : null;
+                        if (parent) protyle = parent;
+                    }
+                }
+                // 兜底：获取可见的编辑器（排除隐藏的标签页）
+                if (!protyle) {
+                    var allProtyles = document.querySelectorAll('.protyle-wysiwyg[contenteditable="true"]');
+                    for (var i = 0; i < allProtyles.length; i++) {
+                        var p = allProtyles[i];
+                        // 检查编辑器是否在可见区域且不是后台标签页
+                        var rect = p.getBoundingClientRect();
+                        var isVisible = rect.width > 0 && rect.height > 0;
+                        var isInActiveTab = p.closest('.layout__tab--active, .fn__flex-1:not([style*="display: none"])');
+                        if (isVisible && isInActiveTab) {
+                            protyle = p;
+                            break;
+                        }
+                    }
+                }
+                // 最终兜底：取第一个可见编辑器
+                if (!protyle) {
+                    protyle = document.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+                }
                 if (!protyle) return false;
 
                 protyle.focus();
@@ -1486,7 +1517,7 @@ class LocalBrowsePlugin extends Plugin {
 
                 var range = selection.getRangeAt(0);
 
-                // 检查是否在编辑器内
+                // 检查选区是否在当前编辑器内，如果不是则重置到编辑器末尾
                 if (!protyle.contains(range.commonAncestorContainer)) {
                     // 选区在编辑器外（如 dock 面板）: 创建新选区到编辑器末尾
                     var newRange = document.createRange();
