@@ -7,7 +7,7 @@
  * https://github.com/sqalei/siyuan-plugin-localbrowse
  */
 
-console.log("[LocalBrowse] === LOADING ===");
+// console.log("[LocalBrowse] === LOADING ===");
 
 var siyuanApi = {};
 try {
@@ -27,7 +27,7 @@ try {
     fs = require('fs');
     path = require('path');
     os = require('os');
-    console.log("[LocalBrowse] Node.js modules loaded successfully");
+    // console.log("[LocalBrowse] Node.js modules loaded successfully");
 } catch (e) {
     console.error("[LocalBrowse] Failed to load Node.js modules:", e);
 }
@@ -37,7 +37,7 @@ class LocalBrowsePlugin extends Plugin {
         super(options);
         this.dockPanel = null;
         this.currentPath = '';
-        this.driveLetter = 'T';
+        this.driveLetter = 'C';
         this.workspacePath = '';
         this.assetsPath = '';
         this.cachedFiles = [];      // 当前目录完整文件列表（用于搜索过滤）
@@ -213,6 +213,7 @@ class LocalBrowsePlugin extends Plugin {
             '<div id="cd-image-preview" style="display:none;position:fixed;z-index:9998;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,0.18);padding:6px;pointer-events:none">' +
                 '<img id="cd-preview-img" src="" style="display:block;max-width:560px;max-height:480px;border-radius:3px">' +
                 '<div id="cd-preview-name" style="margin-top:6px;text-align:center;font-size:12px;color:var(--b3-theme-on-background,#333);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:560px"></div>' +
+                '<div id="cd-preview-time" style="text-align:center;font-size:11px;color:var(--b3-theme-secondary,#999);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:560px"></div>' +
             '</div>' +
         '</div>';
         
@@ -504,7 +505,6 @@ class LocalBrowsePlugin extends Plugin {
                             console.error('[LocalBrowse] fs.readdir error:', err);
                             that.showError('无法访问 ' + dirPath + '，请确认挂载盘已启动且驱动器已挂载');
                         } else {
-                            console.log('[LocalBrowse] 目录不存在或为空（挂载盘空文件夹特性）:', dirPath);
                             that.renderFiles([], normalizedPath);
                         }
                     } else {
@@ -621,13 +621,11 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     renderFiles(files, currentPath) {
-        console.log('[LocalBrowse] renderFiles: ' + files.length + ' 个文件');
         // 保存缓存用于搜索过滤
         this.cachedFiles = files.slice();
         this.cachedPath = currentPath;
         // 应用当前排序
         files = this.sortFiles(files);
-        console.log('[LocalBrowse] 调用 doRender, currentView=' + this.currentView);
         this.doRender(files, currentPath);
     }
 
@@ -1262,18 +1260,20 @@ class LocalBrowsePlugin extends Plugin {
                     var name = item.dataset.name;
                     if (!isDir && that.isImageFile(name)) {
                         that._previewTimer = setTimeout(function() {
-                            // 从 files 数组中查找对应的文件大小
+                            // 从 files 数组中查找对应的文件大小和修改时间
                             var fileSize = null;
+                            var fileMtime = null;
                             if (that.iconRenderState && that.iconRenderState.files) {
                                 for (var fi = 0; fi < that.iconRenderState.files.length; fi++) {
                                     var f = that.iconRenderState.files[fi];
                                     if (f.name === name) {
                                         fileSize = f.size;
+                                        fileMtime = f.mtime;
                                         break;
                                     }
                                 }
                             }
-                            that.showImagePreview(item.dataset.path, name, fileSize);
+                            that.showImagePreview(item.dataset.path, name, fileSize, fileMtime);
                         }, 200);
                     }
                     // 图标视图：悬停显示完整文件名
@@ -1337,7 +1337,7 @@ class LocalBrowsePlugin extends Plugin {
             markdown = '[' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         }
         
-        console.log('[LocalBrowse] Inserting link:', markdown);
+        // console.log('[LocalBrowse] Inserting link:', markdown);
         
         // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
         this.tryInsertToEditor(markdown, function(success) {
@@ -1364,7 +1364,7 @@ class LocalBrowsePlugin extends Plugin {
             markdown = '[' + this.escapeMarkdown(fileName) + '](' + assetPath + ')';
         }
         
-        console.log('[LocalBrowse] Inserting asset:', markdown);
+        // console.log('[LocalBrowse] Inserting asset:', markdown);
         
         // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
         this.tryInsertToEditor(markdown, function(success) {
@@ -1683,8 +1683,6 @@ class LocalBrowsePlugin extends Plugin {
             this.showMessage(msg);
         } else if (window.siyuan && window.siyuan.messenger) {
             window.siyuan.messenger.show(msg);
-        } else {
-            console.log('[LocalBrowse] ' + msg);
         }
     }
 
@@ -1996,7 +1994,7 @@ class LocalBrowsePlugin extends Plugin {
     /**
      * 显示图片悬浮预览
      */
-    showImagePreview(filePath, fileName, fileSize) {
+    showImagePreview(filePath, fileName, fileSize, fileMtime) {
         var that = this;
         var previewEl = document.getElementById('cd-image-preview');
         var imgEl = document.getElementById('cd-preview-img');
@@ -2012,6 +2010,16 @@ class LocalBrowsePlugin extends Plugin {
                 displayText += ' <span style="color:var(--b3-theme-secondary,#999);font-size:11px">(' + that.formatSize(fileSize) + ')</span>';
             }
             nameEl.innerHTML = displayText;
+        }
+
+        // 设置修改时间
+        var timeEl = document.getElementById('cd-preview-time');
+        if (timeEl) {
+            if (fileMtime) {
+                timeEl.textContent = that.formatTime(fileMtime);
+            } else {
+                timeEl.textContent = '';
+            }
         }
 
         // 定位：显示在鼠标右侧，垂直方向跟随鼠标
@@ -2055,6 +2063,8 @@ class LocalBrowsePlugin extends Plugin {
         if (imgEl) imgEl.src = '';
         var nameEl = document.getElementById('cd-preview-name');
         if (nameEl) nameEl.textContent = '';
+        var timeEl = document.getElementById('cd-preview-time');
+        if (timeEl) timeEl.textContent = '';
     }
 
     /**
@@ -2659,4 +2669,4 @@ class LocalBrowsePlugin extends Plugin {
 
 module.exports = LocalBrowsePlugin;
 
-console.log("[LocalBrowse] === LOADED ===");
+// console.log("[LocalBrowse] === LOADED ===");

@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-localbrowse",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "displayName": {
     "default": "LocalBrowse",
     "zh_CN": "本地文件浏览器"
@@ -31,6 +31,9 @@
     "mount",
     "attachment"
   ],
+  "scripts": {
+    "build": "node build.js"
+  },
   "devDependencies": {
     "archiver": "^8.0.0"
   }
