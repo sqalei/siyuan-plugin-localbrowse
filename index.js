@@ -94,8 +94,6 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 清理图标渲染状态
         this.iconRenderState = null;
-        // 断开缩略图观察器
-        this.disconnectThumbObserver();
         // 取消正在进行的深度搜索
         if (this._deepSearchAbort) {
             this._deepSearchAbort.cancelled = true;
@@ -1091,8 +1089,6 @@ class LocalBrowsePlugin extends Plugin {
 
         // 图标模式：grid 布局 + 滚动动态渲染
         if (that.currentView === 'icon' && !isDeepSearch) {
-            // 切换视图时断开旧的缩略图观察器
-            that.disconnectThumbObserver();
             fileListEl.style.display = 'grid';
             fileListEl.style.gridTemplateColumns = 'repeat(auto-fill, minmax(80px, 1fr))';
             fileListEl.style.gridAutoRows = '110px';
@@ -1192,10 +1188,18 @@ class LocalBrowsePlugin extends Plugin {
 
         var iconHtml;
         if (isImg) {
-            // 不直接加载原图，先用占位符，由 IntersectionObserver 按需加载缩略图
-            iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center" data-src="' + that.escapeHtml(that.toFileUrl(fullPath)) + '">' +
-                '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
-                '</div>';
+            // 大文件（>5MB）显示占位图标，避免加载慢
+            var isLargeFile = f.size > 5 * 1024 * 1024;
+            if (isLargeFile) {
+                iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                    '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
+                    '</div>';
+            } else {
+                // 先显示占位符，滚动停止后再加载缩略图
+                iconHtml = '<div class="cd-thumb-wrap" data-src="' + that.escapeHtml(that.toFileUrl(fullPath)) + '" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                    '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
+                    '</div>';
+            }
         } else {
             var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
             iconHtml = '<span style="font-size:36px;line-height:1;display:block">' + icon + '</span>';
@@ -2607,8 +2611,8 @@ class LocalBrowsePlugin extends Plugin {
         // 绑定新项的事件
         that.bindItemEvents(fileListEl, files, currentPath);
 
-        // 使用 IntersectionObserver 按需加载可见缩略图（替代一次性全扫描）
-        that.observeThumbnails(fileListEl);
+        // 首次渲染时加载可见缩略图
+        that.loadVisibleThumbnails(fileListEl);
 
         state.isLoading = false;
 
@@ -2623,57 +2627,42 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 使用 IntersectionObserver 按需加载可见区域的缩略图
-     * 仅在图片项进入视口时才创建 <img> 元素，避免一次性加载大量原图
+     * 加载当前视口内可见的缩略图
+     * 只有在视口范围内的占位符才会被替换为真实 <img>
      */
-    observeThumbnails(container) {
-        var that = this;
-        // 创建或复用 observer
-        if (!that._thumbObserver) {
-            that._thumbObserver = new IntersectionObserver(function(entries) {
-                for (var i = 0; i < entries.length; i++) {
-                    if (entries[i].isIntersecting) {
-                        var wrap = entries[i].target;
-                        var src = wrap.dataset.src;
-                        if (src && !wrap.dataset.loaded) {
-                            wrap.dataset.loaded = '1';
-                            var img = document.createElement('img');
-                            img.src = src;
-                            img.decoding = 'async';
-                            img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
-                            img.onload = function() { this.style.opacity = '1'; };
-                            img.onerror = function() {
-                                wrap.innerHTML = '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>';
-                            };
-                            var placeholder = wrap.querySelector('.cd-thumb-placeholder');
-                            if (placeholder) {
-                                wrap.replaceChild(img, placeholder);
-                            } else {
-                                wrap.appendChild(img);
-                            }
-                        }
-                        that._thumbObserver.unobserve(wrap);
-                    }
-                }
-            }, {
-                root: container,
-                rootMargin: '200px 0px',
-                threshold: 0
-            });
-        }
-        var wraps = container.querySelectorAll('.cd-thumb-wrap:not([data-loaded])');
-        for (var i = 0; i < wraps.length; i++) {
-            that._thumbObserver.observe(wraps[i]);
-        }
-    }
+    loadVisibleThumbnails(container) {
+        if (!container) return;
+        var wraps = container.querySelectorAll('.cd-thumb-wrap[data-src]:not([data-loaded])');
+        if (wraps.length === 0) return;
 
-    /**
-     * 断开缩略图观察器
-     */
-    disconnectThumbObserver() {
-        if (this._thumbObserver) {
-            this._thumbObserver.disconnect();
-            this._thumbObserver = null;
+        var containerRect = container.getBoundingClientRect();
+        var viewTop = containerRect.top - 100;    // 上方预加载 100px
+        var viewBottom = containerRect.bottom + 100; // 下方预加载 100px
+
+        for (var i = 0; i < wraps.length; i++) {
+            var wrap = wraps[i];
+            var rect = wrap.getBoundingClientRect();
+            // 判断是否在视口附近
+            if (rect.bottom >= viewTop && rect.top <= viewBottom) {
+                wrap.dataset.loaded = '1';
+                var src = wrap.dataset.src;
+                var img = document.createElement('img');
+                img.src = src;
+                img.decoding = 'async';
+                img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
+                img.onload = function() { this.style.opacity = '1'; };
+                img.onerror = function() {
+                    // 加载失败保留占位符
+                    this.parentNode.innerHTML = '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>';
+                };
+                var placeholder = wrap.querySelector('.cd-thumb-placeholder');
+                if (placeholder) {
+                    wrap.replaceChild(img, placeholder);
+                } else {
+                    wrap.innerHTML = '';
+                    wrap.appendChild(img);
+                }
+            }
         }
     }
 
@@ -2694,7 +2683,7 @@ class LocalBrowsePlugin extends Plugin {
         }
         that.hideImagePreview();
 
-        // 滚动结束后恢复预览功能
+        // 滚动结束后恢复预览功能 + 加载可见缩略图
         if (that._scrollEndTimer) {
             clearTimeout(that._scrollEndTimer);
         }
@@ -2707,8 +2696,11 @@ class LocalBrowsePlugin extends Plugin {
             clearTimeout(that._scrollTimer);
         }
 
-        // 防抖：200ms 后检查是否需要加载
+        // 防抖：200ms 后加载缩略图 + 检查是否需要加载更多
         that._scrollTimer = setTimeout(function() {
+            // 滚动停止，加载当前视口内的缩略图
+            that.loadVisibleThumbnails(fileListEl);
+
             var scrollTop = fileListEl.scrollTop;
             var clientHeight = fileListEl.clientHeight;
             var scrollHeight = fileListEl.scrollHeight;
@@ -2717,10 +2709,8 @@ class LocalBrowsePlugin extends Plugin {
             // 如果内容高度不足或接近底部，加载更多
             var needLoad = false;
             if (scrollHeight <= clientHeight + 50) {
-                // 内容没有撑满容器，需要加载更多
                 needLoad = true;
             } else if (scrollBottom >= scrollHeight - 100) {
-                // 滚动到底部附近
                 needLoad = true;
             }
             
