@@ -94,6 +94,8 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 清理图标渲染状态
         this.iconRenderState = null;
+        // 断开缩略图观察器
+        this.disconnectThumbObserver();
         // 取消正在进行的深度搜索
         if (this._deepSearchAbort) {
             this._deepSearchAbort.cancelled = true;
@@ -1089,6 +1091,8 @@ class LocalBrowsePlugin extends Plugin {
 
         // 图标模式：grid 布局 + 滚动动态渲染
         if (that.currentView === 'icon' && !isDeepSearch) {
+            // 切换视图时断开旧的缩略图观察器
+            that.disconnectThumbObserver();
             fileListEl.style.display = 'grid';
             fileListEl.style.gridTemplateColumns = 'repeat(auto-fill, minmax(80px, 1fr))';
             fileListEl.style.gridAutoRows = '110px';
@@ -1188,19 +1192,10 @@ class LocalBrowsePlugin extends Plugin {
 
         var iconHtml;
         if (isImg) {
-            var imgUrl = that.toFileUrl(fullPath);
-            // 大文件（>5MB）显示占位图标，避免加载慢
-            var isLargeFile = f.size > 5 * 1024 * 1024;
-            if (isLargeFile) {
-                iconHtml = '<div style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
-                    '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
-                    '</div>';
-            } else {
-                // 使用浏览器原生 loading="lazy" 懒加载
-                iconHtml = '<div style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0">' +
-                    '<img src="' + imgUrl + '" loading="lazy" decoding="async" style="width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.2s">' +
-                    '</div>';
-            }
+            // 不直接加载原图，先用占位符，由 IntersectionObserver 按需加载缩略图
+            iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center" data-src="' + that.escapeHtml(that.toFileUrl(fullPath)) + '">' +
+                '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
+                '</div>';
         } else {
             var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
             iconHtml = '<span style="font-size:36px;line-height:1;display:block">' + icon + '</span>';
@@ -2612,23 +2607,8 @@ class LocalBrowsePlugin extends Plugin {
         // 绑定新项的事件
         that.bindItemEvents(fileListEl, files, currentPath);
 
-        // 处理缩略图加载状态
-        var thumbImgs = fileListEl.querySelectorAll('img');
-        for (var ti = 0; ti < thumbImgs.length; ti++) {
-            (function(img) {
-                if (img.complete && img.naturalWidth > 0) {
-                    img.style.opacity = '1';
-                } else {
-                    img.onload = function() { img.style.opacity = '1'; };
-                    img.onerror = function() {
-                        var wrap = img.parentNode;
-                        if (wrap) {
-                            wrap.innerHTML = '<span style="font-size:28px;line-height:56px;text-align:center;display:block;color:var(--b3-theme-secondary,#999)">🖼️</span>';
-                        }
-                    };
-                }
-            })(thumbImgs[ti]);
-        }
+        // 使用 IntersectionObserver 按需加载可见缩略图（替代一次性全扫描）
+        that.observeThumbnails(fileListEl);
 
         state.isLoading = false;
 
@@ -2640,6 +2620,61 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
         }, 50);
+    }
+
+    /**
+     * 使用 IntersectionObserver 按需加载可见区域的缩略图
+     * 仅在图片项进入视口时才创建 <img> 元素，避免一次性加载大量原图
+     */
+    observeThumbnails(container) {
+        var that = this;
+        // 创建或复用 observer
+        if (!that._thumbObserver) {
+            that._thumbObserver = new IntersectionObserver(function(entries) {
+                for (var i = 0; i < entries.length; i++) {
+                    if (entries[i].isIntersecting) {
+                        var wrap = entries[i].target;
+                        var src = wrap.dataset.src;
+                        if (src && !wrap.dataset.loaded) {
+                            wrap.dataset.loaded = '1';
+                            var img = document.createElement('img');
+                            img.src = src;
+                            img.decoding = 'async';
+                            img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
+                            img.onload = function() { this.style.opacity = '1'; };
+                            img.onerror = function() {
+                                wrap.innerHTML = '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>';
+                            };
+                            var placeholder = wrap.querySelector('.cd-thumb-placeholder');
+                            if (placeholder) {
+                                wrap.replaceChild(img, placeholder);
+                            } else {
+                                wrap.appendChild(img);
+                            }
+                        }
+                        that._thumbObserver.unobserve(wrap);
+                    }
+                }
+            }, {
+                root: container,
+                rootMargin: '200px 0px',
+                threshold: 0
+            });
+        }
+        var wraps = container.querySelectorAll('.cd-thumb-wrap:not([data-loaded])');
+        for (var i = 0; i < wraps.length; i++) {
+            that._thumbObserver.observe(wraps[i]);
+        }
+    }
+
+    /**
+     * 断开缩略图观察器
+     */
+    disconnectThumbObserver() {
+        if (this._thumbObserver) {
+            this._thumbObserver.disconnect();
+            this._thumbObserver = null;
+        }
     }
 
     /**
