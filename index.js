@@ -1189,11 +1189,13 @@ class LocalBrowsePlugin extends Plugin {
 
         var iconHtml;
         if (isImg) {
-            // 大文件（>5MB）显示占位图标，避免加载慢
+            // 大文件（>5MB）或 LIVP 文件显示占位图标，避免加载慢
             var isLargeFile = f.size > 5 * 1024 * 1024;
-            if (isLargeFile) {
+            var ext = name.split('.').pop().toLowerCase();
+            var isLivp = (ext === 'livp');
+            if (isLargeFile || isLivp) {
                 iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
-                    '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
+                    '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">' + (isLivp ? '📷' : '🖼️') + '</span>' +
                     '</div>';
             } else {
                 // 先显示占位符，滚动停止后再加载缩略图
@@ -1268,10 +1270,11 @@ class LocalBrowsePlugin extends Plugin {
                     that._previewMousePos = { x: e.clientX, y: e.clientY };
                     // 滚动中暂停预览，避免卡顿
                     if (that._isScrolling) return;
-                    // 图片文件：延迟显示预览
+                    // 图片文件：延迟显示预览（LIVP 不支持浏览器预览，跳过）
                     var isDir = item.dataset.isdir === 'true';
                     var name = item.dataset.name;
-                    if (!isDir && that.isImageFile(name)) {
+                    var nameExt = name.split('.').pop().toLowerCase();
+                    if (!isDir && that.isImageFile(name) && nameExt !== 'livp') {
                         that._previewTimer = setTimeout(function() {
                             // 从 files 数组中查找对应的文件大小和修改时间
                             var fileSize = null;
@@ -2000,7 +2003,7 @@ class LocalBrowsePlugin extends Plugin {
      */
     isImageFile(fileName) {
         var ext = fileName.split('.').pop().toLowerCase();
-        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1};
+        var imageExts = {'jpg':1,'jpeg':1,'png':1,'gif':1,'webp':1,'svg':1,'bmp':1,'heic':1,'heif':1,'livp':1};
         return !!imageExts[ext];
     }
 
@@ -2538,7 +2541,7 @@ class LocalBrowsePlugin extends Plugin {
         var icons = {
             'pdf': '📕', 'doc': '📄', 'docx': '📄', 'xls': '📊', 'xlsx': '📊',
             'ppt': '📊', 'pptx': '📊', 'txt': '📝', 'md': '📝',
-            'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'webp': '🖼️', 'svg': '🖼️', 'bmp': '🖼️',
+            'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'webp': '🖼️', 'svg': '🖼️', 'bmp': '🖼️', 'heic': '🖼️', 'heif': '🖼️', 'livp': '📷',
             'mp3': '🎵', 'wav': '🎵', 'flac': '🎵',
             'mp4': '🎬', 'avi': '🎬', 'mkv': '🎬', 'mov': '🎬',
             'zip': '📦', 'rar': '📦', '7z': '📦', 'tar': '📦', 'gz': '📦',
