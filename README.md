@@ -1,131 +1,128 @@
-# LocalBrowse for SiYuan
+## 前言
 
-Browse local mounted drive files directly in SiYuan's dock panel. Click any file to automatically copy it to SiYuan's assets folder and insert it as an attachment.
+思源笔记软件非常优秀，适合all-in-one，但感觉太重了，所以我就想着把本地文件（视频、图片、文档、压缩包等）以链接的形式插入到笔记中，即减轻思源笔记的重量，又实现了all-in-one。但每次都要手动打开资源管理器、找到文件、再回到笔记里手写链接，操作繁琐且容易出错。尤其是我习惯把网盘通过工具挂载为本地盘，想要快速浏览和插入其中的文件更是麻烦。
 
-## Features
+于是我开发了 **LocalBrowse** 这个插件，把本地文件浏览器直接嵌入到思源笔记的 Dock 面板里，不用离开思源就能浏览、搜索、插入本地文件链接或者本地文件（我是把网盘挂载为本地盘，每台电脑都挂载统一盘符，或者通过同步盘同步到本地，只要是文件的路径一样就行，这样即使跨电脑，插入到思源笔记里的本地链接也是可以使用的）。
 
-- **Browse local drives**: Navigate through local mounted drives using native file system access
-- **One-click insert**: Click a file to copy it to `workspace/data/assets/` and insert into the current note
-- **Image support**: Images are inserted with `![]()` markdown for inline display
-- **File support**: Other files are inserted as `[filename](assets/...)` links
-- **Duplicate handling**: Files are renamed with timestamps to avoid conflicts
-- **Dark mode compatible**: Styles adapt to SiYuan's theme
-- **Multi-drive support**: Switch between multiple mounted drives via dropdown
-- **Favorites**: Pin frequently used folders for quick access
-- **Search & deep search**: Real-time filtering + recursive search across subdirectories
-- **Sorting**: Sort by name / size / modification time, ascending or descending
-- **List & icon views**: Toggle between compact list and thumbnail grid
-- **Image hover preview**: Hover over images to see a preview with filename
-- **File modification time**: Display file size and modification time in list view
-- **Persistent state**: Remembers last drive, folder, view mode, and sort preferences
+---
 
-## Requirements
+## 插件简介
 
-- SiYuan Note v3.0.0+ (desktop version)
-- **Windows desktop** environment
-- Optional: CloudDrive2, Alist, or any drive mounting tool
+**LocalBrowse**（本地文件浏览器）是一个思源笔记桌面端插件，在右侧 Dock 面板中提供轻量级的本地文件浏览器，支持浏览本地驱动器、搜索文件、一键将文件复制到 `assets` 目录并插入到当前笔记中。
 
-## Installation
+- **插件名称**：LocalBrowse / 本地文件浏览器
+- **适用平台**：Windows 桌面版思源笔记（v3.0.0+）
+- **开源协议**：GPL-3.0
+- **GitHub 仓库**：https://github.com/sqalei/siyuan-plugin-localbrowse
 
-1. Download the latest release ZIP from GitHub
-2. In SiYuan: Settings → Bazaar → Download → Import
-3. Select the ZIP file and install
-4. Enable the plugin in the plugin list
+---
 
-## Tutorial
+## 核心功能
 
-### Opening the File Browser
+### 📁 浏览本地驱动器
 
-1. After installation, a **folder+cloud icon** appears in the right dock panel
-2. Click the icon to open the file browser panel
-3. The panel displays files and folders from your last visited location (or the default drive root)
+插件启动后自动检测所有可用盘符（C:、D:、E:……），通过左上角的下拉框即可快速切换。无论你是浏览本地磁盘，还是通过工具挂载的网盘。同步盘，都能直接访问。
 
-### Navigating Files
+### ✨ 一键插入文件到笔记
 
-- **Click a folder** to enter it
-- **Click a file** to select it (highlighted)
-- **Double-click a file** to insert it into the current note
-- Use the **breadcrumb navigation** at the top to go back to parent folders
-- Click the **home icon (🏠)** in the breadcrumb to return to the drive root
+1、**双击文件**，插件自动完成将**文件链接**插入到当前文档中：
 
-### Switching Drives
+在当前编辑器光标处插入 Markdown 链接
 
-- Use the **drive dropdown** in the top-left to switch between available drives (T:, D:, etc.)
-- The plugin remembers your last selected drive
+图片文件 → `![文件名](assets/文件名)` 内联显示
 
-### Using Favorites
+其他文件 → `[文件名](assets/文件名)` 链接形式
 
-1. **Right-click** any folder → select **"Add to Favorites"**
-2. Favorite folders appear as quick-access chips at the top
-3. Click a favorite to jump directly to that folder
-4. Right-click a favorite → select **"Remove from Favorites"** to delete
+2、也可以**右键菜单**选择"复制到 assets 并插入"，直接将**文件本体**插入到当前文档中，操作灵活。
 
-### Searching Files
+### 🔍 实时搜索 & 深度搜索
 
-- **Real-time search**: Type in the search box to filter files in the current directory
-- **Deep search**: Press **Enter** to search recursively across all subdirectories
-- During deep search, a **"Return"** button appears to go back to normal browsing
+- **实时搜索**：在搜索框输入关键词，即时过滤当前目录的文件（支持多关键词空格分隔 AND 匹配）
+- **深度搜索**：按 Enter 键递归搜索所有子目录，结果渐进式返回，实时显示搜索进度。搜索完成后可点击"返回"按钮回到正常浏览模式
 
-### Sorting Files
+### ⭐ 收藏夹
 
-- Click the **sort button** (e.g., "↑ Name") next to the breadcrumb
-- Choose from: **By Name** / **By Size** / **By Modification Time**
-- Toggle **Ascending / Descending** order
-- Your sort preference is saved automatically
+右键点击任意文件夹 → "添加收藏"，收藏的文件夹以标签形式显示在顶部，点击即可一键跳转。常去的文件夹不再需要逐层点进去。
 
-### Switching Views
+### 📊 排序功能
 
-- Click the **view toggle button** (☰ / ⊞) to switch between:
-  - **List view**: Compact list with file name, size, and modification time
-  - **Icon view**: Thumbnail grid with image previews
-- Your view preference is saved automatically
+按名称 / 大小 / 修改时间排序，支持升序和降序切换。排序偏好自动保存，下次打开时保持上次的排序方式。
 
-### Image Preview
+### 🖼️ 列表视图 & 图标视图
 
-- In **icon view**, hover over an image file to see a large preview
-- The preview appears to the right of your cursor
-- The **filename** is displayed below the preview image
+- **列表视图**：紧凑排列，显示文件名、大小和修改时间
+- **图标视图**：缩略图网格，图片文件鼠标悬停显示大图预览
 
-### Inserting Files into Notes
+两种视图一键切换，偏好自动保存。
 
-1. Navigate to the file you want
-2. **Double-click** the file (or right-click → "Open")
-3. The file is automatically:
-   - Copied to your SiYuan workspace's `data/assets/` directory
-   - Inserted at the cursor position in the current editor
-4. For images: inserted as `![filename](assets/filename)`
-5. For other files: inserted as `[filename](assets/filename)`
+### 💾 状态持久化
 
-## Troubleshooting
+插件会自动记住你上次选择的盘符、浏览的文件夹、视图模式和排序方式，下次打开时直接回到上次的位置，无需重新导航。
 
-### "Cannot access directory"
-- Make sure the drive is mounted and accessible
-- Check that the drive letter is correct
+### 🌗 暗色模式适配
 
-### "Cannot get workspace path"
-- Make sure you're using the desktop version of SiYuan
-- The plugin needs access to the local file system
+样式自动适配思源笔记主题，暗色模式下同样舒适可用。
 
-### File not inserted
-- Make sure the editor is focused before clicking a file
-- If automatic insertion fails, the markdown link is copied to clipboard - just Ctrl+V
+---
 
-## Changelog
-
-### v0.4.0
-- Renamed to LocalBrowse (formerly CloudDrive File Browser)
-- Added favorites support for quick folder access
-- Added search and deep search across subdirectories
-- Added sorting by name / size / modification time
-- Added list view and icon view with thumbnail grid
-- Added image hover preview with filename
-- Added file size and modification time display
-- Persistent state for drive, folder, view mode, and sort preferences
-- Multi-drive support with dropdown selector
-- Improved breadcrumb navigation with home icon
+## 使用场景
 
 
+| 场景             | 说明                                                                     |
+| ---------------- | ------------------------------------------------------------------------ |
+| **网盘文件管理** | 挂载阿里云盘、百度网盘为本地盘，网盘的同步盘，在思源中直接浏览和插入文件 |
+| **本地图片插入** | 浏览本地图片库，双击即可插入到笔记中内联显示                             |
+| **资料整理**     | 批量浏览本地文件夹，快速将文档、PDF 等作为附件插入笔记                   |
+| **项目文件引用** | 浏览项目目录，将代码、文档等文件以链接形式嵌入笔记                       |
 
-## License
+---
 
-Copyright (C) 2026 sqalei. Licensed under the [GNU General Public License v3.0](https://github.com/sqalei/siyuan-plugin-localbrowse/blob/main/LICENSE).
+## 安装方法
+
+### 方式一：从集市安装（推荐）
+
+1. 打开思源笔记 → 设置 → 集市
+2. 搜索"LocalBrowse"或"本地文件浏览器"
+3. 点击安装并启用
+
+### 方式二：手动导入
+
+1. 前往 [GitHub Releases](https://github.com/sqalei/siyuan-plugin-localbrowse) 下载最新版 ZIP 安装包
+2. 思源笔记 → 设置 → 集市 → 下载 → 导入
+3. 选择下载的 ZIP 文件并安装
+4. 在插件列表中启用插件
+
+---
+
+## 快速上手
+
+1. 安装启用后，右侧 Dock 面板会出现**文件夹图标** 📂
+2. 点击图标打开文件浏览器
+3. 左上角选择盘符，单击文件夹进入，单击面包屑导航返回上级
+4. 找到文件后**双击**即可插入到当前笔记
+
+> 💡 小贴士：右键文件夹可以添加收藏，右键文件可以复制到 assets 并插入。深度搜索按 Enter 触发，支持多关键词空格分隔。
+
+---
+
+## 常见问题
+
+**Q：提示"无法访问目录"怎么办？**
+A：请确认对应的驱动器已正确挂载且可访问。如果使用的是网盘挂载工具，确保挂载服务正在运行。
+
+**Q：文件没有插入到笔记中？**
+A：请确保双击文件前编辑器已聚焦（点击一下编辑区域）。如果自动插入失败，Markdown 链接会自动复制到剪贴板，直接 Ctrl+V 粘贴即可。
+
+**Q：支持 macOS / Linux 吗？**
+A：目前仅支持 Windows 桌面版，因为插件依赖 Node.js 的文件系统接口和 Windows 盘符体系。其他平台的支持在后续计划中。
+
+---
+
+## 反馈与建议
+
+如果你在使用过程中遇到任何问题，或有功能建议，欢迎通过以下方式反馈：
+
+- **GitHub Issues**：https://github.com/sqalei/siyuan-plugin-localbrowse/issues
+- **本帖回复**：直接在本帖下方留言
+
+如果你感觉本插件对你有用，请帮我点亮🌟，我会持续改进和完善这个插件，感谢大家的支持和反馈！🙏
