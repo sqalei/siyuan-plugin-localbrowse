@@ -15,8 +15,7 @@
     "windows"
   ],
   "frontends": [
-    "desktop",
-    "desktop-window"
+    "desktop"
   ],
   "readme": {
     "default": "README.md",

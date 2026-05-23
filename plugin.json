@@ -8,8 +8,7 @@
         "windows"
     ],
     "frontends": [
-        "desktop",
-        "desktop-window"
+        "desktop"
     ],
     "icon": "icon.png",
     "displayName": {
