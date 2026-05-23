@@ -22,12 +22,12 @@ archive.on('error', function(err) {
 archive.pipe(output);
 
 // Files to include in the zip (must use forward slashes for SiYuan compatibility)
+// Note: icon.svg is excluded per SiYuan bazaar requirements
 const files = [
     'index.js',
     'index.css',
     'plugin.json',
     'icon.png',
-    'icon.svg',
     'preview.png',
     'README.md',
     'README_zh_CN.md',
