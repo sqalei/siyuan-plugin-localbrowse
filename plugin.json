@@ -10,7 +10,7 @@
     "frontends": [
         "desktop"
     ],
-    "icon": "icon.png",
+    "disabledInPublish": true,
     "displayName": {
         "default": "LocalBrowse",
         "zh_CN": "本地文件浏览器"
