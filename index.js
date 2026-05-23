@@ -50,6 +50,8 @@ class LocalBrowsePlugin extends Plugin {
         this.sortBy = 'name';       // 排序方式：name | size | mtime
         this.sortOrder = 'asc';     // 排序顺序：asc | desc
         this.iconRenderState = null; // 图标视图滚动渲染状态
+        this._isScrolling = false;   // 是否正在滚动中（滚动时暂停预览）
+        this._scrollEndTimer = null; // 滚动结束检测计时器
     }
 
     onload() {
@@ -84,6 +86,11 @@ class LocalBrowsePlugin extends Plugin {
         if (this._scrollTimer) {
             clearTimeout(this._scrollTimer);
             this._scrollTimer = null;
+        }
+        // 清理滚动结束检测计时器
+        if (this._scrollEndTimer) {
+            clearTimeout(this._scrollEndTimer);
+            this._scrollEndTimer = null;
         }
         // 清理图标渲染状态
         this.iconRenderState = null;
@@ -173,6 +180,10 @@ class LocalBrowsePlugin extends Plugin {
                     if (that._searchRenderTimer) {
                         clearTimeout(that._searchRenderTimer);
                         that._searchRenderTimer = null;
+                    }
+                    if (that._scrollEndTimer) {
+                        clearTimeout(that._scrollEndTimer);
+                        that._scrollEndTimer = null;
                     }
                     that.hideImagePreview();
                 }
@@ -1255,6 +1266,8 @@ class LocalBrowsePlugin extends Plugin {
                     }
                     // 记录鼠标位置，用于预览图定位
                     that._previewMousePos = { x: e.clientX, y: e.clientY };
+                    // 滚动中暂停预览，避免卡顿
+                    if (that._isScrolling) return;
                     // 图片文件：延迟显示预览
                     var isDir = item.dataset.isdir === 'true';
                     var name = item.dataset.name;
@@ -2637,6 +2650,22 @@ class LocalBrowsePlugin extends Plugin {
         var fileListEl = e.target;
         var state = that.iconRenderState;
         if (!state || state.isLoading) return;
+
+        // 标记正在滚动，暂停鼠标预览
+        that._isScrolling = true;
+        if (that._previewTimer) {
+            clearTimeout(that._previewTimer);
+            that._previewTimer = null;
+        }
+        that.hideImagePreview();
+
+        // 滚动结束后恢复预览功能
+        if (that._scrollEndTimer) {
+            clearTimeout(that._scrollEndTimer);
+        }
+        that._scrollEndTimer = setTimeout(function() {
+            that._isScrolling = false;
+        }, 300);
 
         // 清除之前的定时器
         if (that._scrollTimer) {
