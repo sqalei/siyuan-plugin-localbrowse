@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-localbrowse",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "displayName": {
     "default": "LocalBrowse",
     "zh_CN": "本地文件浏览器"
