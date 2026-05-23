@@ -23,28 +23,6 @@ var fs = null;
 var path = null;
 var os = null;
 
-/**
- * 辅助函数：解析 EXIF GPS 有理数（度/分/秒 → 十进制度数）
- * 独立于类定义，供 parseExifIFD 调用
- */
-function _parseGPSRational(buf, offset, bigEndian) {
-    var get32r = function(b, off) {
-        return bigEndian ? ((b[off] << 24) | (b[off + 1] << 16) | (b[off + 2] << 8) | b[off + 3]) >>> 0
-                        : ((b[off + 3] << 24) | (b[off + 2] << 16) | (b[off + 1] << 8) | b[off]) >>> 0;
-    };
-    if (offset + 24 > buf.length) return null;
-    var degNum = get32r(buf, offset);
-    var degDen = get32r(buf, offset + 4);
-    var minNum = get32r(buf, offset + 8);
-    var minDen = get32r(buf, offset + 12);
-    var secNum = get32r(buf, offset + 16);
-    var secDen = get32r(buf, offset + 20);
-    var deg = degDen ? degNum / degDen : 0;
-    var min = minDen ? minNum / minDen : 0;
-    var sec = secDen ? secNum / secDen : 0;
-    return deg + min / 60 + sec / 3600;
-}
-
 try {
     fs = require('fs');
     path = require('path');
@@ -286,6 +264,7 @@ class LocalBrowsePlugin extends Plugin {
                 that.showSortMenu(this);
             });
         }
+
 
         // 检测并绑定盘符下拉框
         that.detectDrives(function(drives) {
@@ -2056,35 +2035,15 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
 
-        // 异步读取 EXIF 拍摄时间和 GPS，有则替换显示
+        // 异步读取 EXIF 拍摄时间，有则替换显示
         that._previewExifPath = filePath; // 标记当前预览文件，避免异步回调错位
         that.readExifData(filePath, function(exifResult) {
             // 确保回调时仍在预览同一文件
             if (!exifResult || that._previewExifPath !== filePath) return;
-            var tEl = document.getElementById('cd-preview-time');
-            if (tEl) {
-                var parts = [];
-                if (exifResult.dateTime) {
-                    parts.push('📷 ' + exifResult.dateTime);
-                }
-                if (exifResult.gps) {
-                    // 先显示经纬度，然后异步逆地理编码替换
-                    var latStr = Math.abs(exifResult.gps.lat).toFixed(2) + '°' + (exifResult.gps.lat >= 0 ? 'N' : 'S');
-                    var lngStr = Math.abs(exifResult.gps.lng).toFixed(2) + '°' + (exifResult.gps.lng >= 0 ? 'E' : 'W');
-                    tEl.textContent = parts.length > 0 ? parts.join('  ') + '  📍' + latStr + ' ' + lngStr : '📍' + latStr + ' ' + lngStr;
-
-                    // 异步逆地理编码
-                    (function(currentPath, currentParts) {
-                        that.reverseGeocode(exifResult.gps.lat, exifResult.gps.lng, function(placeName) {
-                            if (that._previewExifPath !== currentPath) return;
-                            var tEl2 = document.getElementById('cd-preview-time');
-                            if (tEl2 && placeName) {
-                                tEl2.textContent = (currentParts.length > 0 ? currentParts.join('  ') + '  ' : '') + '📍' + placeName;
-                            }
-                        });
-                    })(filePath, parts.slice());
-                } else if (parts.length > 0) {
-                    tEl.textContent = parts.join('  ');
+            if (exifResult.dateTime) {
+                var tEl = document.getElementById('cd-preview-time');
+                if (tEl) {
+                    tEl.textContent = '📷 ' + exifResult.dateTime;
                 }
             }
         });
@@ -2143,9 +2102,6 @@ class LocalBrowsePlugin extends Plugin {
         btn.textContent = arrow + ' ' + (labels[this.sortBy] || '名称');
     }
 
-    /**
-     * 显示排序菜单
-     */
     showSortMenu(anchorBtn) {
         var that = this;
         var menu = document.getElementById('cd-sort-menu');
@@ -2356,14 +2312,15 @@ class LocalBrowsePlugin extends Plugin {
         try {
             if (typeof this.loadData === 'function') {
                 this.loadData('pathSettings').then(function(data) {
-                    if (data && typeof data === 'object' && data.currentPath) {
+                    if (data && typeof data === 'object') {
+                    if (data.currentPath) {
                         that.currentPath = data.currentPath;
-                        // 同步盘符
                         var driveMatch = data.currentPath.match(/^([A-Za-z]):/);
                         if (driveMatch) {
                             that.driveLetter = driveMatch[1].toUpperCase();
                         }
                     }
+                }
                 }).catch(function() {
                     // 忽略加载失败
                 });
@@ -2604,7 +2561,7 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 从图片文件中读取 EXIF 数据（拍摄时间 + GPS 坐标）
+     * 从图片文件中读取 EXIF 拍摄时间
      * 仅解析 JPEG 的 EXIF IFD，轻量实现无需第三方库
      */
     readExifData(filePath, callback) {
@@ -2655,8 +2612,8 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 解析 EXIF IFD 数据，提取拍摄时间和 GPS 信息
-     * 返回 { dateTime, gps: { lat, lng } } 或 null
+     * 解析 EXIF IFD 数据，提取拍摄时间
+     * 返回 { dateTime } 或 null
      */
     parseExifIFD(exifBuf) {
         if (exifBuf.length < 8) return null;
@@ -2674,24 +2631,21 @@ class LocalBrowsePlugin extends Plugin {
                             : ((buf[off + 3] << 24) | (buf[off + 2] << 16) | (buf[off + 1] << 8) | buf[off]) >>> 0;
         };
 
-        var result = { dateTime: null, gps: null };
+        var result = { dateTime: null };
 
         var ifd0Offset = get32(exifBuf, 4);
         if (ifd0Offset + 2 > exifBuf.length) return null;
 
         var numEntries = get16(exifBuf, ifd0Offset);
         var exifIFDOffset = null;
-        var gpsIFDOffset = null;
 
-        // 在 IFD0 中查找 ExifOffset (0x8769) 和 GPSInfo (0x8825)
+        // 在 IFD0 中查找 ExifOffset (0x8769)
         for (var i = 0; i < numEntries; i++) {
             var entryOff = ifd0Offset + 2 + i * 12;
             if (entryOff + 12 > exifBuf.length) break;
             var tag = get16(exifBuf, entryOff);
             if (tag === 0x8769) {
                 exifIFDOffset = get32(exifBuf, entryOff + 8);
-            } else if (tag === 0x8825) {
-                gpsIFDOffset = get32(exifBuf, entryOff + 8);
             }
         }
 
@@ -2720,88 +2674,7 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
 
-        // 解析 GPS IFD：提取纬度 (0x0002) 和经度 (0x0004)
-        if (gpsIFDOffset !== null && gpsIFDOffset + 2 <= exifBuf.length) {
-            var gpsLatRef = null, gpsLat = null, gpsLngRef = null, gpsLng = null;
-            var gpsEntries = get16(exifBuf, gpsIFDOffset);
-            for (var g = 0; g < gpsEntries; g++) {
-                var gOff = gpsIFDOffset + 2 + g * 12;
-                if (gOff + 12 > exifBuf.length) break;
-                var gTag = get16(exifBuf, gOff);
-                var gType = get16(exifBuf, gOff + 2);
-                var gCount = get32(exifBuf, gOff + 4);
-                var gValOff = get32(exifBuf, gOff + 8);
-
-                if (gTag === 0x0001) {
-                    // GPSLatitudeRef: ASCII 'N' or 'S'
-                    gpsLatRef = String.fromCharCode(exifBuf[gOff + 8]);
-                } else if (gTag === 0x0003) {
-                    // GPSLongitudeRef: ASCII 'E' or 'W'
-                    gpsLngRef = String.fromCharCode(exifBuf[gOff + 8]);
-                } else if (gTag === 0x0002 && gType === 5 && gCount === 3) {
-                    // GPSLatitude: 3 个 unsigned rational
-                    gpsLat = _parseGPSRational(exifBuf, gValOff, bigEndian);
-                } else if (gTag === 0x0004 && gType === 5 && gCount === 3) {
-                    // GPSLongitude: 3 个 unsigned rational
-                    gpsLng = _parseGPSRational(exifBuf, gValOff, bigEndian);
-                }
-            }
-            if (gpsLat !== null && gpsLng !== null) {
-                var lat = gpsLat;
-                var lng = gpsLng;
-                if (gpsLatRef === 'S') lat = -lat;
-                if (gpsLngRef === 'W') lng = -lng;
-                result.gps = { lat: lat, lng: lng };
-            }
-        }
-
-        return (result.dateTime || result.gps) ? result : null;
-    }
-
-    /**
-     * 使用 Nominatim 逆地理编码，将经纬度转为地名
-     * 简易缓存，避免重复请求
-     */
-    reverseGeocode(lat, lng, callback) {
-        var that = this;
-        var cacheKey = lat.toFixed(3) + ',' + lng.toFixed(3);
-        // 缓存检查（精度到约 100m，同一区域不重复请求）
-        if (!that._geoCache) that._geoCache = {};
-        if (that._geoCache[cacheKey]) {
-            callback(that._geoCache[cacheKey]);
-            return;
-        }
-        var url = 'https://nominatim.openstreetmap.org/reverse?format=json&lat=' + lat + '&lon=' + lng + '&accept-language=zh&zoom=16';
-        fetch(url, {
-            headers: { 'User-Agent': 'SiYuan-LocalBrowse-Plugin/0.5.2' }
-        }).then(function(resp) {
-            return resp.json();
-        }).then(function(data) {
-            var name = '';
-            if (data && data.address) {
-                var addr = data.address;
-                // 优先显示：城市+区+道路/地标
-                var parts = [];
-                if (addr.city || addr.town || addr.county) parts.push(addr.city || addr.town || addr.county);
-                if (addr.suburb || addr.district || addr.borough) parts.push(addr.suburb || addr.district || addr.borough);
-                if (addr.road || addr.pedestrian || addr.footway) parts.push(addr.road || addr.pedestrian || addr.footway);
-                if (parts.length === 0) {
-                    // 回退：用 display_name 前两段
-                    var displayParts = (data.display_name || '').split(',');
-                    if (displayParts.length >= 2) {
-                        name = displayParts[0].trim() + ', ' + displayParts[1].trim();
-                    } else if (displayParts.length === 1) {
-                        name = displayParts[0].trim();
-                    }
-                } else {
-                    name = parts.join(' ');
-                }
-            }
-            that._geoCache[cacheKey] = name;
-            callback(name);
-        }).catch(function() {
-            callback('');
-        });
+        return result.dateTime ? result : null;
     }
 
     /**
