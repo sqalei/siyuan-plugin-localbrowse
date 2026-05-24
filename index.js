@@ -52,6 +52,8 @@ class LocalBrowsePlugin extends Plugin {
         this.iconRenderState = null; // 图标视图滚动渲染状态
         this._isScrolling = false;   // 是否正在滚动中（滚动时暂停预览）
         this._scrollEndTimer = null; // 滚动结束检测计时器
+        // 在构造函数中一次性绑定滚动处理函数，避免每次切换视图时重复创建引用
+        this._boundIconScroll = this.onIconScroll.bind(this);
     }
 
     onload() {
@@ -103,6 +105,18 @@ class LocalBrowsePlugin extends Plugin {
         if (this._sortMenuClickHandler) {
             document.removeEventListener('click', this._sortMenuClickHandler);
             this._sortMenuClickHandler = null;
+        }
+        // 清理排序菜单 DOM 残留
+        var sortMenu = document.getElementById('cd-sort-menu');
+        if (sortMenu) sortMenu.remove();
+        // 清理 toast 定时器
+        if (this._toastTimer1) {
+            clearTimeout(this._toastTimer1);
+            this._toastTimer1 = null;
+        }
+        if (this._toastTimer2) {
+            clearTimeout(this._toastTimer2);
+            this._toastTimer2 = null;
         }
         // 清理搜索渲染计时器
         if (this._searchRenderTimer) {
@@ -185,6 +199,23 @@ class LocalBrowsePlugin extends Plugin {
                         clearTimeout(that._scrollEndTimer);
                         that._scrollEndTimer = null;
                     }
+                    if (that._scrollTimer) {
+                        clearTimeout(that._scrollTimer);
+                        that._scrollTimer = null;
+                    }
+                    if (that._toastTimer1) {
+                        clearTimeout(that._toastTimer1);
+                        that._toastTimer1 = null;
+                    }
+                    if (that._toastTimer2) {
+                        clearTimeout(that._toastTimer2);
+                        that._toastTimer2 = null;
+                    }
+                    // 取消正在进行的深度搜索
+                    if (that._deepSearchAbort) {
+                        that._deepSearchAbort.cancelled = true;
+                        that._deepSearchAbort = null;
+                    }
                     that.hideImagePreview();
                 }
             });
@@ -206,6 +237,7 @@ class LocalBrowsePlugin extends Plugin {
                 '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
                 '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
                 '<button id="cd-refresh" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="刷新" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">↻</button>' +
+                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🧲</button>' +
             '</div>' +
             '<div id="cd-search-wrap" style="margin-bottom:2px;position:relative;flex-shrink:0;display:none">' +
                 '<input id="cd-search" type="text" placeholder="搜索当前目录（按 Enter 深度搜索）..." style="width:100%;padding:6px 56px 6px 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
@@ -233,6 +265,18 @@ class LocalBrowsePlugin extends Plugin {
         if (refreshBtn) {
             refreshBtn.addEventListener('click', function() {
                 that.loadDirectory(that.currentPath || that.driveLetter + ':\\');
+            });
+        }
+
+        // 绑定修复链接按钮
+        var relinkBtn = el.querySelector('#cd-relink-btn');
+        if (relinkBtn) {
+            relinkBtn.addEventListener('click', function() {
+                console.log('[LocalBrowse] relink button clicked');
+                that.relinkBrokenLinks().catch(function(e) {
+                    console.error('[LocalBrowse] relink error:', e);
+                    that.showToastMsg('修复链接出错：' + (e.message || e));
+                });
             });
         }
 
@@ -543,9 +587,15 @@ class LocalBrowsePlugin extends Plugin {
                         // 某些文件可能无法获取stat
                     }
 
+                    // 通过 fs.statSync 回退判断（symlink/junction/挂载点等 OTHER 类型）
+                    var isDir = entry.isDirectory();
+                    if (!isDir && !entry.isFile() && stat) {
+                        try { isDir = stat.isDirectory(); } catch(e) {}
+                    }
+
                     files.push({
                         name: entry.name,
-                        isDir: entry.isDirectory(),
+                        isDir: isDir,
                         size: size,
                         mtime: mtime,
                         path: fullPath
@@ -600,22 +650,40 @@ class LocalBrowsePlugin extends Plugin {
 
         var letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
         var checked = 0;
+        var finished = false;
+
+        // 超时保护：5 秒后强制返回已检测到的盘符（防止网络盘 access 永不回调）
+        var timeout = setTimeout(function() {
+            if (!finished) {
+                finished = true;
+                drives.sort();
+                if (drives.length === 0) drives.push('T');
+                that.availableDrives = drives;
+                callback(drives);
+            }
+        }, 5000);
+
+        function tryFinish() {
+            if (finished) return;
+            finished = true;
+            clearTimeout(timeout);
+            drives.sort();
+            if (drives.length === 0) drives.push('T');
+            that.availableDrives = drives;
+            callback(drives);
+        }
 
         for (var i = 0; i < letters.length; i++) {
             (function(letter) {
                 var drivePath = letter + ':\\';
                 fs.access(drivePath, fs.constants.F_OK, function(err) {
+                    if (finished) return;
                     checked++;
                     if (!err) {
                         drives.push(letter);
                     }
                     if (checked === letters.length) {
-                        // 按字母排序
-                        drives.sort();
-                        // 如果没有检测到任何盘符，默认保留 T
-                        if (drives.length === 0) drives.push('T');
-                        that.availableDrives = drives;
-                        callback(drives);
+                        tryFinish();
                     }
                 });
             })(letters[i]);
@@ -855,7 +923,7 @@ class LocalBrowsePlugin extends Plugin {
      * @param {Function} onPartial - 渐进式回调，参数为新增结果数组
      * @param {Function} onComplete - 完成回调，参数为全部结果数组
      */
-    async deepSearch(dirPath, query, onPartial, onComplete) {
+    async deepSearch(dirPath, query, onPartial, onComplete, externalAbort) {
         var that = this;
         var allResults = [];
         // 支持多关键词：空格分隔，所有关键词都必须匹配（AND 逻辑）
@@ -863,12 +931,18 @@ class LocalBrowsePlugin extends Plugin {
         var searchedDirs = 0;
         var matchedFiles = 0;
 
-        // 取消之前的搜索（如果有）
-        if (this._deepSearchAbort) {
-            this._deepSearchAbort.cancelled = true;
+        // 如果有外部传入的 abortFlag（如并行 relink 场景），使用外部的，避免互相取消
+        // 否则使用共享的 abortion 机制（向后兼容）
+        var abortFlag;
+        if (externalAbort) {
+            abortFlag = externalAbort;
+        } else {
+            if (this._deepSearchAbort) {
+                this._deepSearchAbort.cancelled = true;
+            }
+            abortFlag = { cancelled: false };
+            this._deepSearchAbort = abortFlag;
         }
-        var abortFlag = { cancelled: false };
-        this._deepSearchAbort = abortFlag;
 
         // 并发池：最多同时执行 CONCURRENCY 个 readdir
         var CONCURRENCY = 16;
@@ -996,7 +1070,7 @@ class LocalBrowsePlugin extends Plugin {
 
                     // 只等待 stat 操作完成（获取文件大小/时间），不再等子目录递归
                     return Promise.all(subPromises);
-                }).catch(function() {
+                }).catch(function(err) {
                     // 目录无权限等错误，静默跳过
                 }).finally(function() {
                     taskFinished();
@@ -1110,8 +1184,8 @@ class LocalBrowsePlugin extends Plugin {
             that.renderIconBatch(fileListEl);
 
             // 绑定滚动事件（使用 passive 提升性能，先移除旧的）
+            // 使用构造函数中绑定的 _boundIconScroll，避免重复创建函数引用导致 removeEventListener 失效
             fileListEl.removeEventListener('scroll', that._boundIconScroll);
-            that._boundIconScroll = that.onIconScroll.bind(that);
             fileListEl.addEventListener('scroll', that._boundIconScroll, { passive: true });
 
             return;
@@ -1338,22 +1412,38 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 插入本地文件链接到编辑器
+     * 附加文件的 size 和 mtime 信息到 URL fragment，用于失效链接修复时的精确匹配
      */
-    insertLocalFileLink(filePath, fileName) {
+    insertLocalFileLink(filePath, fileName, isFolder) {
         var that = this;
         var fileUrl = this.toFileUrl(filePath);
         
+        // 尝试获取文件的 size 和 mtime，作为链接标题（title）用于指纹匹配
+        var fingerprintTitle = '';
+        try {
+            var stat = fs.statSync(filePath);
+            if (stat) {
+                fingerprintTitle = 'size=' + stat.size + '&mtime=' + (stat.mtime ? stat.mtime.getTime() : 0);
+            }
+        } catch(e) {
+            // 获取不到就算了，不影响正常插入
+        }
+        
         var markdown;
+        var icon = isFolder ? '📂' : this.getFileIcon(fileName);
+        var linkText = icon + ' ' + this.escapeMarkdown(fileName);
         
         if (this.isImageFile(fileName)) {
             // 图片：直接显示
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         } else {
-            // 其他文件：显示为链接
-            markdown = '[' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
+            // 其他文件：显示为链接，锚文本干净，标题放指纹
+            if (fingerprintTitle) {
+                markdown = '[' + linkText + '](' + fileUrl + ' "' + fingerprintTitle + '")';
+            } else {
+                markdown = '[' + linkText + '](' + fileUrl + ')';
+            }
         }
-        
-        // console.log('[LocalBrowse] Inserting link:', markdown);
         
         // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
         this.tryInsertToEditor(markdown, function(success) {
@@ -1695,11 +1785,31 @@ class LocalBrowsePlugin extends Plugin {
      * 显示提示消息
      */
     showToastMsg(msg) {
+        // 方式1：使用插件自带的 showMessage
         if (typeof this.showMessage === 'function') {
             this.showMessage(msg);
-        } else if (window.siyuan && window.siyuan.messenger) {
+        }
+        // 方式2：使用思源全局 messenger
+        if (window.siyuan && window.siyuan.messenger) {
             window.siyuan.messenger.show(msg);
         }
+        // 方式3：兜底 - 在编辑器区域显示浮动提示
+        var existingToast = document.getElementById('cd-toast-msg');
+        if (existingToast) {
+            existingToast.remove();
+        }
+        var toast = document.createElement('div');
+        toast.id = 'cd-toast-msg';
+        toast.textContent = msg;
+        toast.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
+            'background:var(--b3-theme-surface,#1e1e1e);color:var(--b3-theme-on-surface,#e0e0e0);' +
+            'padding:16px 32px;border-radius:8px;font-size:15px;z-index:999999;' +
+            'box-shadow:0 4px 20px rgba(0,0,0,0.4);transition:opacity 0.3s;pointer-events:none;';
+        document.body.appendChild(toast);
+        setTimeout(function() {
+            toast.style.opacity = '0';
+            setTimeout(function() { toast.remove(); }, 300);
+        }, 2500);
     }
 
     /**
@@ -1723,7 +1833,7 @@ class LocalBrowsePlugin extends Plugin {
                 items.push({ icon: '⭐', label: '添加到收藏', action: function() { that.addFavorite(filePath, fileName); } });
             }
             items.push({ type: 'divider' });
-            items.push({ icon: '📋', label: '复制路径', action: function() { that.copyFilePath(filePath); } });
+            items.push({ icon: '🔗', label: '添加到文档', action: function() { that.insertLocalFileLink(filePath, fileName, true); } });
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         } else {
@@ -1896,14 +2006,29 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 复制 Markdown 链接到剪贴板
+     * 同样附加 size+mtime fragment
      */
     copyMarkdownLink(filePath, fileName) {
         var fileUrl = this.toFileUrl(filePath);
+        // 获取文件指纹，作为链接标题（title）
+        var fingerprintTitle = '';
+        try {
+            var stat = fs.statSync(filePath);
+            if (stat) {
+                fingerprintTitle = 'size=' + stat.size + '&mtime=' + (stat.mtime ? stat.mtime.getTime() : 0);
+            }
+        } catch(e) {}
         var markdown;
+        var icon = this.getFileIcon(fileName);
+        var linkText = icon + ' ' + this.escapeMarkdown(fileName);
         if (this.isImageFile(fileName)) {
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         } else {
-            markdown = '[' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
+            if (fingerprintTitle) {
+                markdown = '[' + linkText + '](' + fileUrl + ' "' + fingerprintTitle + '")';
+            } else {
+                markdown = '[' + linkText + '](' + fileUrl + ')';
+            }
         }
         this.copyToClipboard(markdown);
         this.showToastMsg('✅ Markdown 链接已复制');
@@ -2145,9 +2270,13 @@ class LocalBrowsePlugin extends Plugin {
                     var searchInput = document.getElementById('cd-search');
                     var query = searchInput ? searchInput.value.trim() : '';
                     if (query) {
-                        var lowerQuery = query.toLowerCase();
+                        var keywords = query.toLowerCase().split(/\s+/).filter(function(k) { return k.length > 0; });
                         filtered = filtered.filter(function(f) {
-                            return f.name.toLowerCase().indexOf(lowerQuery) !== -1;
+                            var nameLower = f.name.toLowerCase();
+                            for (var ki = 0; ki < keywords.length; ki++) {
+                                if (nameLower.indexOf(keywords[ki]) === -1) return false;
+                            }
+                            return true;
                         });
                     }
                     filtered = that.sortFiles(filtered);
@@ -2850,6 +2979,1632 @@ class LocalBrowsePlugin extends Plugin {
                 that.renderIconBatch(fileListEl);
             }
         }, 200);
+    }
+
+    // ========== 失效链接修复功能 ==========
+
+    /**
+     * 入口：点击 🔗 按钮触发
+     */
+    async relinkBrokenLinks() {
+        var that = this;
+        console.log('[LocalBrowse] relinkBrokenLinks started');
+
+        // 1. 获取当前活动文档 ID
+        var docId = that.getCurrentDocId();
+        console.log('[LocalBrowse] relinkBrokenLinks - docId:', docId);
+        if (!docId) {
+            that.showToastMsg('请先打开一个文档');
+            return;
+        }
+
+        // 2. 扫描失效链接
+        try {
+            var result = await that.scanBrokenLinks(docId);
+            if (!result || !result.broken || result.broken.length === 0) {
+                if (result && result.total === 0) {
+                    that.showToastMsg('📄 当前文档没有本地文件链接');
+                } else {
+                    that.showToastMsg('✅ 该文档内所有本地链接均有效');
+                }
+                return;
+            }
+
+            // 3. 先弹出对话框显示失效链接列表
+            that.showRelinkDialog(result.broken, result.total, result.valid, docId);
+
+            // 4. 在对话框内自动搜索修复（并行处理所有失效链接）
+            var dialog = document.getElementById('cd-relink-dialog');
+            if (dialog) {
+                var autoFixed = 0;
+                var needManual = [];
+
+                // 定义单个链接的搜索修复函数
+                async function processLink(item, i) {
+                    var candidates = [];
+                    var statusEl = dialog.querySelector('.cd-relink-status[data-index="' + i + '"]');
+                    var candidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + i + '"]');
+                    // 独立的 abortFlag，避免并行搜索时互相取消
+                    var _abortFlag = { cancelled: false };
+
+                    if (statusEl) {
+                        statusEl.textContent = '🔍 搜索中...';
+                        statusEl.style.color = 'var(--b3-theme-secondary,#999)';
+                    }
+
+                    // 对话框已关闭则跳过搜索
+                    if (dialog._relinkAborted) {
+                        item._searchResults = [];
+                        return { manual: true };
+                    }
+
+                    // 搜索策略：旧路径附近 → 上级 → 盘符根（逐步扩大）
+                    var parentDir = '';
+                    var lastSep = Math.max(item.localPath.lastIndexOf('\\'), item.localPath.lastIndexOf('/'));
+                    if (lastSep > 0) {
+                        parentDir = item.localPath.substring(0, lastSep);
+                    }
+
+                    // 第一轮：旧路径父目录，深度2
+                    var r1Candidates = [];
+                    if (parentDir && fs.existsSync(parentDir)) {
+                        r1Candidates = await that.searchFileByName(item.fileName, parentDir, {
+                            maxDepth: 2, maxResults: 5, maxDirs: 100, timeoutMs: 2000,
+                            onProgress: function(info) {
+                                if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R1 已扫 ' + info.dirsScanned + ' 目录</span>';
+                            }
+                        });
+                    }
+                    var r1Exact = r1Candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                    if (r1Exact.length > 0) candidates = r1Exact;
+
+                    // 第二轮：父目录的上级，深度3
+                    if (candidates.length === 0 && parentDir) {
+                        var grandParent = '';
+                        var gpSep = Math.max(parentDir.lastIndexOf('\\'), parentDir.lastIndexOf('/'));
+                        if (gpSep > 2) grandParent = parentDir.substring(0, gpSep);
+                        if (grandParent && grandParent.length > 3 && fs.existsSync(grandParent)) {
+                            if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R2 搜索中...</span>';
+                            var r2Candidates = await that.searchFileByName(item.fileName, grandParent, {
+                                maxDepth: 3, maxResults: 5, maxDirs: 150, timeoutMs: 2000,
+                                onProgress: function(info) {
+                                    if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R2 已扫 ' + info.dirsScanned + ' 目录</span>';
+                                }
+                            });
+                            var r2Exact = r2Candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                            if (r2Exact.length > 0) candidates = r2Exact;
+                        }
+                    }
+
+                    // 第三轮：全盘深度搜索
+                    if (candidates.length === 0) {
+                        var driveRoot = item.localPath.charAt(0) + ':\\';
+                        var r3AllCandidates = [];
+                        var r3TotalSearched = 0;
+                        var r3TotalMatched = 0;
+
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 全盘深度搜索...</span>';
+
+                        await new Promise(function(resolve) {
+                            that.deepSearch(driveRoot, item.fileName, function(partialResults, dirsScanned, matchedFiles) {
+                                r3TotalSearched = dirsScanned || r3TotalSearched;
+                                r3TotalMatched = matchedFiles || r3TotalMatched;
+                                if (candidateArea) {
+                                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 已扫 ' + r3TotalSearched + ' 目录' + (r3TotalMatched > 0 ? '·' + r3TotalMatched + '个' : '') + '</span>';
+                                }
+                            }, function(allResults, wasCancelled) {
+                                for (var ri = 0; ri < allResults.length; ri++) {
+                                    var r = allResults[ri];
+                                    if (r.name === item.fileName || (r.name && r.name.toLowerCase() === item.fileName.toLowerCase())) {
+                                        r3AllCandidates.push({
+                                            fullPath: r.path, size: r.size || 0, mtime: r.mtime || 0,
+                                            matchType: r.name === item.fileName ? 'exact' : 'case-insensitive',
+                                            similarity: r.name === item.fileName ? 1 : 0.95
+                                        });
+                                    }
+                                }
+                                resolve(true);
+                            }, _abortFlag);
+                        });
+
+                        // 网盘兼容：枚举根目录子目录分别搜索
+                        if (r3AllCandidates.length === 0) {
+                            try {
+                                var rootEntries = fs.readdirSync(driveRoot, { withFileTypes: true });
+                                var subDirs = [];
+                                for (var ei = 0; ei < rootEntries.length; ei++) {
+                                    var e = rootEntries[ei];
+                                    var isDir = e.isDirectory();
+                                    if (!isDir && !e.isFile()) {
+                                        try { isDir = fs.statSync(driveRoot + e.name).isDirectory(); } catch(err) {}
+                                    }
+                                    if (isDir) subDirs.push(driveRoot + e.name);
+                                }
+                                for (var si = 0; si < subDirs.length && r3AllCandidates.length < 10; si++) {
+                                    await new Promise(function(resolve) {
+                                        that.deepSearch(subDirs[si], item.fileName, function(partialResults, dirsScanned, matchedFiles) {
+                                            r3TotalSearched += (dirsScanned || 0);
+                                            r3TotalMatched += (matchedFiles || 0);
+                                            if (candidateArea) {
+                                                candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 已扫 ' + r3TotalSearched + ' 目录' + (r3TotalMatched > 0 ? '·' + r3TotalMatched + '个' : '') + '</span>';
+                                            }
+                                        }, function(allResults, wasCancelled) {
+                                            for (var ri = 0; ri < allResults.length; ri++) {
+                                                var r = allResults[ri];
+                                                if (r.name === item.fileName || (r.name && r.name.toLowerCase() === item.fileName.toLowerCase())) {
+                                                    r3AllCandidates.push({
+                                                        fullPath: r.path, size: r.size || 0, mtime: r.mtime || 0,
+                                                        matchType: r.name === item.fileName ? 'exact' : 'case-insensitive',
+                                                        similarity: r.name === item.fileName ? 1 : 0.95
+                                                    });
+                                                }
+                                            }
+                                            resolve(true);
+                                        }, _abortFlag);
+                                    });
+                                }
+                            } catch (e) {}
+                        }
+
+                        if (r3AllCandidates.length > 0) candidates = r3AllCandidates;
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 搜索完成（' + r3TotalSearched + ' 目录）</span>';
+                    }
+
+                    // 处理搜索结果
+                    var exactCandidates = candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                    if (item.fileFingerprint && (item.fileFingerprint.size !== null || item.fileFingerprint.mtime !== null)) {
+                        exactCandidates.sort(function(a, b) {
+                            var aScore = 0, bScore = 0;
+                            if (item.fileFingerprint.size !== null && a.size === item.fileFingerprint.size) aScore += 2;
+                            if (item.fileFingerprint.mtime !== null && a.mtime === item.fileFingerprint.mtime) aScore += 1;
+                            if (item.fileFingerprint.size !== null && b.size === item.fileFingerprint.size) bScore += 2;
+                            if (item.fileFingerprint.mtime !== null && b.mtime === item.fileFingerprint.mtime) bScore += 1;
+                            if (aScore !== bScore) return bScore - aScore;
+                            return b.mtime - a.mtime;
+                        });
+                    } else {
+                        exactCandidates.sort(function(a, b) { return b.mtime - a.mtime; });
+                    }
+
+                    item._searchResults = exactCandidates;
+
+                    if (exactCandidates.length === 1) {
+                        await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, { dialog: dialog, brokenLinks: result.broken });
+                        if (statusEl) {
+                            statusEl.textContent = '✅ 已修复';
+                            statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
+                        }
+                        return { fixed: true };
+                    } else if (exactCandidates.length > 1) {
+                        var matchInfo = exactCandidates.length + ' 个精确匹配';
+                        var candidateHtml = '<div style="margin-top:4px;font-size:11px;color:var(--b3-theme-secondary,#999)">找到 ' + matchInfo + '，请选择：</div>';
+                        candidateHtml += '<div style="margin-top:4px;max-height:150px;overflow-y:auto;border:1px solid var(--b3-border,#eee);border-radius:4px">';
+                        for (var c = 0; c < exactCandidates.length; c++) {
+                            var cand = exactCandidates[c];
+                            var sizeStr = that.formatSize(cand.size);
+                            var mtime = new Date(cand.mtime);
+                            var dateStr = mtime.getFullYear() + '/' + (mtime.getMonth()+1) + '/' + mtime.getDate();
+                            var matchLabel = cand.matchType === 'exact' ? '✅' : '🔤';
+                            var fingerprintMatch = false;
+                            if (item.fileFingerprint) {
+                                if (item.fileFingerprint.size !== null && cand.size === item.fileFingerprint.size &&
+                                    item.fileFingerprint.mtime !== null && cand.mtime === item.fileFingerprint.mtime) {
+                                    fingerprintMatch = true;
+                                } else if (item.fileFingerprint.size !== null && cand.size === item.fileFingerprint.size) {
+                                    fingerprintMatch = true;
+                                }
+                            }
+                            if (fingerprintMatch) matchLabel = '🎯';
+                            var rowBg = ';background:rgba(82,196,26,0.08)';
+                            candidateHtml += '<label style="display:block;padding:4px 8px;cursor:pointer;font-size:11px;border-bottom:1px solid var(--b3-border,#f5f5f5);word-break:break-all;color:#333' + rowBg + '">' +
+                                '<input type="radio" name="cd-relink-cand-' + i + '" value="' + c + '" ' + (c === 0 ? 'checked' : '') + ' style="margin-right:4px">' +
+                                matchLabel + ' ' + that.escapeHtml(cand.fullPath) + ' <span style="color:var(--b3-theme-secondary,#999)">' + sizeStr + '</span> <span style="color:#888">' + dateStr + (fingerprintMatch ? ' (指纹匹配)' : '') + '</span>' +
+                            '</label>';
+                        }
+                        candidateHtml += '</div>';
+                        candidateHtml += '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:6px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
+                        candidateArea.innerHTML = candidateHtml;
+                        candidateArea._candidates = exactCandidates;
+                        if (statusEl) {
+                            statusEl.textContent = '⚠️ 待确认';
+                            statusEl.style.color = 'var(--b3-theme-warning,#faad14)';
+                        }
+                        var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                        if (confirmBtn) {
+                            confirmBtn.addEventListener('click', async function() {
+                                var idx = parseInt(this.getAttribute('data-index'));
+                                var area = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
+                                var selectedRadio = area.querySelector('input[type="radio"]:checked');
+                                if (!selectedRadio) return;
+                                var candIdx = parseInt(selectedRadio.value);
+                                var chosen = area._candidates[candIdx];
+                                await that.replaceLink(docId, result.broken[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: result.broken });
+                                // 刷新底部状态统计
+                                var allStatusEls = dialog.querySelectorAll('.cd-relink-status');
+                                var newFixed = 0, newPending = 0;
+                                for (var s = 0; s < allStatusEls.length; s++) {
+                                    if (allStatusEls[s].textContent === '✅ 已修复') newFixed++;
+                                    else if (allStatusEls[s].textContent === '⚠️ 待确认') newPending++;
+                                }
+                                var bottomSpan = dialog.querySelector('#cd-relink-fixall');
+                                if (bottomSpan) {
+                                    if (newPending === 0) {
+                                        bottomSpan.textContent = '✅ 全部修复完成';
+                                        bottomSpan.style.color = 'var(--b3-theme-success,#52c41a)';
+                                    } else {
+                                        bottomSpan.textContent = '⚠️ 已自动修复 ' + newFixed + '/' + result.broken.length + ' 个，' + newPending + ' 个待确认';
+                                        bottomSpan.style.color = 'var(--b3-theme-warning,#faad14)';
+                                    }
+                                }
+                            });
+                        }
+                        return { manual: true };
+                    } else {
+                        item._searchResults = [];
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">❌ 未找到同名文件</span>';
+                        if (statusEl) {
+                            statusEl.textContent = '❌ 失效';
+                            statusEl.style.color = 'var(--b3-theme-error,#e74c3c)';
+                        }
+                        return { manual: true };
+                    }
+                }
+
+                // 并行启动所有链接的搜索修复（每个链接的错误隔离，避免一个失败导致全部中断）
+                var processPromises = [];
+                for (var i = 0; i < result.broken.length; i++) {
+                    (function(idx) {
+                        processPromises.push(
+                            processLink(result.broken[idx], idx).catch(function(e) {
+                                console.error('[LocalBrowse] processLink error for item', idx, e);
+                                // 更新 UI 显示错误状态
+                                var errStatusEl = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
+                                var errCandidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
+                                if (errStatusEl) {
+                                    errStatusEl.textContent = '⚠️ 出错';
+                                    errStatusEl.style.color = 'var(--b3-theme-warning,#faad14)';
+                                }
+                                if (errCandidateArea) {
+                                    errCandidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-warning,#faad14)">⚠️ 搜索出错：' + (e.message || '未知错误') + '</span>';
+                                }
+                                return { error: true, message: e.message, index: idx };
+                            })
+                        );
+                    })(i);
+                }
+                var results = await Promise.all(processPromises);
+
+                // 统计结果
+                for (var ri = 0; ri < results.length; ri++) {
+                    if (results[ri].error) {
+                        // 发生错误，标记为需要手动处理
+                        needManual.push(result.broken[ri]);
+                    } else if (results[ri].fixed) autoFixed++;
+                    else if (results[ri].manual) needManual.push(result.broken[ri]);
+                }
+
+                // 更新状态信息
+                var fixAllBtn = dialog.querySelector('#cd-relink-fixall');
+                if (fixAllBtn) {
+                    if (needManual.length === 0) {
+                        fixAllBtn.textContent = '✅ 全部修复完成';
+                        fixAllBtn.style.color = 'var(--b3-theme-success,#52c41a)';
+                    } else {
+                        fixAllBtn.textContent = '⚠️ 已自动修复 ' + autoFixed + '/' + result.broken.length + ' 个，' + needManual.length + ' 个待确认';
+                        fixAllBtn.style.color = 'var(--b3-theme-warning,#faad14)';
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('[LocalBrowse] relink scan error:', e);
+            that.showToastMsg('扫描链接失败：' + (e.message || e));
+        }
+    }
+
+    /**
+     * 获取当前活动文档的 block ID
+     */
+    getCurrentDocId() {
+        try {
+            // 方式1：通过思源布局 API 获取当前活动文档（最可靠）
+            if (window.siyuan && window.siyuan.layout && window.siyuan.layout.centerLayout) {
+                try {
+                    var currDoc = window.siyuan.layout.centerLayout.children.map(function(item) {
+                        return item.children.find(function(child) {
+                            return child.headElement && child.headElement.classList.contains('item--focus') &&
+                                   (child.panelElement.closest('.layout__wnd--active') || child.panelElement.closest('[data-type="wnd"]'));
+                        });
+                    }).find(function(item) { return item; });
+                    if (currDoc && currDoc.model && currDoc.model.editor && currDoc.model.editor.protyle) {
+                        var protyleEl = currDoc.model.editor.protyle.element;
+                        if (protyleEl) {
+                            var titleEl = protyleEl.querySelector('.protyle-title');
+                            if (titleEl && titleEl.dataset && titleEl.dataset.nodeId) {
+                                console.log('[LocalBrowse] getCurrentDocId - method1 (layout API):', titleEl.dataset.nodeId);
+                                return titleEl.dataset.nodeId;
+                            }
+                        }
+                    }
+                } catch (e2) {
+                    console.log('[LocalBrowse] getCurrentDocId - method1 error:', e2.message);
+                }
+            }
+
+            // 方式2：通过 DOM 查询 .protyle-title[data-node-id]
+            var activeProtyl = document.querySelector('[data-type="wnd"].layout__wnd--active .protyle:not(.fn__none)') ||
+                               document.querySelector('[data-type="wnd"] .protyle:not(.fn__none)');
+            if (activeProtyl) {
+                var titleEl2 = activeProtyl.querySelector('.protyle-title');
+                if (titleEl2 && titleEl2.dataset && titleEl2.dataset.nodeId) {
+                    console.log('[LocalBrowse] getCurrentDocId - method2 (DOM title):', titleEl2.dataset.nodeId);
+                    return titleEl2.dataset.nodeId;
+                }
+            }
+
+            // 方式3：从 protyle-wysiwyg 向上找 .protyle，再找 .protyle-title
+            var wysiwyg = document.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+            if (wysiwyg) {
+                var container = wysiwyg.closest('.protyle');
+                if (container) {
+                    var titleEl3 = container.querySelector('.protyle-title');
+                    if (titleEl3 && titleEl3.dataset && titleEl3.dataset.nodeId) {
+                        console.log('[LocalBrowse] getCurrentDocId - method3 (wysiwyg→title):', titleEl3.dataset.nodeId);
+                        return titleEl3.dataset.nodeId;
+                    }
+                }
+            }
+
+            console.log('[LocalBrowse] getCurrentDocId - all methods failed');
+            return null;
+        } catch (e) {
+            console.error('[LocalBrowse] getCurrentDocId error:', e);
+            return null;
+        }
+    }
+
+    /**
+     * 扫描文档中的 file:/// 链接，检测失效链接
+     */
+    async scanBrokenLinks(docId) {
+        var that = this;
+
+        // 获取文档 Kramdown 内容
+        var resp = await fetch('/api/block/getBlockKramdown', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: docId })
+        });
+        var data = await resp.json();
+        if (data.code !== 0 || !data.data || !data.data.kramdown) {
+            throw new Error('获取文档内容失败');
+        }
+        var kramdown = data.data.kramdown;
+
+        // 匹配所有 file:/// 链接（支持路径中包含括号）
+        // 策略：先找到 [text](file:///... ) 的整体，再提取 URL
+        var broken = [];
+        var total = 0;
+        var valid = 0;
+        var seen = {}; // 去重
+
+        // 用更可靠的方式：找到所有 file:/// 出现的位置，然后向前找匹配的 )
+        var fileUrlRegex = /file:\/\/\//g;
+        var urlMatch;
+        while ((urlMatch = fileUrlRegex.exec(kramdown)) !== null) {
+            var urlStart = urlMatch.index;
+            // 从 urlStart 向后找，找到对应的 )（考虑括号嵌套）
+            var depth = 0;
+            var urlEnd = urlStart;
+            for (var ci = urlStart; ci < kramdown.length; ci++) {
+                var ch = kramdown.charAt(ci);
+                if (ch === '(') depth++;
+                else if (ch === ')') {
+                    if (depth === 0) {
+                        urlEnd = ci;
+                        break;
+                    }
+                    depth--;
+                }
+            }
+            var urlPart = kramdown.substring(urlStart, urlEnd);
+            // 从 URL 部分提取 title（如果有）：file:///path "title"
+            // urlPart 格式: file:///path 或 file:///path "title"
+            var titleMatch = urlPart.match(/\s+"([^"]*)"\s*$/);
+            var linkTitle = titleMatch ? titleMatch[1] : '';
+            // 去掉 title 后的纯 URL（找到 title 前的引号位置，截断）
+            var urlWithoutTitle = urlPart;
+            if (linkTitle) {
+                var quoteIdx = urlPart.lastIndexOf('"' + linkTitle + '"');
+                if (quoteIdx !== -1) {
+                    urlWithoutTitle = urlPart.substring(0, quoteIdx).trim();
+                }
+            }
+            var fullUrl = urlWithoutTitle;
+
+            // 向前找 [displayText]
+            var bracketStart = kramdown.lastIndexOf('[', urlStart);
+            var bracketEnd = kramdown.indexOf(']', bracketStart);
+            var displayText = '';
+            if (bracketStart >= 0 && bracketEnd > bracketStart && bracketEnd < urlStart) {
+                displayText = kramdown.substring(bracketStart + 1, bracketEnd);
+            }
+
+            // 从链接 title 中提取文件指纹（size & mtime），用于精确定位同名文件
+            // 注意：kramdown 中 & 可能被编码为 &amp;，需要解码
+            var decodedLinkTitle = linkTitle.replace(/&amp;/g, '&');
+            var fileFingerprint = { size: null, mtime: null };
+            if (decodedLinkTitle) {
+                var sizeMatch = decodedLinkTitle.match(/size=(\d+)/);
+                var mtimeMatch = decodedLinkTitle.match(/mtime=(\d+)/);
+                if (sizeMatch) fileFingerprint.size = parseInt(sizeMatch[1]);
+                if (mtimeMatch) fileFingerprint.mtime = parseInt(mtimeMatch[1]);
+            }
+
+            // 去重：同一个 URL 只检测一次
+            if (seen[fullUrl]) continue;
+            seen[fullUrl] = true;
+            total++;
+
+            // URL 转本地路径
+            var localPath = that.fileUrlToLocalPath(fullUrl);
+
+            // 检测文件是否存在
+            if (fs && fs.existsSync && fs.existsSync(localPath)) {
+                valid++;
+            } else {
+                // 提取文件名
+                var fileName = localPath.split('\\').pop().split('/').pop();
+                broken.push({
+                    oldUrl: fullUrl,
+                    localPath: localPath,
+                    fileName: fileName,
+                    displayText: displayText,
+                    fileFingerprint: fileFingerprint  // 保存文件指纹，用于搜索时精确匹配
+                });
+            }
+        }
+
+        return { broken: broken, total: total, valid: valid };
+    }
+
+    /**
+     * file:/// URL 转本地路径
+     */
+    fileUrlToLocalPath(url) {
+        var decoded = decodeURIComponent(url);
+        // file:///D:/docs/file.pdf → D:\docs\file.pdf
+        var local = decoded.replace(/^file:\/\/\//, '').replace(/\//g, '\\');
+        return local;
+    }
+
+    /**
+     * 本地路径转 file:/// URL（URL 编码版本，用于 Kramdown/Markdown）
+     */
+    localPathToFileUrl(localPath) {
+        // D:\腾讯电脑管家截图文件\局部截取_20250918_131642.png
+        // → file:///D:/%E8%85%BE%E8%AE%AF.../局部截取_20250918_131642.png
+        var normalized = localPath.replace(/\\/g, '/');
+        // 只对路径中的每个段做编码，不编码 / 和 :
+        var segments = normalized.split('/');
+        var encodedSegments = segments.map(function(s) {
+            // 如果段包含 :（如 D:），不编码
+            if (/^[a-zA-Z]:$/.test(s)) return s;
+            // 否则对段内字符编码，但保留 / 和 :
+            return encodeURIComponent(s).replace(/%2F/g, '/').replace(/%3A/g, ':');
+        });
+        return 'file:///' + encodedSegments.join('/');
+    }
+
+    /**
+     * 本地路径转 file:/// URL（不编码版本，用于 DOM 替换）
+     * 思源 DOM 中的 data-src 等属性里，中文路径不编码
+     */
+    localPathToFileUrlRaw(localPath) {
+        // D:\腾讯电脑管家截图文件\局部截取_20250918_131642.png
+        // → file:///D:/腾讯电脑管家截图文件/局部截取_20250918_131642.png
+        var normalized = localPath.replace(/\\/g, '/');
+        return 'file:///' + normalized;
+    }
+
+    /**
+     * 显示修复失效链接对话框
+     */
+    showRelinkDialog(brokenLinks, total, valid, docId) {
+        var that = this;
+
+        // 构建失效链接列表 HTML
+        var listHtml = '';
+        for (var i = 0; i < brokenLinks.length; i++) {
+            var item = brokenLinks[i];
+            listHtml += '<div class="cd-relink-item" data-index="' + i + '" style="padding:10px 12px;border-bottom:1px solid var(--b3-border,#eee)">' +
+                '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
+                    '<span style="font-size:14px">📄</span>' +
+                    '<span style="font-weight:bold;font-size:13px;word-break:break-all">' + that.escapeHtml(item.fileName) + '</span>' +
+                    '<span class="cd-relink-status" data-index="' + i + '" style="margin-left:auto;font-size:11px;color:var(--b3-theme-secondary,#999);white-space:nowrap">❌ 失效</span>' +
+                '</div>' +
+                '<div style="font-size:11px;color:var(--b3-theme-secondary,#999);word-break:break-all;margin-bottom:6px;padding-left:20px">旧路径：' + that.escapeHtml(item.localPath) + '</div>' +
+                '<div class="cd-relink-candidate-area" data-index="' + i + '" style="padding-left:20px;font-size:11px;color:var(--b3-theme-secondary,#999);max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>' +
+            '</div>';
+        }
+
+        var contentHtml = '<div style="padding:16px;min-width:420px;max-width:560px;max-height:80vh;display:flex;flex-direction:column">' +
+            '<div style="font-weight:bold;font-size:14px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--b3-border,#eee)">🔗 修复失效链接</div>' +
+            '<div style="font-size:12px;color:var(--b3-theme-secondary,#999);margin-bottom:10px">找到 <b style="color:var(--b3-theme-error,#e74c3c)">' + brokenLinks.length + '</b> 个失效链接（共 ' + total + ' 个本地链接，<b style="color:var(--b3-theme-success,#52c41a)">' + valid + '</b> 个有效）</div>' +
+            '<div class="cd-relink-list" style="flex:1;overflow-y:auto;min-height:0">' + listHtml +             '</div>' +
+            '<div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px">' +
+                '<span id="cd-relink-fixall" style="padding:5px 16px;font-size:12px;background:transparent;color:var(--b3-theme-secondary,#999);border-radius:4px;pointer-events:none;user-select:none">🔍 搜索中...</span>' +
+                '<button id="cd-relink-close" style="padding:5px 16px;font-size:12px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer">关闭</button>' +
+            '</div>' +
+        '</div>';
+
+        var dialog = document.createElement('div');
+        dialog.id = 'cd-relink-dialog';
+        dialog._relinkAborted = false;
+        dialog.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.35);z-index:10000;display:flex;align-items:center;justify-content:center';
+        dialog.innerHTML = '<div style="background:var(--b3-theme-background,#fff);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.2);max-width:90vw;max-height:90vh;overflow:auto">' + contentHtml + '</div>';
+        document.body.appendChild(dialog);
+
+        // 存储上下文
+        var context = {
+            dialog: dialog,
+            brokenLinks: brokenLinks,
+            docId: docId
+        };
+
+        // 点击遮罩关闭
+        dialog.addEventListener('click', function(e) {
+            if (e.target === dialog) {
+                dialog._relinkAborted = true;
+                document.body.removeChild(dialog);
+            }
+        });
+
+        // 关闭按钮
+        var closeBtn = dialog.querySelector('#cd-relink-close');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', function() {
+                dialog._relinkAborted = true;
+                if (dialog.parentNode) document.body.removeChild(dialog);
+            });
+        }
+    }
+
+    /**
+     * 一键修复所有失效链接
+     */
+    async relinkFixAll(context) {
+        var that = this;
+        var brokenLinks = context.brokenLinks;
+        var docId = context.docId;
+        var dialog = context.dialog;
+        var fixAllBtn = dialog.querySelector('#cd-relink-fixall');
+
+        if (fixAllBtn) {
+            fixAllBtn.disabled = true;
+            fixAllBtn.textContent = '🔧 修复中...';
+        }
+
+        var fixed = 0;
+        var failed = 0;
+
+        for (var i = 0; i < brokenLinks.length; i++) {
+            var item = brokenLinks[i];
+            var statusEl = dialog.querySelector('.cd-relink-status[data-index="' + i + '"]');
+            var candidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + i + '"]');
+
+            // 复用对话框打开时已经搜索到的结果
+            var exactCandidates = item._searchResults || [];
+
+            if (exactCandidates.length === 1) {
+                // 唯一精确匹配，直接替换
+                if (statusEl) {
+                    statusEl.textContent = '🔧 修复中...';
+                    statusEl.style.color = 'var(--b3-theme-secondary,#999)';
+                }
+                await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, context);
+                if (statusEl) {
+                    statusEl.textContent = '✅ 已修复';
+                    statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
+                }
+                fixed++;
+            } else if (exactCandidates.length > 1) {
+                // 多个精确匹配，显示让用户选择（如果还没展示）
+                if (statusEl) {
+                    statusEl.textContent = '⚠️ 待确认';
+                    statusEl.style.color = 'var(--b3-theme-warning,#faad14)';
+                }
+                if (candidateArea && !candidateArea.querySelector('input[type="radio"]')) {
+                    var matchInfo = exactCandidates.length + ' 个精确匹配';
+                    var candidateHtml = '<div style="margin-top:4px;font-size:11px;color:var(--b3-theme-secondary,#999)">找到 ' + matchInfo + '，请选择：</div>';
+                    candidateHtml += '<div style="margin-top:4px;max-height:150px;overflow-y:auto;border:1px solid var(--b3-border,#eee);border-radius:4px">';
+                    for (var c = 0; c < exactCandidates.length; c++) {
+                        var cand = exactCandidates[c];
+                        var sizeStr = that.formatSize(cand.size);
+                        var mtime = new Date(cand.mtime);
+                        var dateStr = mtime.getFullYear() + '/' + (mtime.getMonth()+1) + '/' + mtime.getDate();
+                        var matchLabel = cand.matchType === 'exact' ? '✅' : '🔤';
+                        var fingerprintMatch = false;
+                        if (item.fileFingerprint) {
+                            if (item.fileFingerprint.size !== null && cand.size === item.fileFingerprint.size &&
+                                item.fileFingerprint.mtime !== null && cand.mtime === item.fileFingerprint.mtime) {
+                                fingerprintMatch = true;
+                            } else if (item.fileFingerprint.size !== null && cand.size === item.fileFingerprint.size) {
+                                fingerprintMatch = true;
+                            }
+                        }
+                        if (fingerprintMatch) matchLabel = '🎯';
+                        var rowBg = ';background:rgba(82,196,26,0.08)';
+                        candidateHtml += '<label style="display:block;padding:4px 8px;cursor:pointer;font-size:11px;border-bottom:1px solid var(--b3-border,#f5f5f5);word-break:break-all;color:#333' + rowBg + '">' +
+                            '<input type="radio" name="cd-relink-cand-' + i + '" value="' + c + '" ' + (c === 0 ? 'checked' : '') + ' style="margin-right:4px">' +
+                            matchLabel + ' ' + that.escapeHtml(cand.fullPath) + ' <span style="color:var(--b3-theme-secondary,#999)">' + sizeStr + '</span> <span style="color:#888">' + dateStr + (fingerprintMatch ? ' (指纹匹配)' : '') + '</span>' +
+                        '</label>';
+                    }
+                    candidateHtml += '</div>';
+                    candidateHtml += '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:6px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
+                    candidateArea.innerHTML = candidateHtml;
+                    candidateArea._candidates = exactCandidates;
+
+                    var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                    if (confirmBtn) {
+                        confirmBtn.addEventListener('click', async function() {
+                            var idx = parseInt(this.getAttribute('data-index'));
+                            var area = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
+                            var selectedRadio = area.querySelector('input[type="radio"]:checked');
+                            if (!selectedRadio) return;
+                            var candIdx = parseInt(selectedRadio.value);
+                            var chosen = area._candidates[candIdx];
+                            await that.replaceLink(docId, brokenLinks[idx].oldUrl, chosen.fullPath, idx, context);
+                        });
+                    }
+                }
+                failed++;
+            } else {
+                // 未找到
+                if (statusEl) {
+                    statusEl.textContent = '❌ 失效';
+                    statusEl.style.color = 'var(--b3-theme-error,#e74c3c)';
+                }
+                if (candidateArea) {
+                    candidateArea.innerHTML = '<span style="color:var(--b3-theme-error,#e74c3c)">❌ 未找到同名文件</span>';
+                }
+                failed++;
+            }
+        }
+
+        if (fixAllBtn) {
+            fixAllBtn.disabled = false;
+            if (failed === 0) {
+                fixAllBtn.textContent = '✅ 全部修复完成';
+                fixAllBtn.style.background = 'var(--b3-theme-success,#52c41a)';
+            } else {
+                fixAllBtn.textContent = '🔧 一键修复 (' + fixed + '/' + brokenLinks.length + ')';
+            }
+        }
+
+        if (fixed > 0 && failed === 0) {
+            that.showToastMsg('🎉 全部 ' + fixed + ' 个失效链接已修复');
+        } else if (fixed > 0) {
+            that.showToastMsg('✅ 已修复 ' + fixed + ' 个，' + failed + ' 个需要手动处理');
+        } else {
+            that.showToastMsg('❌ 未找到可自动修复的链接');
+        }
+    }
+
+    /**
+     * 为某条失效链接执行查找新位置
+     */
+    relinkSearchForItem(itemIndex, context) {
+        var that = this;
+        var item = context.brokenLinks[itemIndex];
+        var dialog = context.dialog;
+        var searchBtn = dialog.querySelector('.cd-relink-search-btn[data-index="' + itemIndex + '"]');
+        var candidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + itemIndex + '"]');
+
+        if (!searchBtn || !candidateArea) return;
+
+        // 弹出目录选择器
+        that.pickDirectory(item.localPath, function(searchDir) {
+            if (!searchDir) return; // 用户取消
+
+            searchBtn.disabled = true;
+            searchBtn.textContent = '搜索中...';
+            candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 正在搜索...</span>';
+
+            // 异步搜索
+            that.searchFileByName(item.fileName, searchDir, {
+                maxDepth: 5, maxResults: 20,
+                onProgress: function(info) {
+                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 已扫 ' + info.dirsScanned + ' 目录，精确 ' + info.exactCount + ' 模糊 ' + info.fuzzyCount + '</span>';
+                }
+            }).then(function(candidates) {
+                if (candidates.length === 0) {
+                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">未找到同名或相似文件</span>';
+                    searchBtn.disabled = false;
+                    searchBtn.textContent = '查找新位置';
+                    return;
+                }
+
+                // 区分精确和模糊匹配
+                var exactCount = candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; }).length;
+                var fuzzyCount = candidates.filter(function(c) { return c.matchType === 'fuzzy'; }).length;
+                var matchInfo = exactCount + ' 精确' + (fuzzyCount > 0 ? ' + ' + fuzzyCount + ' 模糊' : '');
+
+                // 显示候选列表
+                var candidateHtml = '<div style="margin-top:8px;font-size:11px;color:var(--b3-theme-secondary,#999)">找到 ' + matchInfo + '：</div>';
+                candidateHtml += '<div style="margin-top:4px;max-height:160px;overflow-y:auto;border:1px solid var(--b3-border,#eee);border-radius:4px">';
+                for (var c = 0; c < candidates.length; c++) {
+                    var cand = candidates[c];
+                    var selected = c === 0 ? 'checked' : '';
+                    var sizeStr = that.formatSize(cand.size);
+                    var mtime = new Date(cand.mtime);
+                    var dateStr = mtime.getFullYear() + '/' + (mtime.getMonth()+1) + '/' + mtime.getDate();
+                    var matchLabel = cand.matchType === 'exact' ? '✅' : (cand.matchType === 'case-insensitive' ? '🔤' : '📎');
+                    var simStr = cand.matchType === 'fuzzy' ? ' <span style="color:var(--b3-theme-warning,#faad14)">~' + Math.round(cand.similarity * 100) + '%</span>' : '';
+                    candidateHtml += '<label style="display:block;padding:4px 8px;cursor:pointer;font-size:11px;border-bottom:1px solid var(--b3-border,#f5f5f5);word-break:break-all;background:rgba(82,196,26,0.08)">' +
+                        '<input type="radio" name="cd-relink-cand-' + itemIndex + '" value="' + c + '" ' + selected + ' style="margin-right:4px">' +
+                        matchLabel + ' ' + that.escapeHtml(cand.fullPath) +
+                        ' <span style="color:var(--b3-theme-secondary,#999)">' + sizeStr + '</span> <span style="color:#888">' + dateStr + '</span>' + simStr +
+                    '</label>';
+                }
+                candidateHtml += '</div>';
+                candidateHtml += '<div style="margin-top:6px;display:flex;gap:6px">' +
+                    '<button class="cd-relink-confirm-btn" data-index="' + itemIndex + '" style="padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>' +
+                    '<button class="cd-relink-cancel-btn" data-index="' + itemIndex + '" style="padding:3px 10px;font-size:11px;background:transparent;color:var(--b3-theme-on-background,#333);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer">取消</button>' +
+                '</div>';
+                candidateArea.innerHTML = candidateHtml;
+
+                // 存储候选数据
+                candidateArea._candidates = candidates;
+
+                // 绑定 radio 点击高亮
+                var radios = candidateArea.querySelectorAll('input[type="radio"]');
+                var labels = candidateArea.querySelectorAll('label');
+                for (var r = 0; r < radios.length; r++) {
+                    (function(radio, label) {
+                        radio.addEventListener('change', function() {
+                            for (var l = 0; l < labels.length; l++) {
+                                labels[l].style.background = '';
+                            }
+                            label.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                        });
+                    })(radios[r], labels[r]);
+                }
+
+                // 确认替换按钮
+                var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                if (confirmBtn) {
+                    confirmBtn.addEventListener('click', function() {
+                        var selectedRadio = candidateArea.querySelector('input[type="radio"]:checked');
+                        if (!selectedRadio) return;
+                        var candIdx = parseInt(selectedRadio.value);
+                        var chosen = candidateArea._candidates[candIdx];
+                        that.replaceLink(context.docId, item.oldUrl, chosen.fullPath, itemIndex, context);
+                    });
+                }
+
+                // 取消按钮
+                var cancelBtn = candidateArea.querySelector('.cd-relink-cancel-btn');
+                if (cancelBtn) {
+                    cancelBtn.addEventListener('click', function() {
+                        candidateArea.innerHTML = '';
+                        searchBtn.disabled = false;
+                        searchBtn.textContent = '查找新位置';
+                    });
+                }
+
+                searchBtn.disabled = false;
+                searchBtn.textContent = '重新查找';
+            }).catch(function(e) {
+                candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">搜索出错：' + that.escapeHtml(e.message || String(e)) + '</span>';
+                searchBtn.disabled = false;
+                searchBtn.textContent = '查找新位置';
+            });
+        });
+    }
+
+    /**
+     * 目录选择器 - 弹出小型模态框
+     * defaultPath: 初始路径（旧链接的父目录）
+     * callback(selectedDir): 选中后回调，null 表示取消
+     */
+    pickDirectory(defaultPath, callback) {
+        var that = this;
+
+        // 计算初始目录：旧路径的父目录
+        var initialDir = '';
+        if (defaultPath) {
+            var sep = defaultPath.lastIndexOf('\\');
+            if (sep > 0) {
+                initialDir = defaultPath.substring(0, sep);
+            } else {
+                sep = defaultPath.lastIndexOf('/');
+                if (sep > 0) {
+                    initialDir = defaultPath.substring(0, sep);
+                }
+            }
+        }
+
+        var contentHtml = '<div style="padding:16px;min-width:380px;max-width:500px">' +
+            '<div style="font-weight:bold;font-size:14px;margin-bottom:12px">📁 选择搜索目录</div>' +
+            '<div style="margin-bottom:8px;font-size:12px;color:var(--b3-theme-secondary,#999)">在此目录下递归搜索同名文件（最多5层深度）</div>' +
+            '<div style="display:flex;gap:4px;margin-bottom:10px">' +
+                '<select id="cd-pick-drive" style="padding:4px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:50px"></select>' +
+                '<input id="cd-pick-path" type="text" value="' + that.escapeHtml(initialDir) + '" placeholder="输入或选择目录路径" style="flex:1;padding:6px 10px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+            '</div>' +
+            '<div id="cd-pick-subdirs" style="max-height:200px;overflow-y:auto;border:1px solid var(--b3-border,#eee);border-radius:4px;margin-bottom:10px;font-size:12px">' +
+                '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">加载中...</div>' +
+            '</div>' +
+            '<div style="display:flex;justify-content:flex-end;gap:8px">' +
+                '<button id="cd-pick-cancel" style="padding:5px 14px;font-size:12px;background:transparent;color:var(--b3-theme-on-background,#333);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer">取消</button>' +
+                '<button id="cd-pick-ok" style="padding:5px 14px;font-size:12px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">选择此目录</button>' +
+            '</div>' +
+        '</div>';
+
+        var picker = document.createElement('div');
+        picker.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.35);z-index:10001;display:flex;align-items:center;justify-content:center';
+        picker.innerHTML = '<div style="background:var(--b3-theme-background,#fff);border-radius:8px;box-shadow:0 8px 32px rgba(0,0,0,0.2)">' + contentHtml + '</div>';
+        document.body.appendChild(picker);
+
+        var pathInput = picker.querySelector('#cd-pick-path');
+        var driveSelect = picker.querySelector('#cd-pick-drive');
+        var subdirsDiv = picker.querySelector('#cd-pick-subdirs');
+        var currentBrowsePath = initialDir;
+
+        // 加载盘符
+        that.detectDrives(function(drives) {
+            if (driveSelect) {
+                driveSelect.innerHTML = '';
+                for (var d = 0; d < drives.length; d++) {
+                    var opt = document.createElement('option');
+                    opt.value = drives[d];
+                    opt.textContent = drives[d] + ':';
+                    // 根据初始路径选盘符
+                    if (initialDir && initialDir.charAt(0).toUpperCase() === drives[d]) {
+                        opt.selected = true;
+                    }
+                    driveSelect.appendChild(opt);
+                }
+            }
+        });
+
+        // 盘符切换
+        if (driveSelect) {
+            driveSelect.addEventListener('change', function() {
+                var newDrive = this.value + ':\\';
+                pathInput.value = newDrive;
+                currentBrowsePath = newDrive;
+                that.loadPickerSubdirs(subdirsDiv, newDrive, pathInput);
+            });
+        }
+
+        // 加载子目录列表
+        function loadSubdirs(dirPath) {
+            that.loadPickerSubdirs(subdirsDiv, dirPath, pathInput);
+        }
+
+        // 初始加载子目录
+        if (initialDir) {
+            loadSubdirs(initialDir);
+        }
+
+        // 选择此目录按钮
+        var okBtn = picker.querySelector('#cd-pick-ok');
+        if (okBtn) {
+            okBtn.addEventListener('click', function() {
+                var selectedDir = pathInput.value.trim();
+                if (!selectedDir) {
+                    that.showToastMsg('请输入目录路径');
+                    return;
+                }
+                if (picker.parentNode) document.body.removeChild(picker);
+                if (callback) callback(selectedDir);
+            });
+        }
+
+        // 取消按钮
+        var cancelBtn = picker.querySelector('#cd-pick-cancel');
+        if (cancelBtn) {
+            cancelBtn.addEventListener('click', function() {
+                if (picker.parentNode) document.body.removeChild(picker);
+                if (callback) callback(null);
+            });
+        }
+
+        // 点击遮罩关闭（等同取消）
+        picker.addEventListener('click', function(e) {
+            if (e.target === picker) {
+                if (picker.parentNode) document.body.removeChild(picker);
+                if (callback) callback(null);
+            }
+        });
+    }
+
+    /**
+     * 加载目录选择器中的子目录列表
+     */
+    loadPickerSubdirs(container, dirPath, pathInput) {
+        var that = this;
+        if (!fs || !fs.existsSync(dirPath)) {
+            container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">目录不存在</div>';
+            return;
+        }
+
+        try {
+            var entries = fs.readdirSync(dirPath, { withFileTypes: true });
+            var dirs = [];
+            for (var i = 0; i < entries.length; i++) {
+                if (entries[i].isDirectory()) {
+                    dirs.push(entries[i].name);
+                }
+            }
+            dirs.sort(function(a, b) { return a.localeCompare(b); });
+
+            if (dirs.length === 0) {
+                container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">无子目录</div>';
+                return;
+            }
+
+            var html = '';
+            // 添加"返回上级"选项
+            var parentDir = path.dirname(dirPath);
+            if (parentDir && parentDir !== dirPath) {
+                html += '<div class="cd-pick-dir-item" data-dir="' + that.escapeHtml(parentDir) + '" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f5f5f5);color:var(--b3-theme-secondary,#999)">📁 ..</div>';
+            }
+            for (var d = 0; d < dirs.length; d++) {
+                var fullPath = dirPath + '\\' + dirs[d];
+                html += '<div class="cd-pick-dir-item" data-dir="' + that.escapeHtml(fullPath) + '" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f5f5f5)">📁 ' + that.escapeHtml(dirs[d]) + '</div>';
+            }
+            container.innerHTML = html;
+
+            // 绑定点击进入子目录
+            var dirItems = container.querySelectorAll('.cd-pick-dir-item');
+            for (var j = 0; j < dirItems.length; j++) {
+                (function(item) {
+                    item.addEventListener('click', function() {
+                        var newDir = item.getAttribute('data-dir');
+                        if (pathInput) pathInput.value = newDir;
+                        that.loadPickerSubdirs(container, newDir, pathInput);
+                    });
+                    item.addEventListener('mouseover', function() {
+                        item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                    });
+                    item.addEventListener('mouseout', function() {
+                        item.style.background = '';
+                    });
+                })(dirItems[j]);
+            }
+        } catch (e) {
+            container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-error,#e74c3c);text-align:center">无法读取目录</div>';
+        }
+    }
+
+    /**
+     * 计算两个字符串的相似度（0~1），基于 Levenshtein 距离
+     */
+    stringSimilarity(a, b) {
+        if (a === b) return 1;
+        if (!a || !b) return 0;
+        var la = a.length, lb = b.length;
+        if (Math.abs(la - lb) > Math.max(la, lb) * 0.5) return 0; // 长度差太大直接跳过
+        var dp = [];
+        for (var i = 0; i <= la; i++) {
+            dp[i] = [i];
+        }
+        for (var j = 0; j <= lb; j++) {
+            dp[0][j] = j;
+        }
+        for (var i = 1; i <= la; i++) {
+            for (var j = 1; j <= lb; j++) {
+                dp[i][j] = Math.min(
+                    dp[i - 1][j] + 1,
+                    dp[i][j - 1] + 1,
+                    dp[i - 1][j - 1] + (a.charAt(i - 1).toLowerCase() === b.charAt(j - 1).toLowerCase() ? 0 : 1)
+                );
+            }
+        }
+        var dist = dp[la][lb];
+        return 1 - dist / Math.max(la, lb);
+    }
+
+    /**
+     * 按文件名递归搜索（支持模糊匹配）
+     * options:
+     *   maxDepth, maxResults, maxDirs, timeoutMs — 同前
+     *   fuzzy: true/false — 是否启用模糊匹配（默认 true）
+     *   fuzzyThreshold: 0~1 — 模糊匹配相似度阈值（默认 0.6）
+     *   onProgress: function(info) — 进度回调，info = { dirsScanned, currentDir, exactCount, fuzzyCount }
+     */
+    async searchFileByName(fileName, searchDir, options) {
+        var that = this;
+        var exactResults = [];   // 精确匹配
+        var fuzzyResults = [];   // 模糊匹配
+        var opts = options || {};
+        var maxDepth = opts.maxDepth || 5;
+        var maxResults = opts.maxResults || 20;
+        var maxDirs = opts.maxDirs || 200;
+        var timeoutMs = opts.timeoutMs || 3000;
+        var enableFuzzy = opts.fuzzy !== false;  // 默认开启
+        var fuzzyThreshold = opts.fuzzyThreshold || 0.6;
+        var onProgress = opts.onProgress || null;
+        var fileNameLower = fileName.toLowerCase();
+
+        if (!fs || !fs.existsSync(searchDir)) {
+            return exactResults;
+        }
+
+        var startTime = Date.now();
+        var queue = [{ dir: searchDir, depth: 0 }];
+        var dirsScanned = 0;
+        var YIELD_INTERVAL = 5;
+
+        while (queue.length > 0 && (exactResults.length + fuzzyResults.length) < maxResults) {
+            if (Date.now() - startTime > timeoutMs) {
+                break;
+            }
+            if (dirsScanned >= maxDirs) {
+                break;
+            }
+
+            var item = queue.shift();
+            if (item.depth > maxDepth) continue;
+
+            try {
+                var entries = fs.readdirSync(item.dir, { withFileTypes: true });
+                for (var i = 0; i < entries.length; i++) {
+                    if ((exactResults.length + fuzzyResults.length) >= maxResults) break;
+                    var entry = entries[i];
+                    try {
+                        if (entry.isFile()) {
+                            var matchType = null;
+
+                            // 精确匹配（原逻辑）
+                            if (entry.name === fileName) {
+                                matchType = 'exact';
+                            }
+                            // 大小写不敏感匹配
+                            else if (entry.name.toLowerCase() === fileNameLower) {
+                                matchType = 'case-insensitive';
+                            }
+                            // 模糊匹配：相似度超过阈值
+                            else if (enableFuzzy && that.stringSimilarity(entry.name, fileName) >= fuzzyThreshold) {
+                                matchType = 'fuzzy';
+                            }
+
+                            if (matchType) {
+                                var fullPath = path.join(item.dir, entry.name);
+                                var stat = fs.statSync(fullPath);
+                                var result = {
+                                    fullPath: fullPath,
+                                    size: stat.size,
+                                    mtime: stat.mtime ? stat.mtime.getTime() : 0,
+                                    matchType: matchType,
+                                    similarity: matchType === 'exact' ? 1 : (matchType === 'case-insensitive' ? 0.95 : that.stringSimilarity(entry.name, fileName))
+                                };
+                                if (matchType === 'exact' || matchType === 'case-insensitive') {
+                                    exactResults.push(result);
+                                } else {
+                                    fuzzyResults.push(result);
+                                }
+                            }
+                        } else if (entry.isDirectory()) {
+                            if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
+                            queue.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
+                        } else if (!entry.isFile()) {
+                            // OTHER 类型（symlink/junction/挂载点等），通过 statSync 判断
+                            try {
+                                var st = fs.statSync(path.join(item.dir, entry.name));
+                                if (st.isDirectory()) {
+                                    queue.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
+                                }
+                            } catch(e) {}
+                        }
+                    } catch (e) {
+                        // 跳过无权限文件
+                    }
+                }
+            } catch (e) {
+                // 跳过无权限目录
+            }
+
+            dirsScanned++;
+
+            // 进度回调
+            if (onProgress && dirsScanned % 3 === 0) {
+                onProgress({
+                    dirsScanned: dirsScanned,
+                    currentDir: item.dir,
+                    exactCount: exactResults.length,
+                    fuzzyCount: fuzzyResults.length
+                });
+            }
+
+            if (dirsScanned % YIELD_INTERVAL === 0) {
+                await new Promise(function(resolve) { setTimeout(resolve, 0); });
+            }
+        }
+
+        // 排序：精确匹配在前，然后按修改时间降序（最近的排前面）
+        exactResults.sort(function(a, b) { return b.mtime - a.mtime; });
+        fuzzyResults.sort(function(a, b) {
+            // 模糊匹配先按相似度降序，再按修改时间降序
+            if (b.similarity !== a.similarity) return b.similarity - a.similarity;
+            return b.mtime - a.mtime;
+        });
+
+        return exactResults.concat(fuzzyResults);
+    }
+
+    /**
+     * 全盘深度搜索文件（无深度限制，并发扫描，渐进式进度反馈）
+     * 用于失效链接修复 R3 阶段：在盘符根目录下全盘搜索同名文件
+     * 融合 deepSearch 的异步高并发架构 + 精确匹配 + 目录过滤 + 早停机制
+     * @param {string} fileName - 要搜索的文件名
+     * @param {string} searchDir - 搜索根目录（通常是盘符根）
+     * @param {Object} options
+     *   maxResults: 最大结果数（默认 10）
+     *   onProgress: 进度回调 function(info) info = { dirsScanned, matchedCount, currentDir, finished }
+     */
+    async deepSearchFileByName(fileName, searchDir, options) {
+        var that = this;
+        var opts = options || {};
+        var maxResults = opts.maxResults || 10;
+        var onProgress = opts.onProgress || null;
+        var fileNameLower = fileName.toLowerCase();
+
+
+        var exactResults = [];
+        var searchedDirs = 0;
+        var abortFlag = { cancelled: false };
+
+        // 并发池（同 deepSearch：异步 I/O + 高并发）
+        var CONCURRENCY = 16;
+        var active = 0;
+        var pendingCallbacks = [];
+        var pendingTasks = 0;
+        var allDoneResolve = null;
+        var allDonePromise = new Promise(function(resolve) { allDoneResolve = resolve; });
+
+        function taskStarted() { pendingTasks++; }
+        function taskFinished() {
+            pendingTasks--;
+            if (pendingTasks === 0 && allDoneResolve) {
+                allDoneResolve();
+                allDoneResolve = null;
+            }
+        }
+
+        function schedule(fn) {
+            return new Promise(function(resolve, reject) {
+                function tryRun() {
+                    if (abortFlag.cancelled) { taskFinished(); resolve(); return; }
+                    if (exactResults.length >= maxResults) { taskFinished(); resolve(); return; }
+                    if (active < CONCURRENCY) {
+                        active++;
+                        fn().then(function(val) {
+                            active--;
+                            resolve(val);
+                            if (pendingCallbacks.length > 0) { var next = pendingCallbacks.shift(); next(); }
+                        }, function(err) {
+                            active--;
+                            reject(err);
+                            if (pendingCallbacks.length > 0) { var next = pendingCallbacks.shift(); next(); }
+                        });
+                    } else {
+                        pendingCallbacks.push(tryRun);
+                    }
+                }
+                tryRun();
+            });
+        }
+
+        // 进度节流：最多每 300ms 回调一次
+        var lastProgressTime = 0;
+        var progressTimer = null;
+        function reportProgress(currentDir) {
+            if (!onProgress) return;
+            var now = Date.now();
+            if (now - lastProgressTime < 300 && !progressTimer) {
+                progressTimer = setTimeout(function() {
+                    progressTimer = null;
+                    lastProgressTime = Date.now();
+                    onProgress({
+                        dirsScanned: searchedDirs,
+                        matchedCount: exactResults.length,
+                        currentDir: currentDir || '',
+                        finished: false
+                    });
+                }, 300);
+                return;
+            }
+            lastProgressTime = now;
+            onProgress({
+                dirsScanned: searchedDirs,
+                matchedCount: exactResults.length,
+                currentDir: currentDir || '',
+                finished: false
+            });
+        }
+
+        function searchRecursive(currentDir) {
+            if (abortFlag.cancelled) return;
+            if (exactResults.length >= maxResults) return;
+
+            var normalizedPath = currentDir;
+            if (!normalizedPath.endsWith('\\')) normalizedPath += '\\';
+
+            taskStarted();
+            schedule(function() {
+                if (abortFlag.cancelled) { taskFinished(); return Promise.resolve(); }
+                if (exactResults.length >= maxResults) { taskFinished(); return Promise.resolve(); }
+
+                // 异步读取目录（同 deepSearch）
+                return fs.promises.readdir(normalizedPath, { withFileTypes: true }).then(function(entries) {
+                    var subPromises = [];
+                    searchedDirs++;
+
+                    for (var i = 0; i < entries.length; i++) {
+                        if (abortFlag.cancelled) break;
+                        if (exactResults.length >= maxResults) break;
+
+                        var entry = entries[i];
+                        var fullPath = normalizedPath + entry.name;
+                        var isFile = entry.isFile();
+                        var isDir = entry.isDirectory();
+
+                        if (isFile) {
+                            // 精确匹配
+                            var matchType = null;
+                            if (entry.name === fileName) {
+                                matchType = 'exact';
+                            } else if (entry.name.toLowerCase() === fileNameLower) {
+                                matchType = 'case-insensitive';
+                            }
+
+                            if (matchType) {
+                                // 用 IIFE 捕获 matchType 和 fullPath，避免闭包 bug
+                                (function(mt, fp) {
+                                    var statP = fs.promises.stat(fp).then(function(st) {
+                                        exactResults.push({
+                                            fullPath: fp,
+                                            size: st.size,
+                                            mtime: st.mtime ? st.mtime.getTime() : 0,
+                                            matchType: mt,
+                                            similarity: mt === 'exact' ? 1 : 0.95
+                                        });
+                                    }).catch(function() {});
+                                    subPromises.push(statP);
+                                })(matchType, fullPath);
+                            }
+                        }
+
+                        // 目录递归：独立检查 isDirectory()
+                        // 也处理 OTHER 类型（symlink/junction 指向目录）
+                        if (isDir) {
+                            // 目录过滤：跳过系统目录、隐藏目录、开发目录
+                            if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
+                            searchRecursive(fullPath);
+                        } else if (!isFile && !isDir) {
+                            // OTHER 类型（symlink/junction）：尝试 fs.statSync 判断是否为目录
+                            // Windows 上如 "Documents and Settings"、用户目录下的兼容性链接
+                            try {
+                                var st = fs.statSync(fullPath);
+                                if (st.isDirectory()) {
+                                    if (entry.name.charAt(0) !== '.' && entry.name !== '$RECYCLE.BIN' && entry.name !== 'System Volume Information' && entry.name !== 'node_modules' && entry.name !== '.git') {
+                                        searchRecursive(fullPath);
+                                    }
+                                }
+                            } catch(e) {
+                                // 无权限等，跳过
+                            }
+                        }
+                    }
+
+                    // 等待当前目录的 stat 完成，确保 matchedCount 准确
+                    return Promise.all(subPromises).then(function() {
+                        reportProgress(normalizedPath);
+                    });
+                }).catch(function(err) {
+                    // 目录无权限等错误，静默跳过
+                }).finally(function() {
+                    taskFinished();
+                });
+            });
+        }
+
+        // 强制结束（取消时确保 pendingTasks 归零）
+        function forceFinishAll() {
+            pendingCallbacks.length = 0;
+            if (pendingTasks > 0 && allDoneResolve) {
+                pendingTasks = 0;
+                allDoneResolve();
+                allDoneResolve = null;
+            }
+        }
+
+        try {
+            searchRecursive(searchDir);
+            await allDonePromise;
+        } catch (e) {
+            console.error('[LocalBrowse] deepSearchFileByName error:', e);
+        }
+
+        // 网盘兼容：如果递归搜索没找到任何结果，尝试用插件的 deepSearch 方法
+        // deepSearch 在网盘上表现更稳定（不做 OTHER 类型 statSync、不过滤目录）
+        if (exactResults.length === 0) {
+            try {
+                var fallbackResults = await new Promise(function(resolve, reject) {
+                    var timeout = setTimeout(function() { resolve([]); }, 60000);
+                    that.deepSearch(searchDir, fileName, function(partialResults) {
+                        // onPartial - 进度回调
+                    }, function(allResults, wasCancelled) {
+                        clearTimeout(timeout);
+                        resolve(allResults || []);
+                    }, abortFlag);
+                });
+                for (var fi = 0; fi < fallbackResults.length && exactResults.length < maxResults; fi++) {
+                    var fr = fallbackResults[fi];
+                    var frName = fr.name || (fr.path ? fr.path.split('\\').pop() : '');
+                    if (frName === fileName || frName.toLowerCase() === fileNameLower) {
+                        try {
+                            var fst = fr.path ? fs.statSync(fr.path) : null;
+                            exactResults.push({
+                                fullPath: fr.path || '',
+                                size: fst ? fst.size : (fr.size || 0),
+                                mtime: fst ? (fst.mtime ? fst.mtime.getTime() : 0) : (fr.mtime || 0),
+                                matchType: 'exact',
+                                similarity: 1
+                            });
+                        } catch (e) {}
+                    }
+                }
+            } catch (e) {
+            }
+        }
+
+        // 清理 abort 标记
+        if (abortFlag.cancelled) {
+            forceFinishAll();
+        }
+
+        // 排序：按修改时间降序
+        exactResults.sort(function(a, b) { return b.mtime - a.mtime; });
+
+        // 最终进度回调
+        if (onProgress) {
+            onProgress({
+                dirsScanned: searchedDirs,
+                matchedCount: exactResults.length,
+                currentDir: '',
+                finished: true
+            });
+        }
+
+        return exactResults;
+    }
+
+    /**
+     * 替换文档中的链接
+     * 修复v4：找到包含链接的具体子块，只更新那个子块，避免重建整个文档
+     * 新链接会附加 #size=xxx&mtime=xxx fragment，用于未来精确匹配
+     */
+    async replaceLink(docId, oldUrl, newLocalPath, itemIndex, context) {
+        var that = this;
+
+        // 为新链接生成文件指纹 title
+        var newFingerprintTitle = '';
+        try {
+            var newStat = fs.statSync(newLocalPath);
+            if (newStat) {
+                newFingerprintTitle = 'size=' + newStat.size + '&mtime=' + (newStat.mtime ? newStat.mtime.getTime() : 0);
+            }
+        } catch(e) {}
+
+        var newUrl = that.localPathToFileUrl(newLocalPath);
+        var newUrlRaw = that.localPathToFileUrlRaw(newLocalPath);  // 不编码版本，用于 DOM 替换
+        var newUrlWithTitle = newFingerprintTitle ? (newUrl + ' "' + newFingerprintTitle + '"') : newUrl;
+        var newUrlRawWithTitle = newFingerprintTitle ? (newUrlRaw + ' "' + newFingerprintTitle + '"') : newUrlRaw;
+
+        try {
+
+            // === 步骤1：获取文档的所有子块 ===
+            var childResp = await fetch('/api/block/getChildBlocks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: docId })
+            });
+            var childData = await childResp.json();
+            if (childData.code !== 0 || !childData.data) {
+                that.showToastMsg('获取子块失败');
+                return;
+            }
+            var childBlocks = childData.data;
+
+            // === 步骤2：找到包含旧链接的子块 ===
+            var targetBlock = null;
+            var targetMatchUrl = null;  // 记录实际匹配到的 URL 格式
+
+            // 准备多种可能的 URL 格式用于匹配
+            // oldUrl 已在 scanBrokenLinks 中去掉了 fragment，但 markdown 中可能仍保留 fragment
+            var oldUrlVariants = [oldUrl];
+            // 带可能 fragment 的版本（旧链接可能包含 #size=xxx&mtime=xxx）
+            // 在 oldUrl 后面添加通配 fragment 匹配：搜索时先试不含 fragment 的，再试含 fragment 的
+            // 编码版本（空格→%20，中文→UTF-8）
+            oldUrlVariants.push(that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/')));
+            // 只编码空格版本（思源有时只编码空格）
+            oldUrlVariants.push(oldUrl.replace(/ /g, '%20'));
+            // 只编码中文版本
+            oldUrlVariants.push(encodeURI(oldUrl).replace(/%25/g, '%'));
+            // 去掉 file:/// 前缀的原始路径
+            oldUrlVariants.push(oldUrl.replace('file:///', ''));
+            // 去掉 file:/// 前缀且斜杠替换为反斜杠
+            oldUrlVariants.push(oldUrl.replace('file:///', '').replace(/\//g, '\\'));
+
+            // 如果旧链接可能带有 fragment（size/mtime），也添加带 fragment 的变体
+            // 这里用 startswith 匹配：如果 markdown 中包含 oldUrl 的开头部分就能匹配
+            // 但 indexOf 是精确匹配，所以需要额外加入带 #size 的变体
+            // 由于 fragment 的具体值不确定，使用子串搜索方式：在匹配时先搜索 oldUrl 前缀
+            // 这里不需要添加带 fragment 的变体，因为不含 fragment 的 oldUrl 是含 fragment 的前缀
+            // block.markdown.indexOf(oldUrl) 在 markdown 中如果 URL 是 "file:///D:/xxx.png#size=123"
+            // 而 oldUrl 是 "file:///D:/xxx.png"，那么 indexOf 仍然能匹配到！
+            // 因为 "file:///D:/xxx.png" 是 "file:///D:/xxx.png#size=123" 的子串
+
+
+            for (var i = 0; i < childBlocks.length; i++) {
+                var block = childBlocks[i];
+                if (!block.markdown) continue;
+
+                for (var v = 0; v < oldUrlVariants.length; v++) {
+                    if (block.markdown.indexOf(oldUrlVariants[v]) !== -1) {
+                        targetBlock = block;
+                        targetMatchUrl = oldUrlVariants[v];
+                        break;
+                    }
+                }
+                if (targetBlock) break;
+            }
+
+            if (!targetBlock) {
+                // 打印所有子块的 markdown 前200字符用于调试
+                for (var i = 0; i < Math.min(childBlocks.length, 5); i++) {
+                    var md = childBlocks[i].markdown || '';
+                }
+                that.showToastMsg('未找到包含该链接的块');
+                return;
+            }
+
+            // === 步骤3：获取该子块的 DOM ===
+            var domResp = await fetch('/api/block/getBlockDOM', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: targetBlock.id })
+            });
+            var domData = await domResp.json();
+            if (domData.code !== 0 || !domData.data || !domData.data.dom) {
+                that.showToastMsg('获取块 DOM 失败');
+                return;
+            }
+            var blockDom = domData.data.dom;
+
+            // === 步骤4：在 DOM 中替换链接 ===
+            // DOM 中的链接可能是未编码的中文，也可能有编码
+            // 可能包含旧的 fragment（#size=xxx&mtime=xxx），需要一并替换
+            // 策略：用正则匹配旧 URL（含可能的 fragment），替换为新 URL（含新 fragment）
+            var newDom = blockDom;
+            var replaced = false;
+
+            // 构建匹配旧 URL 的正则，同时捕获可能存在的 fragment
+            // oldUrl 是不含 fragment 的纯 URL
+            function escapeRegex(str) {
+                return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
+
+            // 方式1：用 targetMatchUrl（实际在 markdown 中匹配到的格式）替换
+            if (targetMatchUrl && newDom.indexOf(targetMatchUrl) !== -1) {
+                var isEncoded = targetMatchUrl !== oldUrl && targetMatchUrl.indexOf('%') !== -1;
+                var replacementUrl = isEncoded ? newUrl : newUrlRaw;
+                // targetMatchUrl 可能不包含 fragment（因为是子串匹配），需要检查并去掉 DOM 中旧的 fragment
+                var escapedTarget = escapeRegex(targetMatchUrl);
+                var regex1 = new RegExp(escapedTarget + '(#[^"\\s<>]*)?');
+                newDom = newDom.replace(regex1, replacementUrl);
+                replaced = true;
+            }
+            // 方式2：直接替换旧 URL（未编码），用未编码的新 URL 替换
+            if (!replaced && newDom.indexOf(oldUrl) !== -1) {
+                var escapedOld = escapeRegex(oldUrl);
+                var regex2 = new RegExp(escapedOld + '(#[^"\\s<>]*)?');
+                newDom = newDom.replace(regex2, newUrlRaw);
+                replaced = true;
+            }
+            // 方式3：旧 URL 编码版本，用编码的新 URL 替换
+            if (!replaced) {
+                var oldEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/'));
+                if (newDom.indexOf(oldEncoded) !== -1) {
+                    var escapedEncoded = escapeRegex(oldEncoded);
+                    var regex3 = new RegExp(escapedEncoded + '(#[^"\\s<>]*)?', 'g');
+                    newDom = newDom.replace(regex3, newUrl);
+                    replaced = true;
+                }
+            }
+            // 方式4：只编码空格版本
+            if (!replaced) {
+                var oldSpaceEncoded = oldUrl.replace(/ /g, '%20');
+                if (newDom.indexOf(oldSpaceEncoded) !== -1) {
+                    var newSpaceEncoded = newUrlRaw.replace(/ /g, '%20');
+                    var escapedSpace = escapeRegex(oldSpaceEncoded);
+                    var regex4 = new RegExp(escapedSpace + '(#[^"\\s<>]*)?', 'g');
+                    newDom = newDom.replace(regex4, newSpaceEncoded);
+                    replaced = true;
+                }
+            }
+            // 方式5：部分匹配 - 去掉 file:/// 前缀
+            if (!replaced) {
+                var oldPathPart = oldUrl.replace('file:///', '');
+                var oldPathEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/')).replace('file:///', '');
+                var newPathPartRaw = newUrlRaw.replace('file:///', '');
+                var newPathPartEncoded = newUrl.replace('file:///', '');
+
+                if (newDom.indexOf(oldPathPart) !== -1) {
+                    var escapedPath = escapeRegex(oldPathPart);
+                    var regex5a = new RegExp(escapedPath + '(#[^"\\s<>]*)?', 'g');
+                    newDom = newDom.replace(regex5a, newPathPartRaw);
+                    replaced = true;
+                } else if (newDom.indexOf(oldPathEncoded) !== -1) {
+                    var escapedPathEnc = escapeRegex(oldPathEncoded);
+                    var regex5b = new RegExp(escapedPathEnc + '(#[^"\\s<>]*)?', 'g');
+                    newDom = newDom.replace(regex5b, newPathPartEncoded);
+                    replaced = true;
+                }
+            }
+
+            if (!replaced) {
+                that.showToastMsg('未找到需要替换的链接');
+                return;
+            }
+
+            // 更新 DOM 中的文件指纹 title（修复后新链接需要携带新指纹，用于未来精确定位）
+            // 注意：只替换目标链接附近的 title，避免误伤同一块中的其他链接
+            if (newFingerprintTitle && replaced) {
+                // 在已替换的链接附近查找并替换 title（只替换第一次匹配，对应刚替换的那个链接）
+                var titleRegex = /title="size=\d+&(?:amp;)?mtime=\d+"/;
+                newDom = newDom.replace(titleRegex, 'title="' + newFingerprintTitle + '"');
+            }
+
+            // === 步骤5：用 dataType: 'dom' 更新该子块 ===
+            var updateResp = await fetch('/api/block/updateBlock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: targetBlock.id,
+                    dataType: 'dom',
+                    data: newDom
+                })
+            });
+            var updateData = await updateResp.json();
+            if (updateData.code !== 0) {
+                that.showToastMsg('替换链接失败：' + (updateData.msg || '未知错误'));
+                return;
+            }
+
+            // 替换成功，更新 UI
+            if (context && context.dialog) {
+                var statusEl = context.dialog.querySelector('.cd-relink-status[data-index="' + itemIndex + '"]');
+                var candidateArea = context.dialog.querySelector('.cd-relink-candidate-area[data-index="' + itemIndex + '"]');
+
+                if (statusEl) {
+                    statusEl.textContent = '✅ 已修复';
+                    statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
+                }
+                if (candidateArea) {
+                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-success,#52c41a)">→ ' + that.escapeHtml(newLocalPath) + '</span>';
+                }
+            }
+
+            that.showToastMsg('✅ 已修复：' + (context.brokenLinks[itemIndex] ? context.brokenLinks[itemIndex].fileName : ''));
+
+        } catch (e) {
+            console.error('[LocalBrowse] replaceLink error:', e);
+            that.showToastMsg('替换链接失败：' + (e.message || e));
+        }
     }
 }
 
