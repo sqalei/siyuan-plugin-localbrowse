@@ -46,14 +46,23 @@ class LocalBrowsePlugin extends Plugin {
         this.preSearchPath = '';    // 深度搜索前所在的目录，用于返回
         this.availableDrives = [];  // 可用盘符列表
         this.favorites = [];        // 收藏的文件夹列表 [{path, name}]
-        this.currentView = 'list';  // 当前视图模式：list 或 icon
+        this.currentView = 'list';  // 当前视图模式：list | icon
         this.sortBy = 'name';       // 排序方式：name | size | mtime
         this.sortOrder = 'asc';     // 排序顺序：asc | desc
         this.iconRenderState = null; // 图标视图滚动渲染状态
+        this.listRenderState = null; // 列表视图分批渲染状态
         this._isScrolling = false;   // 是否正在滚动中（滚动时暂停预览）
         this._scrollEndTimer = null; // 滚动结束检测计时器
+        this._thumbQueue = [];       // 缩略图加载队列
+        this._thumbLoading = 0;      // 当前正在加载的缩略图数量
+        this._scrollPositions = {};  // 目录路径 → 滚动位置，用于返回上级时恢复
+        this._searchDebounceTimer = null; // 搜索输入防抖计时器
         // 在构造函数中一次性绑定滚动处理函数，避免每次切换视图时重复创建引用
         this._boundIconScroll = this.onIconScroll.bind(this);
+        this._boundListScroll = null; // 列表滚动处理（延迟绑定，避免构造时 this 不完整）
+        this._clipboardCut = null;   // 剪切板：记录剪切的文件/文件夹路径 {path, name, isDir}
+        this._linkStatus = 'none';    // 链接状态指示灯: none/green/yellow/red/checking
+        this._lastCheckedDocId = '';  // 上次检测的文档 ID，避免重复扫描
     }
 
     onload() {
@@ -65,6 +74,30 @@ class LocalBrowsePlugin extends Plugin {
         this.loadViewSettings();
         this.loadPathSettings();
         this.registerDock();
+
+        // 链接指示灯初始化 + 自动检测
+        var that = this;
+        that._linkInitTimeout = setTimeout(function() {
+            that._updateLinkIndicator('green');
+            that._autoCheckLinks();
+            that._linkCheckInterval = setInterval(function() { that._autoCheckLinks(); }, 5000);
+            // 监听文档切换：focusin 事件（用户点击编辑区时触发）
+            that._linkFocusHandler = function() {
+                // 延迟 300ms 执行，避免 focusin 和 click 事件冲突
+                clearTimeout(that._linkFocusDebounce);
+                that._linkFocusDebounce = setTimeout(function() {
+                    var newDocId = that.getCurrentDocId();
+                    if (newDocId && newDocId !== that._lastCheckedDocId) {
+                        that._autoCheckLinks();
+                    }
+                }, 300);
+            };
+            document.addEventListener('focusin', that._linkFocusHandler);
+        }, 2000);
+
+        // 注册链接点击拦截器：处理带 fragment（#size=xxx&mtime=xxx）的 file:/// 链接
+        // Windows 会把 fragment 当作文件名一部分，导致打不开文件
+        this.registerLinkClickInterceptor();
     }
 
     onunload() {
@@ -77,7 +110,12 @@ class LocalBrowsePlugin extends Plugin {
             if (fileListEl) {
                 fileListEl.removeEventListener('scroll', this._boundIconScroll);
             }
-            this._boundIconScroll = null;
+        }
+        if (this._boundListScroll) {
+            var fileListEl2 = document.getElementById('cd-file-list');
+            if (fileListEl2) {
+                fileListEl2.removeEventListener('scroll', this._boundListScroll);
+            }
         }
         // 清理预览计时器
         if (this._previewTimer) {
@@ -96,6 +134,38 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 清理图标渲染状态
         this.iconRenderState = null;
+        // 清理列表渲染状态
+        this.listRenderState = null;
+        // 清理缩略图队列
+        this._thumbQueue = [];
+        this._thumbLoading = 0;
+        // 清理链接指示灯定时器
+        if (this._linkInitTimeout) {
+            clearTimeout(this._linkInitTimeout);
+            this._linkInitTimeout = null;
+        }
+        if (this._linkCheckInterval) {
+            clearInterval(this._linkCheckInterval);
+            this._linkCheckInterval = null;
+        }
+        if (this._linkFocusHandler) {
+            document.removeEventListener('focusin', this._linkFocusHandler);
+            this._linkFocusHandler = null;
+        }
+        if (this._linkFocusDebounce) {
+            clearTimeout(this._linkFocusDebounce);
+            this._linkFocusDebounce = null;
+        }
+        // 清理搜索防抖计时器
+        if (this._searchDebounceTimer) {
+            clearTimeout(this._searchDebounceTimer);
+            this._searchDebounceTimer = null;
+        }
+        // 清理链接点击拦截器
+        if (this._linkClickInterceptor) {
+            document.removeEventListener('mousedown', this._linkClickInterceptor, true);
+            this._linkClickInterceptor = null;
+        }
         // 取消正在进行的深度搜索
         if (this._deepSearchAbort) {
             this._deepSearchAbort.cancelled = true;
@@ -235,9 +305,9 @@ class LocalBrowsePlugin extends Plugin {
             '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px">' +
                 '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
                 '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
-                '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
+                '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
                 '<button id="cd-refresh" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="刷新" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">↻</button>' +
-                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🧲</button>' +
+                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0" title="点击修复失效链接">🔘</button>' +
             '</div>' +
             '<div id="cd-search-wrap" style="margin-bottom:2px;position:relative;flex-shrink:0;display:none">' +
                 '<input id="cd-search" type="text" placeholder="搜索当前目录（按 Enter 深度搜索）..." style="width:100%;padding:6px 56px 6px 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
@@ -250,6 +320,9 @@ class LocalBrowsePlugin extends Plugin {
             '</div>' +
             '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
                 '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
+            '</div>' +
+            '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px">' +
+                '<span id="cd-stats-text">📊 加载中...</span>' +
             '</div>' +
             '<div id="cd-context-menu" style="display:none;position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);min-width:160px;padding:4px 0;font-size:13px;user-select:none">' +
             '</div>' +
@@ -268,11 +341,10 @@ class LocalBrowsePlugin extends Plugin {
             });
         }
 
-        // 绑定修复链接按钮
+        // 绑定链接状态指示灯
         var relinkBtn = el.querySelector('#cd-relink-btn');
         if (relinkBtn) {
             relinkBtn.addEventListener('click', function() {
-                console.log('[LocalBrowse] relink button clicked');
                 that.relinkBrokenLinks().catch(function(e) {
                     console.error('[LocalBrowse] relink error:', e);
                     that.showToastMsg('修复链接出错：' + (e.message || e));
@@ -283,13 +355,16 @@ class LocalBrowsePlugin extends Plugin {
         // 绑定视图切换按钮
         var viewToggleBtn = el.querySelector('#cd-view-toggle');
         if (viewToggleBtn) {
+            // 初始化按钮状态
             viewToggleBtn.textContent = that.currentView === 'icon' ? '⊞' : '☰';
+            viewToggleBtn.title = that.currentView === 'icon' ? '切换为列表视图' : '切换为图标视图';
             viewToggleBtn.addEventListener('click', function() {
+                // 在列表和图标之间切换
                 that.currentView = (that.currentView === 'list') ? 'icon' : 'list';
                 this.textContent = that.currentView === 'icon' ? '⊞' : '☰';
                 this.title = that.currentView === 'icon' ? '切换为列表视图' : '切换为图标视图';
                 that.saveViewSettings();
-                // 重新渲染当前目录（先排序，cachedFiles 是未排序的原始列表）
+                // 重新渲染当前目录
                 if (that.cachedFiles.length && that.cachedPath) {
                     var sorted = that.sortFiles(that.cachedFiles.slice());
                     that.doRender(sorted, that.cachedPath, '', that.isDeepSearchMode);
@@ -348,8 +423,13 @@ class LocalBrowsePlugin extends Plugin {
             searchInput.addEventListener('input', function() {
                 var query = this.value.trim();
                 if (clearBtn) clearBtn.style.display = query ? 'block' : 'none';
-                // 仅实时过滤当前目录；回车才触发深度搜索
-                that.applyFilter(query);
+                // 防抖 200ms，大目录下避免每次按键都触发全量过滤
+                if (that._searchDebounceTimer) {
+                    clearTimeout(that._searchDebounceTimer);
+                }
+                that._searchDebounceTimer = setTimeout(function() {
+                    that.applyFilter(query);
+                }, 200);
             });
             searchInput.addEventListener('keydown', function(e) {
                 if (e.key === 'Enter') {
@@ -360,6 +440,23 @@ class LocalBrowsePlugin extends Plugin {
                 }
             });
         }
+
+        // Backspace 快速返回上级目录（不在搜索框聚焦时）
+        var fileListEl = el.querySelector('#cd-file-list');
+        if (fileListEl) {
+            fileListEl.addEventListener('keydown', function(e) {
+                if (e.key === 'Backspace') {
+                    // 搜索框聚焦时不触发
+                    if (document.activeElement && document.activeElement.id === 'cd-search') return;
+                    e.preventDefault();
+                    that.goUp();
+                }
+            });
+            // 让文件列表可聚焦，才能响应键盘事件
+            fileListEl.setAttribute('tabindex', '0');
+            fileListEl.style.outline = 'none';
+        }
+
         if (clearBtn) {
             clearBtn.addEventListener('click', function() {
                 // 如果正在深度搜索，点击叉按钮取消搜索
@@ -431,8 +528,22 @@ class LocalBrowsePlugin extends Plugin {
             this._searchRenderTimer = null;
         }
 
+        // 保存当前目录的滚动位置，便于返回时恢复
+        if (this.currentPath) {
+            var fileListEl = document.getElementById('cd-file-list');
+            if (fileListEl) {
+                this._scrollPositions[this.currentPath] = fileListEl.scrollTop;
+            }
+        }
+
         this.currentPath = dirPath;
         this.savePathSettings();
+
+        // 清理旧的渲染状态
+        this.listRenderState = null;
+        this.iconRenderState = null;
+        this._thumbQueue = [];
+        this._thumbLoading = 0;
 
         // 同步当前路径的盘符到下拉框
         var driveMatch = dirPath.match(/^([A-Za-z]):/);
@@ -540,6 +651,26 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * Backspace 快速返回上级目录
+     */
+    goUp() {
+        var currentPath = this.currentPath;
+        if (!currentPath) return;
+        // 清理末尾反斜杠
+        var cleanPath = currentPath.endsWith('\\') ? currentPath.slice(0, -1) : currentPath;
+        // 如果是盘符根目录（如 C:），不再往上了
+        if (/^[A-Za-z]:$/.test(cleanPath)) return;
+        // 取上级目录
+        var lastSlash = cleanPath.lastIndexOf('\\');
+        if (lastSlash <= 1) {
+            // 上一级是盘符根目录
+            this.loadDirectory(cleanPath.substring(0, lastSlash + 1));
+        } else {
+            this.loadDirectory(cleanPath.substring(0, lastSlash));
+        }
+    }
+
+    /**
      * 使用 Node.js fs 模块读取目录
      */
     loadDirectoryWithNode(dirPath, fileListEl) {
@@ -571,38 +702,45 @@ class LocalBrowsePlugin extends Plugin {
                     return;
                 }
                 
-                var files = [];
+                // 异步并行 stat，避免同步阻塞主线程
+                var statTasks = [];
                 for (var i = 0; i < entries.length; i++) {
-                    var entry = entries[i];
-                    var fullPath = normalizedPath + entry.name;
-                    var stat = null;
-                    var size = 0;
-                    var mtime = 0;
-
-                    try {
-                        stat = fs.statSync(fullPath);
-                        size = stat.size;
-                        mtime = stat.mtime ? stat.mtime.getTime() : 0;
-                    } catch (e) {
-                        // 某些文件可能无法获取stat
-                    }
-
-                    // 通过 fs.statSync 回退判断（symlink/junction/挂载点等 OTHER 类型）
-                    var isDir = entry.isDirectory();
-                    if (!isDir && !entry.isFile() && stat) {
-                        try { isDir = stat.isDirectory(); } catch(e) {}
-                    }
-
-                    files.push({
-                        name: entry.name,
-                        isDir: isDir,
-                        size: size,
-                        mtime: mtime,
-                        path: fullPath
-                    });
+                    (function(entry) {
+                        var fullPath = normalizedPath + entry.name;
+                        statTasks.push(new Promise(function(resolve) {
+                            fs.stat(fullPath, function(err, stat) {
+                                resolve({ entry: entry, fullPath: fullPath, stat: err ? null : stat });
+                            });
+                        }));
+                    })(entries[i]);
                 }
-                
-                that.renderFiles(files, normalizedPath);
+
+                Promise.all(statTasks).then(function(results) {
+                    var files = [];
+                    for (var i = 0; i < results.length; i++) {
+                        var r = results[i];
+                        var size = 0;
+                        var mtime = 0;
+                        if (r.stat) {
+                            size = r.stat.size;
+                            mtime = r.stat.mtime ? r.stat.mtime.getTime() : 0;
+                        }
+
+                        var isDir = r.entry.isDirectory();
+                        if (!isDir && !r.entry.isFile() && r.stat) {
+                            try { isDir = r.stat.isDirectory(); } catch(e) {}
+                        }
+
+                        files.push({
+                            name: r.entry.name,
+                            isDir: isDir,
+                            size: size,
+                            mtime: mtime,
+                            path: r.fullPath
+                        });
+                    }
+                    that.renderFiles(files, normalizedPath);
+                });
             });
         } catch (e) {
             console.error('[LocalBrowse] loadDirectoryWithNode error:', e);
@@ -707,6 +845,8 @@ class LocalBrowsePlugin extends Plugin {
         // 应用当前排序
         files = this.sortFiles(files);
         this.doRender(files, currentPath);
+        // 更新底部统计栏
+        this.updateFileStats();
     }
 
     /**
@@ -1175,7 +1315,7 @@ class LocalBrowsePlugin extends Plugin {
             that.iconRenderState = {
                 files: files,
                 currentPath: currentPath,
-                batchSize: 20,  // 每批渲染数量
+                batchSize: 60,  // 每批渲染数量（图标较小，加大批量减少卡顿）
                 renderedCount: 0,
                 isLoading: false
             };
@@ -1195,6 +1335,35 @@ class LocalBrowsePlugin extends Plugin {
             fileListEl.style.gridTemplateColumns = '';
             fileListEl.style.gap = '';
             fileListEl.style.padding = '';
+
+            // 文件数量超过阈值时启用分批渲染
+            var LIST_BATCH_THRESHOLD = 200;
+            var LIST_BATCH_SIZE = 100;
+
+            if (!isDeepSearch && files.length > LIST_BATCH_THRESHOLD) {
+                // 分批渲染模式
+                that.listRenderState = {
+                    files: files,
+                    currentPath: currentPath,
+                    batchSize: LIST_BATCH_SIZE,
+                    renderedCount: 0,
+                    isLoading: false,
+                    isDeepSearch: false
+                };
+
+                that.renderListBatch(fileListEl);
+
+                // 绑定滚动事件
+                if (!that._boundListScroll) {
+                    that._boundListScroll = that.onListScroll.bind(that);
+                }
+                fileListEl.removeEventListener('scroll', that._boundListScroll);
+                fileListEl.addEventListener('scroll', that._boundListScroll, { passive: true });
+                return;
+            }
+
+            // 文件数量不多或深度搜索时，一次性渲染
+            that.listRenderState = null;
 
             for (var i = 0; i < files.length; i++) {
                 var f = files[i];
@@ -1221,6 +1390,7 @@ class LocalBrowsePlugin extends Plugin {
                         'data-path="' + that.escapeHtml(fullPath) + '" ' +
                         'data-name="' + that.escapeHtml(f.name) + '" ' +
                         'data-isdir="' + f.isDir + '" ' +
+                        'draggable="true" ' +
                         'style="display:flex;align-items:flex-start;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
                         '<span style="font-size:16px;margin-right:8px;flex-shrink:0;margin-top:1px">' + icon + '</span>' +
                         '<span style="flex:1;overflow:hidden;min-width:0">' +
@@ -1231,16 +1401,26 @@ class LocalBrowsePlugin extends Plugin {
                         (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
                     '</div>';
                 } else {
+                    // 文件夹默认不显示箭头，异步检测有子项后再插入
+                    var expander = f.isDir ?
+                        '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
+                        '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+
                     html += '<div class="cd-item ' + itemClass + '" ' +
                         'data-path="' + that.escapeHtml(fullPath) + '" ' +
                         'data-name="' + that.escapeHtml(f.name) + '" ' +
                         'data-isdir="' + f.isDir + '" ' +
+                        'data-has-children="false" ' +
+                        'data-level="0" ' +
+                        'draggable="true" ' +
                         'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
-                        '<span style="font-size:16px;margin-right:8px;flex-shrink:0">' + icon + '</span>' +
+                        expander +
+                        '<span style="font-size:16px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
                         '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + '</span>' +
                         (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
                         (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
-                    '</div>';
+                    '</div>' +
+                    '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="0" style="display:none"></div>';
                 }
             }
         }
@@ -1249,7 +1429,313 @@ class LocalBrowsePlugin extends Plugin {
 
         // 绑定点击事件
         that.bindItemEvents(fileListEl, files, currentPath);
+
+        // 恢复滚动位置
+        that._restoreScrollPosition(fileListEl, currentPath);
+
+        // 异步检测空文件夹，移除空文件夹的展开箭头
+        that.checkEmptyFolders(fileListEl);
     }
+
+    /**
+     * 恢复当前目录的滚动位置
+     */
+    _restoreScrollPosition(fileListEl, currentPath) {
+        var saved = this._scrollPositions[currentPath];
+        if (saved && fileListEl) {
+            // 用 requestAnimationFrame 等待 DOM 稳定后恢复
+            var that = this;
+            requestAnimationFrame(function() {
+                fileListEl.scrollTop = saved;
+                // 恢复后清除记录，避免下次误恢复
+                delete that._scrollPositions[currentPath];
+            });
+        }
+    }
+
+    /**
+     * 列表视图分批渲染（大目录场景）
+     */
+    renderListBatch(fileListEl) {
+        var that = this;
+        var state = that.listRenderState;
+        if (!state || state.isLoading) return;
+
+        state.isLoading = true;
+        var files = state.files;
+        var currentPath = state.currentPath;
+        var batchSize = state.batchSize;
+        var startIdx = state.renderedCount;
+        var endIdx = Math.min(startIdx + batchSize, files.length);
+
+        if (startIdx >= files.length) {
+            state.isLoading = false;
+            return;
+        }
+
+        var html = '';
+        for (var i = startIdx; i < endIdx; i++) {
+            var f = files[i];
+            var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
+            var name = that.escapeHtml(f.name);
+            var itemClass = f.isDir ? 'cd-dir' : 'cd-file';
+            var fullPath = f.path || ((currentPath.endsWith('\\') ? currentPath : currentPath + '\\') + f.name);
+            var timeStr = f.mtime ? that.formatTime(f.mtime) : '';
+            var sizeStr = f.isDir ? '' : that.formatSize(f.size);
+
+            // 文件夹默认不显示箭头，异步检测有子项后再插入
+            var expander = f.isDir ?
+                '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
+                '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+
+            html += '<div class="cd-item ' + itemClass + '" ' +
+                'data-path="' + that.escapeHtml(fullPath) + '" ' +
+                'data-name="' + that.escapeHtml(f.name) + '" ' +
+                'data-isdir="' + f.isDir + '" ' +
+                'data-has-children="false" ' +
+                'data-level="0" ' +
+                'draggable="true" ' +
+                'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
+                expander +
+                '<span style="font-size:16px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + '</span>' +
+                (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
+                (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
+            '</div>' +
+            '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="0" style="display:none"></div>';
+        }
+
+        if (startIdx === 0) {
+            fileListEl.innerHTML = html;
+            // 首批渲染后恢复滚动位置
+            that._restoreScrollPosition(fileListEl, currentPath);
+        } else {
+            fileListEl.insertAdjacentHTML('beforeend', html);
+        }
+
+        state.renderedCount = endIdx;
+
+        that.bindItemEvents(fileListEl, files, currentPath);
+
+        // 异步检测本批中的空文件夹
+        that.checkEmptyFolders(fileListEl);
+
+        state.isLoading = false;
+
+        // 有更多内容时显示加载提示
+        if (state.renderedCount < state.files.length) {
+            var existing = document.getElementById('cd-loading-more');
+            if (!existing) {
+                fileListEl.insertAdjacentHTML('beforeend',
+                    '<div id="cd-loading-more" style="padding:10px;text-align:center;color:var(--b3-theme-secondary,#999);font-size:12px">加载中...</div>');
+            }
+        } else {
+            // 全部加载完成，移除加载提示
+            var loadingEl = document.getElementById('cd-loading-more');
+            if (loadingEl) loadingEl.remove();
+        }
+
+        // 如果内容没有撑满容器，自动加载下一批
+        setTimeout(function() {
+            if (fileListEl.scrollHeight <= fileListEl.clientHeight + 50) {
+                if (state.renderedCount < state.files.length) {
+                    that.renderListBatch(fileListEl);
+                }
+            }
+            // 渲染完成后移除加载提示
+            var loadingEl = document.getElementById('cd-loading-more');
+            if (loadingEl) loadingEl.remove();
+        }, 50);
+    }
+
+    /**
+     * 列表视图：滚动事件处理（分批渲染）
+     */
+    onListScroll(e) {
+        var that = this;
+        var fileListEl = e.target;
+        var state = that.listRenderState;
+        if (!state || state.isLoading) return;
+
+        if (that._scrollTimer) {
+            clearTimeout(that._scrollTimer);
+        }
+
+        that._scrollTimer = setTimeout(function() {
+            var scrollTop = fileListEl.scrollTop;
+            var clientHeight = fileListEl.clientHeight;
+            var scrollHeight = fileListEl.scrollHeight;
+            var scrollBottom = scrollTop + clientHeight;
+
+            if (scrollBottom >= scrollHeight - 100 && state.renderedCount < state.files.length) {
+                // 滚动触底时有更多内容，显示加载提示
+                var existing = document.getElementById('cd-loading-more');
+                if (!existing) {
+                    fileListEl.insertAdjacentHTML('beforeend',
+                        '<div id="cd-loading-more" style="padding:10px;text-align:center;color:var(--b3-theme-secondary,#999);font-size:12px">加载中...</div>');
+                }
+                that.renderListBatch(fileListEl);
+            }
+        }, 100);
+    }
+
+    /**
+     * 异步检测空文件夹，移除空文件夹的展开箭头
+     * 策略：先快速渲染（文件夹默认不显示箭头），再异步检测有子项的文件夹并插入箭头
+     */
+    checkEmptyFolders(container) {
+        if (!fs) return;
+        var that = this;
+        var dirItems = container.querySelectorAll('.cd-item[data-isdir="true"]');
+        if (dirItems.length === 0) return;
+
+        var checkTasks = [];
+        for (var i = 0; i < dirItems.length; i++) {
+            (function(item) {
+                var itemPath = item.dataset.path;
+                // 已经处理过的跳过
+                if (item.dataset.hasChildren === 'true') return;
+
+                checkTasks.push(new Promise(function(resolve) {
+                    fs.readdir(itemPath, function(err, entries) {
+                        var hasVisible = false;
+                        if (!err && entries) {
+                            for (var j = 0; j < entries.length; j++) {
+                                var n = entries[j];
+                                if (n.charAt(0) !== '.' && n !== '$RECYCLE.BIN' && n !== 'System Volume Information') {
+                                    hasVisible = true;
+                                    break;
+                                }
+                            }
+                        }
+                        resolve({ item: item, hasChildren: hasVisible });
+                    });
+                }));
+            })(dirItems[i]);
+        }
+
+        Promise.all(checkTasks).then(function(results) {
+            for (var i = 0; i < results.length; i++) {
+                var r = results[i];
+                if (r.hasChildren) {
+                    // 有子项的文件夹：插入展开箭头
+                    var slot = r.item.querySelector('.cd-list-expand-slot');
+                    if (slot) {
+                        var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+                        svg.setAttribute('class', 'cd-list-expand');
+                        svg.setAttribute('data-path', r.item.dataset.path);
+                        svg.setAttribute('viewBox', '0 0 32 32');
+                        svg.style.cssText = 'cursor:pointer;width:10px;height:10px;margin-right:6px;flex-shrink:0;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor';
+                        var pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+                        pathEl.setAttribute('d', 'M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z');
+                        svg.appendChild(pathEl);
+                        slot.parentNode.replaceChild(svg, slot);
+                    }
+                    r.item.dataset.hasChildren = 'true';
+                }
+            }
+        });
+    }
+
+    /**
+     * 渲染列表视图中展开的子项
+     */
+    renderListChildren(containerEl, dirPath, level) {
+        var that = this;
+        if (!fs) return;
+        level = level || 1;
+
+        containerEl.style.display = 'block';
+
+        fs.readdir(dirPath, { withFileTypes: true }, function(err, entries) {
+            if (err) {
+                containerEl.innerHTML = '<div style="padding:8px 12px;font-size:12px;color:var(--b3-theme-secondary,#999)">无法读取</div>';
+                delete containerEl.dataset.loading;
+                return;
+            }
+
+            entries = entries.filter(function(entry) {
+                return entry.name.charAt(0) !== '.' &&
+                       entry.name !== '$RECYCLE.BIN' &&
+                       entry.name !== 'System Volume Information';
+            });
+            entries.sort(function(a, b) {
+                if (a.isDirectory() && !b.isDirectory()) return -1;
+                if (!a.isDirectory() && b.isDirectory()) return 1;
+                return a.name.localeCompare(b.name);
+            });
+
+            if (entries.length === 0) {
+                containerEl.innerHTML = '';
+                return;
+            }
+
+            // 异步并行获取所有子项的 stat
+            var statTasks = [];
+            for (var i = 0; i < entries.length; i++) {
+                (function(entry) {
+                    var fullPath = path.join(dirPath, entry.name);
+                    statTasks.push(new Promise(function(resolve) {
+                        fs.stat(fullPath, function(err, stat) {
+                            resolve({ entry: entry, fullPath: fullPath, stat: err ? null : stat });
+                        });
+                    }));
+                })(entries[i]);
+            }
+
+            Promise.all(statTasks).then(function(results) {
+                var html = '';
+                var indent = level * 18; // 每层缩进 18px
+                for (var i = 0; i < results.length; i++) {
+                    var r = results[i];
+                    var entry = r.entry;
+                    var fullPath = r.fullPath;
+                    var stat = r.stat;
+                    var isDir = entry.isDirectory();
+                    if (!isDir && !entry.isFile() && stat) {
+                        try { isDir = stat.isDirectory(); } catch(e) {}
+                    }
+                    var icon = isDir ? '📁' : that.getFileIcon(entry.name);
+                    var sizeStr = '';
+                    var timeStr = '';
+                    if (stat) {
+                        if (!isDir) sizeStr = that.formatSize(stat.size);
+                        if (stat.mtime) timeStr = that.formatTime(stat.mtime);
+                    }
+
+                    // 文件夹默认不显示箭头，异步检测有子项后再插入
+                    var expander = isDir ?
+                        '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
+                        '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+
+                    html += '<div class="cd-item ' + (isDir ? 'cd-dir' : 'cd-file') + '" ' +
+                        'data-path="' + that.escapeHtml(fullPath) + '" ' +
+                        'data-name="' + that.escapeHtml(entry.name) + '" ' +
+                        'data-isdir="' + isDir + '" ' +
+                        'data-has-children="false" ' +
+                        'data-level="' + level + '" ' +
+                        'draggable="true" ' +
+                        'style="display:flex;align-items:center;padding:6px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f0f0f0);transition:background 0.15s;padding-left:' + (12 + indent) + 'px">' +
+                        expander +
+                        '<span style="font-size:15px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
+                        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + '</span>' +
+                        (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
+                        (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
+                    '</div>' +
+                    '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="' + level + '" style="display:none"></div>';
+                }
+
+                containerEl.innerHTML = html;
+                // 加载完成，清除 loading 标记
+                delete containerEl.dataset.loading;
+                // 绑定事件到 containerEl 自身，让子项的事件能冒泡到它
+                that.bindItemEvents(containerEl, [], dirPath);
+                // 异步检测有子项的文件夹并插入箭头
+                that.checkEmptyFolders(containerEl);
+            });
+        });
+    }
+
 
     /**
      * 构建单个图标项 HTML
@@ -1268,9 +1754,17 @@ class LocalBrowsePlugin extends Plugin {
             var ext = name.split('.').pop().toLowerCase();
             var isLivp = (ext === 'livp');
             if (isLargeFile || isLivp) {
-                iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
-                    '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">' + (isLivp ? '📷' : '🖼️') + '</span>' +
-                    '</div>';
+                // LIVP 不支持浏览器预览，大图悬浮时懒加载缩放缩略图
+                if (isLivp) {
+                    iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                        '<span style="font-size:28px;color:var(--b3-theme-secondary,#999)">📷</span>' +
+                        '</div>';
+                } else {
+                    // 大图：给 data-src + data-large，悬浮时 Canvas 缩放加载
+                    iconHtml = '<div class="cd-thumb-wrap" data-src="' + that.escapeHtml(that.toFileUrl(fullPath)) + '" data-large="1" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                        '<span class="cd-thumb-placeholder" style="font-size:28px;color:var(--b3-theme-secondary,#999)">🖼️</span>' +
+                        '</div>';
+                }
             } else {
                 // 先显示占位符，滚动停止后再加载缩略图
                 iconHtml = '<div class="cd-thumb-wrap" data-src="' + that.escapeHtml(that.toFileUrl(fullPath)) + '" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
@@ -1293,6 +1787,7 @@ class LocalBrowsePlugin extends Plugin {
             'data-name="' + that.escapeHtml(f.name) + '" ' +
             'data-isdir="' + f.isDir + '" ' +
             'data-isimg="' + isImg + '" ' +
+            'draggable="true" ' +
             'style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:6px 4px;cursor:pointer;border-radius:4px;transition:background 0.15s;height:110px;box-sizing:border-box;overflow:hidden">' +
             '<div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;flex-shrink:0">' + iconHtml + '</div>' +
             '<span class="cd-name" style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + displayName + '</span>' +
@@ -1314,8 +1809,44 @@ class LocalBrowsePlugin extends Plugin {
                     e.stopPropagation();
 
                     var isDir = item.dataset.isdir === 'true';
+                    var hasChildren = item.dataset.hasChildren === 'true';
                     var itemPath = item.dataset.path;
+                    var expander = item.querySelector('.cd-list-expand');
+                    // 从 item 的下一个兄弟元素获取 children 容器
+                    var childrenEl = item.nextElementSibling;
+                    if (childrenEl && !childrenEl.classList.contains('cd-list-children')) {
+                        childrenEl = null;
+                    }
 
+                    // 获取当前层级
+                    var currentLevel = parseInt(item.dataset.level || '0', 10);
+
+                    // 如果点击的是展开箭头（SVG 或其子元素），则展开/折叠
+                    var isExpandClick = e.target.classList.contains('cd-list-expand') ||
+                        (e.target.parentElement && e.target.parentElement.classList.contains('cd-list-expand'));
+                    if (isExpandClick) {
+                        if (childrenEl) {
+                            if (childrenEl.style.display === 'none') {
+                                if (childrenEl.innerHTML === '') {
+                                    // 标记正在加载，防止快速双击重复渲染
+                                    childrenEl.dataset.loading = 'true';
+                                    that.renderListChildren(childrenEl, itemPath, currentLevel + 1);
+                                } else {
+                                    childrenEl.style.display = 'block';
+                                }
+                                expander.style.transform = 'rotate(90deg)';
+                            } else if (childrenEl.dataset.loading === 'true') {
+                                // 正在加载中，忽略重复点击
+                                return;
+                            } else {
+                                childrenEl.style.display = 'none';
+                                expander.style.transform = 'rotate(0deg)';
+                            }
+                        }
+                        return;
+                    }
+
+                    // 点击文件夹名称/图标：进入文件夹
                     if (isDir) {
                         that.loadDirectory(itemPath);
                     } else {
@@ -1364,7 +1895,14 @@ class LocalBrowsePlugin extends Plugin {
                                 }
                             }
                             that.showImagePreview(item.dataset.path, name, fileSize, fileMtime);
-                        }, 200);
+                        }, 600);
+                    }
+                    // 图标视图：大图悬浮时懒加载缩略图
+                    if (that.currentView === 'icon' && !isDir) {
+                        var thumbWrap = item.querySelector('.cd-thumb-wrap[data-large="1"]:not([data-loaded])');
+                        if (thumbWrap) {
+                            that.loadLargeThumbnail(thumbWrap);
+                        }
                     }
                     // 图标视图：悬停显示完整文件名
                     if (that.currentView === 'icon') {
@@ -1398,8 +1936,105 @@ class LocalBrowsePlugin extends Plugin {
                     var name = item.dataset.name;
                     that.showContextMenu(e, itemPath, name, isDir);
                 });
+
+                // === 拖拽移动 ===
+                item.addEventListener('dragstart', function(e) {
+                    var isDir = item.dataset.isdir === 'true';
+                    var itemPath = item.dataset.path;
+                    var name = item.dataset.name;
+                    that._dragSource = {
+                        path: itemPath,
+                        name: name,
+                        isDir: isDir,
+                        el: item
+                    };
+                    item.style.opacity = '0.4';
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', itemPath);
+                    // 拖拽开始时关闭图片预览，避免遮挡
+                    that.hideImagePreview();
+                    if (that._previewTimer) {
+                        clearTimeout(that._previewTimer);
+                        that._previewTimer = null;
+                    }
+                });
+
+                item.addEventListener('dragend', function(e) {
+                    item.style.opacity = '';
+                    that._dragSource = null;
+                    // 清除所有拖拽高亮
+                    var highlighted = fileListEl.querySelectorAll('.cd-drag-over');
+                    for (var h = 0; h < highlighted.length; h++) {
+                        highlighted[h].classList.remove('cd-drag-over');
+                        highlighted[h].style.background = '';
+                        highlighted[h].style.boxShadow = '';
+                    }
+                });
+
+                // 文件夹作为拖拽目标
+                if (item.dataset.isdir === 'true') {
+                    item.addEventListener('dragover', function(e) {
+                        e.preventDefault();
+                        e.dataTransfer.dropEffect = 'move';
+                        if (!item.classList.contains('cd-drag-over')) {
+                            item.classList.add('cd-drag-over');
+                            item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                            item.style.boxShadow = 'inset 0 0 0 2px var(--b3-theme-primary,#4285f4)';
+                        }
+                    });
+                    item.addEventListener('dragleave', function(e) {
+                        item.classList.remove('cd-drag-over');
+                        item.style.background = '';
+                        item.style.boxShadow = '';
+                    });
+                    item.addEventListener('drop', function(e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        item.classList.remove('cd-drag-over');
+                        item.style.background = '';
+                        item.style.boxShadow = '';
+                        if (that._dragSource) {
+                            var targetPath = item.dataset.path;
+                            // 不能拖到自身内部
+                            if (targetPath.indexOf(that._dragSource.path) === 0) {
+                                that.showToastMsg('不能将文件夹移动到自身内部');
+                                return;
+                            }
+                            that.moveFile(that._dragSource.path, targetPath, that._dragSource.name, that._dragSource.isDir);
+                        }
+                    });
+                }
             })(items[j]);
         }
+
+        // 文件列表空白处作为拖拽目标（移动到当前目录）
+        fileListEl.addEventListener('dragover', function(e) {
+            if (that._dragSource) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+            }
+        });
+        fileListEl.addEventListener('drop', function(e) {
+            if (that._dragSource) {
+                // 如果 drop 在文件项上，由文件项的 drop 事件处理
+                if (e.target.closest('.cd-item')) return;
+                e.preventDefault();
+                e.stopPropagation();
+                that.moveFile(that._dragSource.path, currentPath, that._dragSource.name, that._dragSource.isDir);
+            }
+        });
+
+        // 文件列表空白处右键：显示粘贴菜单（如果有剪切内容）
+        fileListEl.addEventListener('contextmenu', function(e) {
+            // 如果点击的是文件项，不处理（由上面的 item contextmenu 处理）
+            if (e.target.closest('.cd-item')) return;
+            e.preventDefault();
+            e.stopPropagation();
+            // 如果有剪切内容，显示粘贴菜单
+            if (that._clipboardCut) {
+                that.showPasteMenu(e, that.currentPath);
+            }
+        });
     }
 
     /**
@@ -1447,9 +2082,7 @@ class LocalBrowsePlugin extends Plugin {
         
         // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
         this.tryInsertToEditor(markdown, function(success) {
-            if (success) {
-                that.showToastMsg('✅ 已插入链接: ' + fileName);
-            } else {
+            if (!success) {
                 // 重试全部失败，降级到剪贴板
                 that.copyToClipboard(markdown);
                 that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
@@ -1460,27 +2093,117 @@ class LocalBrowsePlugin extends Plugin {
     /**
      * 插入资源到编辑器
      */
-    insertAssetToEditor(assetPath, fileName) {
+    insertAssetToEditor(assetPath, displayName) {
         var that = this;
-        var markdown;
-        
-        if (this.isImageFile(fileName)) {
-            markdown = '![' + this.escapeMarkdown(fileName) + '](' + assetPath + ')';
+        var content;
+        var isVideo = that.isVideoFile(displayName);
+        var isImage = that.isImageFile(displayName);
+
+        if (isImage) {
+            content = '![' + that.escapeMarkdown(displayName) + '](' + assetPath + ')';
+        } else if (isVideo) {
+            // 视频文件：通过思源 API 插入 HTML 块
+            that.insertVideoBlock(assetPath, displayName);
+            return;
         } else {
-            markdown = '[' + this.escapeMarkdown(fileName) + '](' + assetPath + ')';
+            // 其他文件（PDF、DOC 等）：加文件类型图标前缀
+            var icon = that.getFileIcon(displayName);
+            content = '[' + icon + ' ' + that.escapeMarkdown(displayName) + '](' + assetPath + ')';
         }
-        
-        // console.log('[LocalBrowse] Inserting asset:', markdown);
-        
+
         // 尝试插入到编辑器（带重试，首次启动时编辑器可能尚未就绪）
-        this.tryInsertToEditor(markdown, function(success) {
-            if (success) {
-                that.showToastMsg('✅ 已插入: ' + fileName);
-            } else {
+        this.tryInsertToEditor(content, function(success) {
+            if (!success) {
                 // 重试全部失败，降级到剪贴板
-                that.copyToClipboard(markdown);
+                that.copyToClipboard(content);
                 that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
             }
+        });
+    }
+
+    /**
+     * 通过思源 API 插入视频 HTML 块
+     * 思源编辑器会覆盖直接 DOM 操作，必须用 API 才能持久化 HTML 块
+     */
+    insertVideoBlock(assetPath, fileName) {
+        var that = this;
+        var docId = that.getCurrentDocId();
+        if (!docId) {
+            that.showToastMsg('无法获取当前文档 ID');
+            return;
+        }
+
+        // 获取光标所在块 ID，用于精确定位插入位置
+        var focusBlockId = that.getFocusBlockId();
+
+        // 思源视频块格式：Type=NodeVideo，Data 为 <video> 标签（含 data-src 属性）
+        // 必须用 dataType:"markdown"，让思源自动把 <video> 标签转为 NodeVideo（含 Data 字段）
+        // 用 dataType:"dom" + data-type="NodeVideo" 会导致 Data 字段为空，刷新后视频消失
+        var videoHtml = '<video controls="controls" src="' + assetPath + '" data-src="' + assetPath + '"></video>';
+
+        var params = {
+            data: videoHtml,
+            dataType: 'markdown'
+        };
+        if (focusBlockId) {
+            params.previousID = focusBlockId;
+        } else {
+            params.parentID = docId;
+        }
+
+        fetch('/api/block/insertBlock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+            credentials: 'include'
+        }).then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            if (data.code !== 0) {
+                console.warn('[LocalBrowse] insertBlock markdown failed, trying DOM:', data.msg);
+                that.insertVideoBlockFallback(assetPath, fileName, docId, focusBlockId);
+            }
+        }).catch(function(e) {
+            console.warn('[LocalBrowse] insertBlock error, trying DOM:', e);
+            that.insertVideoBlockFallback(assetPath, fileName, docId, focusBlockId);
+        });
+    }
+
+    /**
+     * 降级：用 DOM 格式插入视频（用 dataType:"dom" 方式，可能缺少 Data 字段）
+     */
+    insertVideoBlockFallback(assetPath, fileName, docId, focusBlockId) {
+        var that = this;
+        var videoHtml = '<video controls="controls" src="' + assetPath + '" data-src="' + assetPath + '"></video>';
+        var domData = '<div data-type="NodeVideo">' + videoHtml + '</div>';
+
+        var params = {
+            data: domData,
+            dataType: 'dom'
+        };
+        if (focusBlockId) {
+            params.previousID = focusBlockId;
+        } else {
+            params.parentID = docId;
+        }
+
+        fetch('/api/block/insertBlock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+            credentials: 'include'
+        }).then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            if (data.code !== 0) {
+                console.warn('[LocalBrowse] insertBlock DOM fallback failed:', data.msg);
+                that.copyToClipboard(videoHtml);
+                that.showToastMsg('已复制视频标签到剪贴板，请 Ctrl+V 粘贴');
+            }
+        }).catch(function(e) {
+            console.warn('[LocalBrowse] insertBlock DOM fallback error:', e);
+            that.copyToClipboard(videoHtml);
+            that.showToastMsg('已复制视频标签到剪贴板，请 Ctrl+V 粘贴');
         });
     }
 
@@ -1493,8 +2216,6 @@ class LocalBrowsePlugin extends Plugin {
 
         // 处理文件名冲突：先生成唯一文件名
         var finalName = that.resolveAssetName(fileName);
-
-        that.showToastMsg('正在复制到 assets: ' + finalName);
 
         // 优先用思源 API 复制（更安全，不会触发数据保护）
         fetch('/api/file/copyFile', {
@@ -1509,20 +2230,21 @@ class LocalBrowsePlugin extends Plugin {
             return resp.json();
         }).then(function(data) {
             if (data.code === 0) {
-                that.showToastMsg('✅ 已复制到 assets: ' + finalName);
-                that.insertAssetToEditor('assets/' + finalName, finalName);
+                // 复制到 assets 成功，无提示
+                // 传入原文件名作为显示文本，finalName 作为实际路径
+                that.insertAssetToEditor('assets/' + finalName, fileName);
             } else {
                 console.warn('[LocalBrowse] API copyFile failed:', data.msg);
-                that.copyFileToAssetsFallback(filePath, finalName);
+                that.copyFileToAssetsFallback(filePath, fileName);
             }
         }).catch(function(e) {
             console.warn('[LocalBrowse] API copyFile error:', e);
-            that.copyFileToAssetsFallback(filePath, finalName);
+            that.copyFileToAssetsFallback(filePath, fileName);
         });
     }
 
     /**
-     * 生成唯一的 assets 文件名（处理冲突）
+     * 生成唯一的 assets 文件名（思源风格：hash-时间戳-随机后缀.扩展名）
      */
     resolveAssetName(fileName) {
         var dataDir = '';
@@ -1532,31 +2254,50 @@ class LocalBrowsePlugin extends Plugin {
             }
         } catch (e) {}
 
-        if (!dataDir) return fileName;
-
-        var assetsDir = dataDir.replace(/\\/g, '/') + '/assets';
-        var destPath = assetsDir + '/' + fileName;
-
-        // 如果 assets 中不存在同名文件，直接返回
-        if (!fs.existsSync(destPath)) return fileName;
-
-        // 存在冲突，添加时间戳
+        // 提取扩展名
         var ext = '';
-        var baseName = fileName;
         var lastDot = fileName.lastIndexOf('.');
         if (lastDot > 0) {
-            ext = fileName.substring(lastDot);
-            baseName = fileName.substring(0, lastDot);
+            ext = fileName.substring(lastDot + 1).toLowerCase();
         }
-        var timestamp = new Date().getTime();
-        return baseName + '_' + timestamp + ext;
+
+        // 生成思源风格的唯一文件名：hash-时间戳-随机后缀
+        var now = new Date();
+        var timestamp = now.getFullYear() +
+            String(now.getMonth() + 1).padStart(2, '0') +
+            String(now.getDate()).padStart(2, '0') +
+            String(now.getHours()).padStart(2, '0') +
+            String(now.getMinutes()).padStart(2, '0') +
+            String(now.getSeconds()).padStart(2, '0');
+        var randomSuffix = Math.random().toString(36).substring(2, 8);
+        var uniqueName = timestamp + '-' + randomSuffix;
+        if (ext) {
+            uniqueName += '.' + ext;
+        }
+
+        // 如果 dataDir 拿不到，直接返回唯一文件名
+        if (!dataDir) return uniqueName;
+
+        var assetsDir = dataDir.replace(/\\/g, '/') + '/assets';
+        var destPath = assetsDir + '/' + uniqueName;
+
+        // 如果已存在（极罕见），再追加随机数
+        if (fs.existsSync(destPath)) {
+            uniqueName = timestamp + '-' + randomSuffix + '-' + Math.random().toString(36).substring(2, 6);
+            if (ext) uniqueName += '.' + ext;
+        }
+
+        return uniqueName;
     }
 
     /**
      * 降级：用 fs 流式复制到 assets（API 失败时使用）
      */
-    copyFileToAssetsFallback(filePath, fileName) {
+    copyFileToAssetsFallback(filePath, displayName) {
         var that = this;
+
+        // 生成唯一文件名（避免 assets 目录冲突）
+        var fileName = that.resolveAssetName(displayName);
 
         var dataDir = '';
         try {
@@ -1594,8 +2335,9 @@ class LocalBrowsePlugin extends Plugin {
             });
 
             writeStream.on('finish', function() {
-                that.showToastMsg('✅ 已复制到 assets: ' + fileName);
-                that.insertAssetToEditor('assets/' + fileName, fileName);
+                // 复制到 assets 成功，无提示
+                // fileName 是生成的唯一文件名，displayName 是原文件名（用于显示）
+                that.insertAssetToEditor('assets/' + fileName, displayName);
             });
 
             writeStream.on('error', function(err) {
@@ -1782,6 +2524,173 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 移动文件/文件夹（拖拽专用）
+     */
+    moveFile(srcPath, targetDir, srcName, isDir) {
+        var that = this;
+        if (!fs) {
+            this.showToastMsg('文件系统不可用，无法移动');
+            return;
+        }
+
+        // 不能移动到自身内部
+        if (targetDir.indexOf(srcPath) === 0) {
+            this.showToastMsg('不能将文件夹移动到自身内部');
+            return;
+        }
+
+        var destPath = path.join(targetDir, srcName);
+
+        // 如果目标已存在，添加数字后缀
+        var finalDestPath = destPath;
+        var counter = 1;
+        while (fs.existsSync(finalDestPath)) {
+            var ext = path.extname(srcName);
+            var base = path.basename(srcName, ext);
+            finalDestPath = path.join(targetDir, base + ' (' + counter + ')' + ext);
+            counter++;
+        }
+
+        try {
+            var srcDrive = srcPath.charAt(0).toUpperCase();
+            var destDrive = targetDir.charAt(0).toUpperCase();
+
+            if (srcDrive !== destDrive) {
+                if (isDir) {
+                    that.copyDirectorySync(srcPath, finalDestPath);
+                    that.removeDirectorySync(srcPath);
+                } else {
+                    fs.copyFileSync(srcPath, finalDestPath);
+                    fs.unlinkSync(srcPath);
+                }
+            } else {
+                fs.renameSync(srcPath, finalDestPath);
+            }
+
+            // 刷新当前目录
+            that.loadDirectory(that.currentPath);
+        } catch(e) {
+            console.error('[LocalBrowse] moveFile error:', e);
+            that.showToastMsg('移动失败：' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * 剪切文件/文件夹
+     */
+    cutFile(filePath, fileName, isDir) {
+        this._clipboardCut = {
+            path: filePath,
+            name: fileName,
+            isDir: isDir
+        };
+        // 剪切成功，无提示
+    }
+
+    /**
+     * 粘贴文件/文件夹到目标目录
+     */
+    pasteFile(targetDir) {
+        var that = this;
+        if (!this._clipboardCut) {
+            this.showToastMsg('剪贴板为空，请先剪切文件');
+            return;
+        }
+        if (!fs) {
+            this.showToastMsg('文件系统不可用，无法粘贴');
+            return;
+        }
+
+        var srcPath = this._clipboardCut.path;
+        var srcName = this._clipboardCut.name;
+        var isDir = this._clipboardCut.isDir;
+
+        // 不能粘贴到自身子目录
+        if (targetDir.indexOf(srcPath) === 0) {
+            this.showToastMsg('不能将文件夹粘贴到自身内部');
+            return;
+        }
+
+        var destPath = path.join(targetDir, srcName);
+
+        // 如果目标已存在，添加数字后缀
+        var finalDestPath = destPath;
+        var counter = 1;
+        while (fs.existsSync(finalDestPath)) {
+            var ext = path.extname(srcName);
+            var base = path.basename(srcName, ext);
+            finalDestPath = path.join(targetDir, base + ' (' + counter + ')' + ext);
+            counter++;
+        }
+
+        try {
+            // 检查是否跨盘符（Windows 下 rename 不能跨盘）
+            var srcDrive = srcPath.charAt(0).toUpperCase();
+            var destDrive = targetDir.charAt(0).toUpperCase();
+
+            if (srcDrive !== destDrive) {
+                // 跨盘符：先复制再删除
+                if (isDir) {
+                    that.copyDirectorySync(srcPath, finalDestPath);
+                    that.removeDirectorySync(srcPath);
+                } else {
+                    fs.copyFileSync(srcPath, finalDestPath);
+                    fs.unlinkSync(srcPath);
+                }
+            } else {
+                // 同盘符：直接 rename
+                fs.renameSync(srcPath, finalDestPath);
+            }
+
+            // 粘贴成功，无提示
+            that._clipboardCut = null;
+
+            // 刷新当前目录
+            that.loadDirectory(that.currentPath);
+        } catch(e) {
+            console.error('[LocalBrowse] pasteFile error:', e);
+            that.showToastMsg('移动失败：' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * 同步复制目录（用于跨盘符移动）
+     */
+    copyDirectorySync(src, dest) {
+        if (!fs) return;
+        fs.mkdirSync(dest, { recursive: true });
+        var entries = fs.readdirSync(src, { withFileTypes: true });
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            var srcPath = path.join(src, entry.name);
+            var destPath = path.join(dest, entry.name);
+            if (entry.isDirectory()) {
+                this.copyDirectorySync(srcPath, destPath);
+            } else {
+                fs.copyFileSync(srcPath, destPath);
+            }
+        }
+    }
+
+    /**
+     * 同步删除目录（用于跨盘符移动后清理）
+     */
+    removeDirectorySync(dirPath) {
+        if (!fs) return;
+        var entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            var fullPath = path.join(dirPath, entry.name);
+            if (entry.isDirectory()) {
+                this.removeDirectorySync(fullPath);
+            } else {
+                fs.unlinkSync(fullPath);
+            }
+        }
+        fs.rmdirSync(dirPath);
+    }
+
+    /**
      * 显示提示消息
      */
     showToastMsg(msg) {
@@ -1813,6 +2722,83 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 显示粘贴菜单（空白处右键）
+     */
+    showPasteMenu(e, targetDir) {
+        var that = this;
+        var menuEl = document.getElementById('cd-context-menu');
+        if (!menuEl) return;
+
+        that.hideContextMenu();
+
+        if (!that._clipboardCut) return;
+
+        var items = [];
+        items.push({
+            icon: '📋',
+            label: '粘贴「' + that._clipboardCut.name + '」',
+            action: function() { that.pasteFile(targetDir); }
+        });
+        items.push({ type: 'divider' });
+        items.push({
+            icon: '❌',
+            label: '取消剪切',
+            action: function() {
+                that._clipboardCut = null;
+                that.showToastMsg('已取消剪切');
+            }
+        });
+
+        var html = '';
+        for (var i = 0; i < items.length; i++) {
+            var item = items[i];
+            if (item.type === 'divider') {
+                html += '<div style="height:1px;background:var(--b3-border,#eee);margin:4px 0"></div>';
+            } else {
+                html += '<div class="cd-menu-item" data-idx="' + i + '" style="padding:6px 14px;cursor:pointer;white-space:nowrap;transition:background 0.1s;display:flex;align-items:center;gap:8px">' +
+                    '<span style="font-size:14px;width:18px;text-align:center;flex-shrink:0">' + item.icon + '</span>' +
+                    '<span style="flex:1">' + item.label + '</span>' +
+                '</div>';
+            }
+        }
+        menuEl.innerHTML = html;
+
+        var menuItems = menuEl.querySelectorAll('.cd-menu-item');
+        for (var j = 0; j < menuItems.length; j++) {
+            menuItems[j].addEventListener('click', function(e) {
+                e.stopPropagation();
+                that.hideContextMenu();
+                var idx = parseInt(this.dataset.idx, 10);
+                if (items[idx] && items[idx].action) {
+                    items[idx].action();
+                }
+            });
+            menuItems[j].addEventListener('mouseenter', function() {
+                this.style.background = 'var(--b3-theme-hover,#e3f2fd)';
+            });
+            menuItems[j].addEventListener('mouseleave', function() {
+                this.style.background = '';
+            });
+        }
+
+        menuEl.style.display = 'block';
+        var rect = menuEl.getBoundingClientRect();
+        var winW = window.innerWidth;
+        var winH = window.innerHeight;
+        var x = e.clientX;
+        var y = e.clientY;
+        if (x + rect.width > winW) x = winW - rect.width - 4;
+        if (y + rect.height > winH) y = winH - rect.height - 4;
+        if (x < 0) x = 4;
+        if (y < 0) y = 4;
+        menuEl.style.left = x + 'px';
+        menuEl.style.top = y + 'px';
+
+        document.addEventListener('click', that._menuDocClick);
+        document.addEventListener('keydown', that._menuKeyDown);
+    }
+
+    /**
      * 显示右键菜单
      */
     showContextMenu(e, filePath, fileName, isDir) {
@@ -1835,6 +2821,13 @@ class LocalBrowsePlugin extends Plugin {
             items.push({ type: 'divider' });
             items.push({ icon: '🔗', label: '添加到文档', action: function() { that.insertLocalFileLink(filePath, fileName, true); } });
             items.push({ type: 'divider' });
+            items.push({ icon: '✂️', label: '剪切', action: function() { that.cutFile(filePath, fileName, isDir); } });
+            // 如果有剪切内容，显示粘贴选项
+            if (that._clipboardCut) {
+                items.push({ type: 'divider' });
+                items.push({ icon: '📋', label: '粘贴「' + that._clipboardCut.name + '」', action: function() { that.pasteFile(filePath); } });
+            }
+            items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         } else {
             items.push({ icon: '📂', label: '打开文件', action: function() { that.openFile(filePath); } });
@@ -1844,7 +2837,9 @@ class LocalBrowsePlugin extends Plugin {
             items.push({ icon: '🔗', label: '复制 Markdown 链接', action: function() { that.copyMarkdownLink(filePath, fileName); } });
             items.push({ type: 'divider' });
             items.push({ icon: '📎', label: '插入本地链接', action: function() { that.handleFileClick(filePath, fileName); } });
-            items.push({ icon: '📦', label: '复制到 assets 并插入', action: function() { that.copyFileToAssets(filePath, fileName); } });
+            items.push({ icon: '📦', label: '插入本地文件', action: function() { that.copyFileToAssets(filePath, fileName); } });
+            items.push({ type: 'divider' });
+            items.push({ icon: '✂️', label: '剪切', action: function() { that.cutFile(filePath, fileName, isDir); } });
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         }
@@ -1997,11 +2992,69 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 注册链接点击拦截器
+     * 拦截文档中 file:/// 链接的点击，确保带指纹信息的链接能正确打开
+     * 指纹信息存储在 title 属性中（如 title="size=123&mtime=456"），
+     * 也兼容 URL fragment 格式（如 #size=123&mtime=456）
+     */
+    registerLinkClickInterceptor() {
+        var that = this;
+        that._linkClickInterceptor = function(e) {
+            // 查找被点击的链接元素
+            var target = e.target;
+            var linkEl = null;
+            // 向上查找 <a> 标签
+            while (target && target !== document) {
+                if (target.tagName === 'A' && target.href) {
+                    linkEl = target;
+                    break;
+                }
+                target = target.parentElement;
+            }
+            if (!linkEl) return;
+
+            var href = linkEl.href;
+            // 只处理 file:/// 链接
+            if (!href || href.indexOf('file:///') !== 0) return;
+
+            // 检查是否包含指纹信息（URL fragment 或 title 属性）
+            var hasFragmentFingerprint = (href.indexOf('#size=') !== -1 || href.indexOf('#mtime=') !== -1);
+            var titleAttr = linkEl.getAttribute('title') || '';
+            var hasTitleFingerprint = (titleAttr.indexOf('size=') !== -1 || titleAttr.indexOf('mtime=') !== -1);
+
+            if (!hasFragmentFingerprint && !hasTitleFingerprint) return;
+
+            // 阻止默认行为和事件冒泡（带指纹的链接需要特殊处理）
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+
+            // 去掉 fragment 后打开文件
+            var cleanUrl = href.split('#')[0];
+            that.openFileByUrl(cleanUrl);
+        };
+        // 在捕获阶段拦截，比思源的默认处理更早
+        document.addEventListener('mousedown', that._linkClickInterceptor, true);
+    }
+
+    /**
+     * 通过 file:/// URL 打开文件（去掉 fragment 后转为本地路径）
+     */
+    openFileByUrl(url) {
+        var localPath = this.fileUrlToLocalPath(url);
+        if (localPath) {
+            this.openFile(localPath);
+        } else {
+            this.showToastMsg('无法解析文件路径：' + url);
+        }
+    }
+
+    /**
      * 复制文件路径到剪贴板
      */
     copyFilePath(filePath) {
         this.copyToClipboard(filePath);
-        this.showToastMsg('✅ 路径已复制');
+        // 路径复制成功，无提示
     }
 
     /**
@@ -2031,7 +3084,7 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
         this.copyToClipboard(markdown);
-        this.showToastMsg('✅ Markdown 链接已复制');
+        // Markdown 链接复制成功，无提示
     }
 
     /**
@@ -2133,7 +3186,36 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 判断是否为视频文件
+     */
+    isVideoFile(fileName) {
+        var ext = fileName.split('.').pop().toLowerCase();
+        var videoExts = {'mp4':1,'avi':1,'mkv':1,'mov':1,'wmv':1,'flv':1,'webm':1,'m4v':1,'mpg':1,'mpeg':1,'ts':1,'m2ts':1,'3gp':1};
+        return !!videoExts[ext];
+    }
+
+    /**
+     * 获取文件类型图标（用于非图片/视频文件的链接前缀）
+     */
+    getFileIcon(fileName) {
+        var ext = fileName.split('.').pop().toLowerCase();
+        var iconMap = {
+            'pdf': '📄',
+            'doc': '📝','docx': '📝',
+            'xls': '📊','xlsx': '📊',
+            'ppt': '📊','pptx': '📊',
+            'txt': '📃',
+            'zip': '📦','rar': '📦','7z': '📦',
+            'mp3': '🎵','wav': '🎵','flac': '🎵','aac': '🎵',
+            'epub': '📖',
+            'md': '📝'
+        };
+        return iconMap[ext] || '📎';
+    }
+
+    /**
      * 显示图片悬浮预览
+     * 优化：使用 Canvas 缩放只显示缩小版本，避免加载全尺寸原图
      */
     showImagePreview(filePath, fileName, fileSize, fileMtime) {
         var that = this;
@@ -2141,7 +3223,46 @@ class LocalBrowsePlugin extends Plugin {
         var imgEl = document.getElementById('cd-preview-img');
         if (!previewEl || !imgEl) return;
 
-        imgEl.src = that.toFileUrl(filePath);
+        var PREVIEW_W = 560;
+        var PREVIEW_H = 480;
+        var fileUrl = that.toFileUrl(filePath);
+
+        // 使用 createImageBitmap 异步解码 + Canvas 缩放，避免全尺寸图片阻塞主线程
+        var loadAndScale = function() {
+            return new Promise(function(resolve) {
+                var img = new Image();
+                img.onload = function() {
+                    // 计算缩放比例，保持纵横比
+                    var scale = Math.min(PREVIEW_W / img.naturalWidth, PREVIEW_H / img.naturalHeight, 1);
+                    var w = Math.round(img.naturalWidth * scale);
+                    var h = Math.round(img.naturalHeight * scale);
+                    var canvas = document.createElement('canvas');
+                    canvas.width = w;
+                    canvas.height = h;
+                    var ctx = canvas.getContext('2d');
+                    ctx.drawImage(img, 0, 0, w, h);
+                    resolve(canvas.toDataURL('image/jpeg', 0.85));
+                };
+                img.onerror = function() { resolve(fileUrl); }; // 降级到原始 URL
+                img.src = fileUrl;
+            });
+        };
+
+        // 取消上一次的预览加载
+        if (that._previewAbortController) {
+            that._previewAbortController.abort();
+        }
+        var abortCtrl = new AbortController();
+        that._previewAbortController = abortCtrl;
+
+        // 先显示占位背景，立刻出界面
+        imgEl.src = '';
+
+        loadAndScale().then(function(dataUrl) {
+            // 使用闭包捕获的 abortCtrl 确保取消检查正确
+            if (abortCtrl.signal.aborted) return;
+            imgEl.src = dataUrl;
+        });
 
         // 设置文件名（带上文件大小）
         var nameEl = document.getElementById('cd-preview-name');
@@ -2179,23 +3300,18 @@ class LocalBrowsePlugin extends Plugin {
         // 定位：显示在鼠标右侧，垂直方向跟随鼠标
         var winW = window.innerWidth;
         var winH = window.innerHeight;
-        var previewW = 560;
-        var previewH = 480;
 
         var mx = that._previewMousePos ? that._previewMousePos.x : 0;
         var my = that._previewMousePos ? that._previewMousePos.y : 0;
 
         var left = mx + 16;
-        // 垂直方向以鼠标为中心偏下一点，避免上下跳跃
-        var top = my - previewH / 2 + 20;
+        var top = my - PREVIEW_H / 2 + 20;
 
-        // 如果右侧空间不够，显示在鼠标左侧（紧挨着鼠标）
-        if (left + previewW > winW) {
-            left = mx - previewW - 2;
+        if (left + PREVIEW_W > winW) {
+            left = mx - PREVIEW_W - 2;
         }
-        // 边界保护
-        if (top + previewH > winH) {
-            top = winH - previewH - 8;
+        if (top + PREVIEW_H > winH) {
+            top = winH - PREVIEW_H - 8;
         }
         if (top < 0) top = 8;
         if (left < 0) left = 8;
@@ -2219,6 +3335,11 @@ class LocalBrowsePlugin extends Plugin {
         if (nameEl) nameEl.textContent = '';
         var timeEl = document.getElementById('cd-preview-time');
         if (timeEl) timeEl.textContent = '';
+        // 取消还在进行的预览加载
+        if (this._previewAbortController) {
+            this._previewAbortController.abort();
+            this._previewAbortController = null;
+        }
     }
 
     /**
@@ -2556,7 +3677,11 @@ class LocalBrowsePlugin extends Plugin {
             } else {
                 var saved = localStorage.getItem('cd_favorites');
                 if (saved) {
-                    that.favorites = JSON.parse(saved);
+                    try {
+                        that.favorites = JSON.parse(saved);
+                    } catch (e) {
+                        that.favorites = [];
+                    }
                 }
                 that.renderFavorites();
             }
@@ -2601,30 +3726,116 @@ class LocalBrowsePlugin extends Plugin {
         for (var i = 0; i < this.favorites.length; i++) {
             var fav = this.favorites[i];
             var btn = document.createElement('div');
-            btn.style.cssText = 'display:inline-flex;align-items:center;gap:3px;padding:2px 6px;font-size:10px;background:var(--b3-theme-surface,#f0f0f0);border:1px solid var(--b3-border,#ddd);border-radius:10px;cursor:pointer;white-space:nowrap;max-width:100px;overflow:hidden;text-overflow:ellipsis;transition:background 0.15s;flex-shrink:0';
+            btn.style.cssText = 'display:inline-flex;align-items:center;gap:3px;padding:2px 6px;font-size:10px;background:var(--b3-theme-surface,#f0f0f0);border:1px solid var(--b3-border,#ddd);border-radius:10px;cursor:pointer;white-space:nowrap;max-width:100px;overflow:hidden;text-overflow:ellipsis;transition:background 0.15s;flex-shrink:0;user-select:none';
             btn.title = fav.path;
+            btn.draggable = true;
+            btn.dataset.favIndex = i;
             btn.innerHTML = '<span style="font-size:10px">⭐</span><span style="overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(fav.name) + '</span>';
 
-            (function(favPath, favName) {
-                btn.addEventListener('click', function() {
+            (function(favPath, favName, btnEl) {
+                btnEl.addEventListener('click', function() {
                     that.loadDirectory(favPath);
                 });
-                btn.addEventListener('mouseenter', function() {
+                btnEl.addEventListener('mouseenter', function() {
                     this.style.background = 'var(--b3-theme-hover,#e3f2fd)';
                 });
-                btn.addEventListener('mouseleave', function() {
+                btnEl.addEventListener('mouseleave', function() {
                     this.style.background = 'var(--b3-theme-surface,#f0f0f0)';
                 });
-                btn.addEventListener('contextmenu', function(e) {
+                btnEl.addEventListener('contextmenu', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
                     if (confirm('确定要移除收藏 "' + favName + '" 吗？')) {
                         that.removeFavorite(favPath);
                     }
                 });
-            })(fav.path, fav.name);
+
+                // 拖拽排序
+                btnEl.addEventListener('dragstart', function(e) {
+                    this.style.opacity = '0.4';
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', favPath);
+                    that._dragFavIndex = parseInt(this.dataset.favIndex, 10);
+                });
+                btnEl.addEventListener('dragend', function(e) {
+                    this.style.opacity = '';
+                    that._dragFavIndex = null;
+                    // 清除所有高亮
+                    var allBtns = list.querySelectorAll('[data-fav-index]');
+                    for (var k = 0; k < allBtns.length; k++) {
+                        allBtns[k].style.borderLeft = '';
+                        allBtns[k].style.borderRight = '';
+                    }
+                });
+                btnEl.addEventListener('dragover', function(e) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'move';
+                    // 高亮拖拽目标位置
+                    var targetIndex = parseInt(this.dataset.favIndex, 10);
+                    if (that._dragFavIndex !== null && that._dragFavIndex !== targetIndex) {
+                        if (targetIndex < that._dragFavIndex) {
+                            this.style.borderLeft = '2px solid var(--b3-theme-primary,#4285f4)';
+                            this.style.borderRight = '';
+                        } else {
+                            this.style.borderRight = '2px solid var(--b3-theme-primary,#4285f4)';
+                            this.style.borderLeft = '';
+                        }
+                    }
+                });
+                btnEl.addEventListener('dragleave', function(e) {
+                    this.style.borderLeft = '';
+                    this.style.borderRight = '';
+                });
+                btnEl.addEventListener('drop', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.style.borderLeft = '';
+                    this.style.borderRight = '';
+                    var fromIndex = that._dragFavIndex;
+                    var toIndex = parseInt(this.dataset.favIndex, 10);
+                    if (fromIndex !== null && fromIndex !== toIndex) {
+                        // 移动数组元素
+                        var moved = that.favorites.splice(fromIndex, 1)[0];
+                        that.favorites.splice(toIndex, 0, moved);
+                        that.saveFavorites();
+                        // 只交换 DOM 位置，避免清空重建导致闪烁
+                        that._swapFavButtons(fromIndex, toIndex);
+                    }
+                });
+            })(fav.path, fav.name, btn);
 
             list.appendChild(btn);
+        }
+    }
+
+    /**
+     * 交换收藏夹按钮的 DOM 位置（避免 renderFavorites 清空重建导致闪烁）
+     */
+    _swapFavButtons(fromIndex, toIndex) {
+        var list = document.getElementById('cd-favorites-list');
+        if (!list) return;
+        var btns = list.querySelectorAll('[data-fav-index]');
+        if (fromIndex < 0 || fromIndex >= btns.length || toIndex < 0 || toIndex >= btns.length) {
+            // 索引越界，回退到全量重建
+            this.renderFavorites();
+            return;
+        }
+        var fromBtn = btns[fromIndex];
+        var toBtn = btns[toIndex];
+        if (!fromBtn || !toBtn) {
+            this.renderFavorites();
+            return;
+        }
+        // 交换 DOM 位置
+        if (fromIndex < toIndex) {
+            toBtn.parentNode.insertBefore(fromBtn, toBtn.nextSibling);
+        } else {
+            toBtn.parentNode.insertBefore(fromBtn, toBtn);
+        }
+        // 更新所有按钮的 data-fav-index
+        var allBtns = list.querySelectorAll('[data-fav-index]');
+        for (var i = 0; i < allBtns.length; i++) {
+            allBtns[i].dataset.favIndex = i;
         }
     }
 
@@ -2645,7 +3856,7 @@ class LocalBrowsePlugin extends Plugin {
         if (this.isFavorite(dirPath)) return;
         this.favorites.push({ path: dirPath, name: dirName });
         this.saveFavorites();
-        this.showToastMsg('⭐ 已收藏: ' + dirName);
+        // 收藏成功，无提示
     }
 
     /**
@@ -2661,7 +3872,7 @@ class LocalBrowsePlugin extends Plugin {
         }
         if (removed) {
             this.saveFavorites();
-            this.showToastMsg('❌ 已移除收藏: ' + removed);
+            // 移除收藏成功，无提示
         }
     }
 
@@ -2693,6 +3904,88 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 显示当前目录文件类型统计面板
+     */
+    /**
+     * 更新底部文件统计栏（自动在加载目录后调用）
+     */
+    updateFileStats() {
+        var that = this;
+        var statsText = document.getElementById('cd-stats-text');
+        if (!statsText) return;
+
+        var files = that.cachedFiles || [];
+        if (files.length === 0) {
+            statsText.innerHTML = '📊 目录为空';
+            return;
+        }
+
+        var categories = {
+            '📷': { exts: ['jpg','jpeg','png','gif','webp','svg','bmp','heic','heif','ico','tiff','tif'] },
+            '📄': { exts: ['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','md','csv','rtf','odt'] },
+            '🎬': { exts: ['mp4','avi','mkv','mov','wmv','flv','webm','m4v','mpg','mpeg'] },
+            '🎵': { exts: ['mp3','wav','flac','aac','ogg','wma','m4a','ape'] },
+            '📦': { exts: ['zip','rar','7z','tar','gz','bz2','xz','iso'] },
+            '💻': { exts: ['js','ts','jsx','tsx','py','java','cpp','c','h','hpp','html','css','json','xml','yaml','yml','go','rs','rb','php','swift','kt'] }
+        };
+
+        var stats = {};
+        var totalSize = 0;
+        var totalFiles = 0;
+        var folderCount = 0;
+
+        for (var i = 0; i < files.length; i++) {
+            var f = files[i];
+            if (f.isDir) {
+                folderCount++;
+                continue;
+            }
+            totalFiles++;
+            totalSize += f.size || 0;
+
+            var ext = f.name.split('.').pop().toLowerCase();
+            var found = false;
+            for (var cat in categories) {
+                if (categories[cat].exts.indexOf(ext) !== -1) {
+                    if (!stats[cat]) stats[cat] = { count: 0, size: 0 };
+                    stats[cat].count++;
+                    stats[cat].size += f.size || 0;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (!stats['📎']) stats['📎'] = { count: 0, size: 0 };
+                stats['📎'].count++;
+                stats['📎'].size += f.size || 0;
+            }
+        }
+
+        // 按大小降序排列
+        var catOrder = [];
+        for (var cat in stats) {
+            catOrder.push({ name: cat, count: stats[cat].count, size: stats[cat].size });
+        }
+        catOrder.sort(function(a, b) { return b.size - a.size; });
+
+        var parts = [];
+        for (var j = 0; j < catOrder.length; j++) {
+            var c = catOrder[j];
+            parts.push(c.name + ' ' + c.count + '个/' + that.formatSize(c.size));
+        }
+        if (folderCount > 0) {
+            parts.push('📁 ' + folderCount + '个');
+        }
+
+        statsText.innerHTML = '<span title="' + that.escapeHtml(parts.join(' | ')) + '">' +
+            '📊 ' + totalFiles + '个文件' +
+            (folderCount > 0 ? ' · ' + folderCount + '个文件夹' : '') +
+            ' · 共 ' + that.formatSize(totalSize) +
+            ' <span style="opacity:0.6">(' + parts.join(' | ') + ')</span>' +
+        '</span>';
+    }
+
+    /**
      * 从图片文件中读取 EXIF 拍摄时间
      * 仅解析 JPEG 的 EXIF IFD，轻量实现无需第三方库
      */
@@ -2700,44 +3993,49 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         try {
             var fs = require('fs');
-            fs.readFile(filePath, function(err, buf) {
-                if (err || !buf || buf.length < 4) { callback(null); return; }
-                try {
-                    // 检查 JPEG 文件头
-                    if (buf[0] !== 0xFF || buf[1] !== 0xD8) { callback(null); return; }
+            // 只读取文件前 64KB，EXIF 数据通常在此范围内
+            var buf = Buffer.alloc(65536);
+            var fd = fs.openSync(filePath, 'r');
+            var bytesRead = fs.readSync(fd, buf, 0, 65536, 0);
+            fs.closeSync(fd);
+            if (bytesRead < 4) { callback(null); return; }
 
-                    var offset = 2;
-                    while (offset < buf.length - 4) {
-                        if (buf[offset] !== 0xFF) break;
-                        var marker = buf[offset + 1];
-                        // APP1 (EXIF)
-                        if (marker === 0xE1) {
-                            var segLen = (buf[offset + 2] << 8) | buf[offset + 3];
-                            // 检查 "Exif\0\0" 头
-                            if (offset + 10 < buf.length &&
-                                buf[offset + 4] === 0x45 && buf[offset + 5] === 0x78 &&
-                                buf[offset + 6] === 0x69 && buf[offset + 7] === 0x66) {
-                                var exifStart = offset + 10;
-                                var exifBuf = buf.slice(exifStart, offset + 2 + segLen);
-                                var exifResult = that.parseExifIFD(exifBuf);
-                                callback(exifResult);
-                                return;
-                            }
-                            offset += 2 + segLen;
-                        } else if (marker >= 0xD0 && marker <= 0xD9) {
-                            // 无长度的标记 (RST, SOI, EOI 等)
-                            offset += 2;
-                        } else if (marker === 0xDA) {
-                            // SOS - 图像数据开始，后面不是 EXIF
-                            break;
-                        } else {
-                            var segLen2 = (buf[offset + 2] << 8) | buf[offset + 3];
-                            offset += 2 + segLen2;
+            try {
+                // 检查 JPEG 文件头
+                if (buf[0] !== 0xFF || buf[1] !== 0xD8) { callback(null); return; }
+
+                var offset = 2;
+                var totalLen = bytesRead;
+                while (offset < totalLen - 4) {
+                    if (buf[offset] !== 0xFF) break;
+                    var marker = buf[offset + 1];
+                    // APP1 (EXIF)
+                    if (marker === 0xE1) {
+                        var segLen = (buf[offset + 2] << 8) | buf[offset + 3];
+                        // 检查 "Exif\0\0" 头
+                        if (offset + 10 < totalLen &&
+                            buf[offset + 4] === 0x45 && buf[offset + 5] === 0x78 &&
+                            buf[offset + 6] === 0x69 && buf[offset + 7] === 0x66) {
+                            var exifStart = offset + 10;
+                            var exifBuf = buf.slice(exifStart, offset + 2 + segLen);
+                            var exifResult = that.parseExifIFD(exifBuf);
+                            callback(exifResult);
+                            return;
                         }
+                        offset += 2 + segLen;
+                    } else if (marker >= 0xD0 && marker <= 0xD9) {
+                        // 无长度的标记 (RST, SOI, EOI 等)
+                        offset += 2;
+                    } else if (marker === 0xDA) {
+                        // SOS - 图像数据开始，后面不是 EXIF
+                        break;
+                    } else {
+                        var segLen2 = (buf[offset + 2] << 8) | buf[offset + 3];
+                        offset += 2 + segLen2;
                     }
-                } catch (e) { /* 解析失败 */ }
-                callback(null);
-            });
+                }
+            } catch (e) { /* 解析失败 */ }
+            callback(null);
         } catch (e) {
             callback(null);
         }
@@ -2844,6 +4142,7 @@ class LocalBrowsePlugin extends Plugin {
         if (!state || state.isLoading) return;
 
         state.isLoading = true;
+        state._pendingScroll = false;  // 清除待处理标记
         var files = state.files;
         var currentPath = state.currentPath;
         var batchSize = state.batchSize;
@@ -2863,6 +4162,8 @@ class LocalBrowsePlugin extends Plugin {
         // 使用 insertAdjacentHTML 追加，避免重新渲染已有内容
         if (startIdx === 0) {
             fileListEl.innerHTML = html;
+            // 首批渲染后恢复滚动位置
+            that._restoreScrollPosition(fileListEl, currentPath);
         } else {
             fileListEl.insertAdjacentHTML('beforeend', html);
         }
@@ -2877,54 +4178,140 @@ class LocalBrowsePlugin extends Plugin {
 
         state.isLoading = false;
 
-        // 如果内容没有撑满容器，自动加载下一批
-        setTimeout(function() {
-            if (fileListEl.scrollHeight <= fileListEl.clientHeight + 50) {
-                if (state.renderedCount < state.files.length) {
-                    that.renderIconBatch(fileListEl);
-                }
+        // 图标视图主动预加载：始终确保渲染了足够多的内容
+        // 不依赖 scrollHeight 触发，保证滚动流畅
+        requestAnimationFrame(function() {
+            var shouldLoad = false;
+            if (fileListEl.scrollHeight <= fileListEl.clientHeight + 200) {
+                shouldLoad = true;  // 内容不足以覆盖视口
             }
-        }, 50);
+            // 已渲染内容不足视口高度的 2 倍时继续预加载
+            if (state.renderedCount < state.files.length && fileListEl.scrollHeight < fileListEl.clientHeight * 2) {
+                shouldLoad = true;
+            }
+            if (shouldLoad && state.renderedCount < state.files.length) {
+                that.renderIconBatch(fileListEl);
+            } else if (state._pendingScroll && state.renderedCount < state.files.length) {
+                // 滚动事件期间被 isLoading 阻挡的请求，在加载完成后补上
+                state._pendingScroll = false;
+                that.renderIconBatch(fileListEl);
+            }
+        });
     }
 
     /**
      * 加载当前视口内可见的缩略图
      * 只有在视口范围内的占位符才会被替换为真实 <img>
+     * 带并发控制，避免同时加载过多图片导致卡顿
      */
     loadVisibleThumbnails(container) {
         if (!container) return;
-        var wraps = container.querySelectorAll('.cd-thumb-wrap[data-src]:not([data-loaded])');
+        var wraps = container.querySelectorAll('.cd-thumb-wrap[data-src]:not([data-loaded]):not([data-large])');
         if (wraps.length === 0) return;
 
         var containerRect = container.getBoundingClientRect();
-        var viewTop = containerRect.top - 100;    // 上方预加载 100px
-        var viewBottom = containerRect.bottom + 100; // 下方预加载 100px
+        var viewTop = containerRect.top - 50;    // 上方预加载 50px
+        var viewBottom = containerRect.bottom + 50; // 下方预加载 50px
 
+        // 收集视口内的缩略图，按从上到下排序
+        var visible = [];
         for (var i = 0; i < wraps.length; i++) {
             var wrap = wraps[i];
             var rect = wrap.getBoundingClientRect();
-            // 判断是否在视口附近
             if (rect.bottom >= viewTop && rect.top <= viewBottom) {
-                wrap.dataset.loaded = '1';
-                var src = wrap.dataset.src;
-                var img = document.createElement('img');
-                img.src = src;
-                img.decoding = 'async';
-                img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
-                img.onload = function() { this.style.opacity = '1'; };
-                img.onerror = function() {
-                    // 加载失败保留占位符
-                    this.parentNode.innerHTML = '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>';
-                };
-                var placeholder = wrap.querySelector('.cd-thumb-placeholder');
-                if (placeholder) {
-                    wrap.replaceChild(img, placeholder);
-                } else {
-                    wrap.innerHTML = '';
-                    wrap.appendChild(img);
-                }
+                visible.push({ wrap: wrap, top: rect.top });
             }
         }
+        visible.sort(function(a, b) { return a.top - b.top; });
+
+        // 并发控制：同时最多加载 4 个缩略图
+        var maxConcurrent = 4;
+        var that = this;
+        if (!that._thumbQueue) that._thumbQueue = [];
+        if (!that._thumbLoading) that._thumbLoading = 0;
+
+        for (var i = 0; i < visible.length; i++) {
+            that._thumbQueue.push(visible[i].wrap);
+        }
+
+        that._processThumbQueue();
+    }
+
+    /**
+     * 处理缩略图加载队列，控制并发数
+     */
+    _processThumbQueue() {
+        var that = this;
+        if (!that._thumbQueue) return;
+        var maxConcurrent = 4;
+
+        while (that._thumbLoading < maxConcurrent && that._thumbQueue.length > 0) {
+            var wrap = that._thumbQueue.shift();
+            if (!wrap || !wrap.parentNode || wrap.dataset.loaded) continue;
+
+            wrap.dataset.loaded = '1';
+            that._thumbLoading++;
+            var src = wrap.dataset.src;
+            var img = document.createElement('img');
+            img.src = src;
+            img.decoding = 'async';
+            img.loading = 'lazy';
+            img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
+            img.onload = function() {
+                this.style.opacity = '1';
+                that._thumbLoading--;
+                that._processThumbQueue();
+            };
+            img.onerror = function() {
+                this.parentNode.innerHTML = '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🖼️</span>';
+                that._thumbLoading--;
+                that._processThumbQueue();
+            };
+            var placeholder = wrap.querySelector('.cd-thumb-placeholder');
+            if (placeholder) {
+                wrap.replaceChild(img, placeholder);
+            } else {
+                wrap.innerHTML = '';
+                wrap.appendChild(img);
+            }
+        }
+    }
+
+    /**
+     * 悬浮时懒加载大图缩略图：Canvas 缩放为 56x56 替换占位符
+     */
+    loadLargeThumbnail(wrap) {
+        if (!wrap || wrap.dataset.loaded === '1') return;
+        var that = this;
+        var src = wrap.dataset.src;
+        if (!src) return;
+
+        wrap.dataset.loaded = '1';
+
+        var img = new Image();
+        img.onload = function() {
+            var scale = Math.min(56 / img.naturalWidth, 56 / img.naturalHeight);
+            var w = Math.round(img.naturalWidth * scale);
+            var h = Math.round(img.naturalHeight * scale);
+            var canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            var ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, w, h);
+            var dataUrl = canvas.toDataURL('image/jpeg', 0.7);
+
+            var thumbImg = document.createElement('img');
+            thumbImg.src = dataUrl;
+            thumbImg.style.cssText = 'width:100%;height:100%;object-fit:contain;display:block';
+            var placeholder = wrap.querySelector('.cd-thumb-placeholder');
+            if (placeholder) {
+                wrap.replaceChild(thumbImg, placeholder);
+            }
+        };
+        img.onerror = function() {
+            // 加载失败保留占位符
+        };
+        img.src = src;
     }
 
     /**
@@ -2934,7 +4321,7 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         var fileListEl = e.target;
         var state = that.iconRenderState;
-        if (!state || state.isLoading) return;
+        if (!state) return;
 
         // 标记正在滚动，暂停鼠标预览
         that._isScrolling = true;
@@ -2957,7 +4344,7 @@ class LocalBrowsePlugin extends Plugin {
             clearTimeout(that._scrollTimer);
         }
 
-        // 防抖：200ms 后加载缩略图 + 检查是否需要加载更多
+        // 防抖：50ms 后加载缩略图 + 检查是否需要加载更多
         that._scrollTimer = setTimeout(function() {
             // 滚动停止，加载当前视口内的缩略图
             that.loadVisibleThumbnails(fileListEl);
@@ -2967,18 +4354,205 @@ class LocalBrowsePlugin extends Plugin {
             var scrollHeight = fileListEl.scrollHeight;
             var scrollBottom = scrollTop + clientHeight;
             
-            // 如果内容高度不足或接近底部，加载更多
+            // 提前加载：距离底部 300px 时就开始加载下一批，避免滚到底才加载的卡顿
             var needLoad = false;
             if (scrollHeight <= clientHeight + 50) {
                 needLoad = true;
-            } else if (scrollBottom >= scrollHeight - 100) {
+            } else if (scrollBottom >= scrollHeight - 300) {
                 needLoad = true;
             }
             
             if (needLoad && state.renderedCount < state.files.length) {
-                that.renderIconBatch(fileListEl);
+                if (state.isLoading) {
+                    // 正在加载中，标记待处理，加载完成后会自动补上
+                    state._pendingScroll = true;
+                } else {
+                    that.renderIconBatch(fileListEl);
+                }
             }
-        }, 200);
+        }, 50);
+    }
+
+    // ========== 链接状态指示灯 ==========
+
+    /**
+     * 更新链接状态指示灯
+     */
+    _updateLinkIndicator(status) {
+        var btn = document.getElementById('cd-relink-btn');
+        if (!btn) {
+            // 按钮还未渲染，延迟重试（最多 10 次）
+            if (!this._linkRetryCount) this._linkRetryCount = 0;
+            if (this._linkRetryCount < 10) {
+                this._linkRetryCount++;
+                var that = this;
+                setTimeout(function() { that._updateLinkIndicator(status); }, 1000);
+            }
+            return;
+        }
+        this._linkRetryCount = 0;
+
+        var icons = {
+            'none':     { emoji: '⚪', color: 'var(--b3-theme-secondary,#999)', title: '无本地链接' },
+            'checking': { emoji: '⏳', color: 'var(--b3-theme-secondary,#999)', title: '正在检测链接...' },
+            'green':    { emoji: '🟢', color: '#4caf50', title: '本地链接正常 ✅' },
+            'yellow':   { emoji: '🟡', color: '#ff9800', title: '有链接需要手动选择 ⚠️' },
+            'red':      { emoji: '🔴', color: '#f44336', title: '有链接无法修复 🔗' }
+        };
+
+        var info = icons[status] || icons.none;
+        btn.textContent = info.emoji;
+        btn.style.color = info.color;
+        btn.style.borderColor = info.color;
+        btn.title = info.title;
+        this._linkStatus = status;
+    }
+
+    /**
+     * 自动检测当前文档的本地链接状态
+     */
+    async _autoCheckLinks() {
+        var that = this;
+        if (that._autoCheckRunning) return;  // 防止并发执行
+        if (!document.getElementById('cd-relink-btn')) return;
+        var docId = that.getCurrentDocId();
+        if (!docId) {
+            // 没有打开文档时显示白灯
+            that._updateLinkIndicator('none');
+            return;
+        }
+
+        if (docId === that._lastCheckedDocId && that._linkStatus !== 'none' && that._linkStatus !== 'checking') return;
+        console.log('[LocalBrowse] autoCheckLinks - checking doc:', docId);
+        that._lastCheckedDocId = docId;
+        that._autoCheckRunning = true;
+
+        that._updateLinkIndicator('checking');
+
+        try {
+            var result = await that.scanBrokenLinks(docId);
+            console.log('[LocalBrowse] autoCheckLinks - scan result:', result ? (result.total + ' total, ' + (result.broken ? result.broken.length : 0) + ' broken') : 'null');
+            if (!result || result.total === 0) {
+                // 没有本地链接时显示白灯
+                that._updateLinkIndicator('none');
+                return;
+            }
+            if (!result.broken || result.broken.length === 0) {
+                // 有本地链接但都有效，显示绿灯
+                that._updateLinkIndicator('green');
+                return;
+            }
+
+            // 后台自动修复每个失效链接
+            var autoFixed = 0;
+            var needManual = 0;
+            var unfixable = 0;
+
+            // 保存未自动修复的链接及其搜索结果，供点击指示灯时复用
+            var pendingItems = [];
+
+            for (var i = 0; i < result.broken.length; i++) {
+                var item = result.broken[i];
+                console.log('[LocalBrowse] autoCheckLinks - fixing:', item.fileName, 'from', item.localPath);
+                var candidates = [];
+                var parentDir = '';
+                var lastSep = Math.max(item.localPath.lastIndexOf('\\'), item.localPath.lastIndexOf('/'));
+                if (lastSep > 0) parentDir = item.localPath.substring(0, lastSep);
+
+                // R1: 旧路径附近
+                if (parentDir && fs.existsSync(parentDir)) {
+                    var r1 = await that.searchFileByName(item.fileName, parentDir, {
+                        maxDepth: 2, maxResults: 10, maxDirs: 50, timeoutMs: 2000
+                    });
+                    var r1Exact = r1.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                    if (r1Exact.length > 0) candidates = r1Exact;
+                }
+
+                // R2: 上级目录
+                if (candidates.length === 0 && parentDir) {
+                    var grandParent = '';
+                    var gpSep = Math.max(parentDir.lastIndexOf('\\'), parentDir.lastIndexOf('/'));
+                    if (gpSep > 2) grandParent = parentDir.substring(0, gpSep);
+                    if (grandParent && grandParent.length > 3 && fs.existsSync(grandParent)) {
+                        var r2 = await that.searchFileByName(item.fileName, grandParent, {
+                            maxDepth: 3, maxResults: 10, maxDirs: 80, timeoutMs: 2000
+                        });
+                        var r2Exact = r2.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                        if (r2Exact.length > 0) candidates = r2Exact;
+                    }
+                }
+
+                // R3: 盘符根目录全盘搜索
+                if (candidates.length === 0) {
+                    var driveRoot = (item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\';
+                    var r3All = [];
+                    await new Promise(function(resolve) {
+                        that.deepSearch(driveRoot, item.fileName, function(partial, scanned, matched) {}, function(allResults) {
+                            for (var ri = 0; ri < allResults.length; ri++) {
+                                var r = allResults[ri];
+                                if (r.name === item.fileName || (r.name && r.name.toLowerCase() === item.fileName.toLowerCase())) {
+                                    r3All.push({ fullPath: r.path, size: r.size || 0, mtime: r.mtime || 0, matchType: 'exact' });
+                                }
+                            }
+                            resolve();
+                        });
+                    });
+                    if (r3All.length > 0) candidates = r3All;
+                }
+
+                if (candidates.length === 0) {
+                    unfixable++;
+                    item._searchResults = [];
+                    pendingItems.push(item);
+                } else if (candidates.length === 1) {
+                    // 唯一匹配 → 自动修复
+                    try {
+                        await that.replaceLink(docId, item.oldUrl, candidates[0].fullPath, i, { silent: true });
+                        autoFixed++;
+                        console.log('[LocalBrowse] autoCheckLinks - auto fixed:', item.fileName, '→', candidates[0].fullPath);
+                    } catch(e) {
+                        unfixable++;
+                        item._searchResults = candidates;
+                        pendingItems.push(item);
+                        console.error('[LocalBrowse] autoCheckLinks - auto fix failed:', item.fileName, e);
+                    }
+                } else {
+                    // 多个匹配 → 需要手动选择
+                    needManual++;
+                    item._searchResults = candidates;
+                    pendingItems.push(item);
+                    console.log('[LocalBrowse] autoCheckLinks - need manual:', item.fileName, candidates.length, 'candidates');
+                }
+            }
+
+            // 缓存未修复的链接信息，供点击指示灯时复用
+            that._cachedBrokenResult = {
+                docId: docId,
+                broken: pendingItems,
+                total: result.total,
+                valid: result.valid
+            };
+
+            console.log('[LocalBrowse] autoCheckLinks - result: autoFixed=' + autoFixed + ', needManual=' + needManual + ', unfixable=' + unfixable);
+            if (unfixable > 0) {
+                that._updateLinkIndicator('red');
+            } else if (needManual > 0) {
+                that._updateLinkIndicator('yellow');
+            } else {
+                that._updateLinkIndicator('green');
+            }
+
+            // 自动修复后重置 _lastCheckedDocId，让下次定时器触发时重新扫描确认
+            // （自动修复可能改变了文档内容，需要重新评估链接状态）
+            if (autoFixed > 0) {
+                that._lastCheckedDocId = '';
+            }
+        } catch (e) {
+            console.error('[LocalBrowse] auto check error:', e);
+            that._updateLinkIndicator('none');
+        } finally {
+            that._autoCheckRunning = false;
+        }
     }
 
     // ========== 失效链接修复功能 ==========
@@ -2998,26 +4572,180 @@ class LocalBrowsePlugin extends Plugin {
             return;
         }
 
-        // 2. 扫描失效链接
-        try {
-            var result = await that.scanBrokenLinks(docId);
-            if (!result || !result.broken || result.broken.length === 0) {
-                if (result && result.total === 0) {
-                    that.showToastMsg('📄 当前文档没有本地文件链接');
-                } else {
-                    that.showToastMsg('✅ 该文档内所有本地链接均有效');
-                }
+        // 2. 尝试复用自动检测缓存的扫描结果
+        var result = null;
+        var useCache = false;
+        if (that._cachedBrokenResult && that._cachedBrokenResult.docId === docId && that._cachedBrokenResult.broken && that._cachedBrokenResult.broken.length > 0) {
+            result = that._cachedBrokenResult;
+            useCache = true;
+            console.log('[LocalBrowse] relinkBrokenLinks - using cached result');
+        }
+
+        // 3. 无缓存时重新扫描
+        if (!result) {
+            try {
+                result = await that.scanBrokenLinks(docId);
+            } catch(e) {
+                console.error('[LocalBrowse] relinkBrokenLinks - scan error:', e);
+                that.showToastMsg('扫描链接失败：' + (e.message || e));
                 return;
             }
+        }
 
-            // 3. 先弹出对话框显示失效链接列表
-            that.showRelinkDialog(result.broken, result.total, result.valid, docId);
+        if (!result || !result.broken || result.broken.length === 0) {
+            if (result && result.total === 0) {
+                that.showToastMsg('📄 当前文档没有本地文件链接');
+            } else {
+                // 所有链接有效，无提示
+            }
+            return;
+        }
 
-            // 4. 在对话框内自动搜索修复（并行处理所有失效链接）
-            var dialog = document.getElementById('cd-relink-dialog');
-            if (dialog) {
-                var autoFixed = 0;
-                var needManual = [];
+        // 4. 弹出对话框显示失效链接列表
+        that.showRelinkDialog(result.broken, result.total, result.valid, docId);
+
+        // 5. 在对话框内处理链接
+        var dialog = document.getElementById('cd-relink-dialog');
+        if (dialog) {
+            if (useCache) {
+                // 有缓存时，直接展示已有的搜索结果，不再重新搜索
+                that._renderCachedResults(result.broken, docId, dialog);
+            } else {
+                // 无缓存，并行搜索修复
+                that._searchAndFixLinks(result, docId, dialog);
+            }
+        }
+    }
+
+    /**
+     * 复用缓存结果渲染对话框（点击指示灯时，避免重复扫描和搜索）
+     */
+    _renderCachedResults(brokenItems, docId, dialog) {
+        var that = this;
+        var autoFixed = 0;
+        var needManual = 0;
+        var unfixable = 0;
+
+        for (var i = 0; i < brokenItems.length; i++) {
+            var item = brokenItems[i];
+            var statusEl = dialog.querySelector('.cd-relink-status[data-index="' + i + '"]');
+            var candidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + i + '"]');
+            var candidates = item._searchResults || [];
+
+            if (candidates.length === 0) {
+                unfixable++;
+                if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">⚠️ 未找到同名文件</span>';
+                if (statusEl) {
+                    statusEl.textContent = '🔗 失效';
+                    statusEl.style.color = 'var(--b3-theme-error,#e74c3c)';
+                }
+            } else if (candidates.length === 1) {
+                // 唯一匹配，显示确认按钮
+                var cand = candidates[0];
+                var sizeStr = that.formatSize(cand.size);
+                var mtime = new Date(cand.mtime);
+                var dateStr = mtime.getFullYear() + '/' + (mtime.getMonth()+1) + '/' + mtime.getDate();
+                if (candidateArea) {
+                    candidateArea.innerHTML = '<div style="font-size:11px;color:var(--b3-theme-secondary,#999)">✅ 找到：' + that.escapeHtml(cand.fullPath) + ' <span>' + sizeStr + '</span> <span style="color:#888">' + dateStr + '</span></div>' +
+                        '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:4px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
+                    candidateArea._candidates = candidates;
+                }
+                if (statusEl) {
+                    statusEl.textContent = '✅ 可修复';
+                    statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
+                }
+                // 绑定确认按钮
+                var confirmBtn = candidateArea ? candidateArea.querySelector('.cd-relink-confirm-btn') : null;
+                if (confirmBtn) {
+                    (function(idx, cands) {
+                        confirmBtn.addEventListener('click', async function() {
+                            await that.replaceLink(docId, brokenItems[idx].oldUrl, cands[0].fullPath, idx, { dialog: dialog, brokenLinks: brokenItems });
+                            var s = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
+                            if (s) { s.textContent = '✅ 已修复'; s.style.color = 'var(--b3-theme-success,#52c41a)'; }
+                            that._cachedBrokenResult = null;
+                            that._lastCheckedDocId = '';
+                            that._autoCheckLinks();
+                        });
+                    })(i, candidates);
+                }
+                needManual++;
+            } else {
+                // 多个匹配，显示选择列表
+                needManual++;
+                var matchInfo = candidates.length + ' 个精确匹配';
+                var candidateHtml = '<div style="margin-top:4px;font-size:11px;color:var(--b3-theme-secondary,#999)">找到 ' + matchInfo + '，请选择：</div>';
+                candidateHtml += '<div style="margin-top:4px;max-height:150px;overflow-y:auto;border:1px solid var(--b3-border,#eee);border-radius:4px">';
+                for (var c = 0; c < candidates.length; c++) {
+                    var cand = candidates[c];
+                    var sizeStr = that.formatSize(cand.size);
+                    var mtime = new Date(cand.mtime);
+                    var dateStr = mtime.getFullYear() + '/' + (mtime.getMonth()+1) + '/' + mtime.getDate();
+                    var matchLabel = cand.matchType === 'exact' ? '✅' : '🔤';
+                    var fingerprintMatch = false;
+                    if (item.fileFingerprint) {
+                        if (item.fileFingerprint.size !== null && cand.size === item.fileFingerprint.size) fingerprintMatch = true;
+                    }
+                    if (fingerprintMatch) matchLabel = '🎯';
+                    candidateHtml += '<label style="display:block;padding:4px 8px;cursor:pointer;font-size:11px;border-bottom:1px solid var(--b3-border,#f5f5f5);word-break:break-all;color:#333;background:rgba(82,196,26,0.08)">' +
+                        '<input type="radio" name="cd-relink-cand-' + i + '" value="' + c + '" ' + (c === 0 ? 'checked' : '') + ' style="margin-right:4px">' +
+                        matchLabel + ' ' + that.escapeHtml(cand.fullPath) + ' <span style="color:var(--b3-theme-secondary,#999)">' + sizeStr + '</span> <span style="color:#888">' + dateStr + (fingerprintMatch ? ' (指纹匹配)' : '') + '</span>' +
+                    '</label>';
+                }
+                candidateHtml += '</div>';
+                candidateHtml += '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:6px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
+                if (candidateArea) {
+                    candidateArea.innerHTML = candidateHtml;
+                    candidateArea._candidates = candidates;
+                }
+                if (statusEl) {
+                    statusEl.textContent = '⚠️ 待确认';
+                    statusEl.style.color = 'var(--b3-theme-warning,#faad14)';
+                }
+                var confirmBtn2 = candidateArea ? candidateArea.querySelector('.cd-relink-confirm-btn') : null;
+                if (confirmBtn2) {
+                    (function(idx, cands) {
+                        confirmBtn2.addEventListener('click', async function() {
+                            var area = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
+                            var selectedRadio = area.querySelector('input[type="radio"]:checked');
+                            if (!selectedRadio) return;
+                            var candIdx = parseInt(selectedRadio.value, 10);
+                            var chosen = cands[candIdx];
+                            await that.replaceLink(docId, brokenItems[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: brokenItems });
+                            var s = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
+                            if (s) { s.textContent = '✅ 已修复'; s.style.color = 'var(--b3-theme-success,#52c41a)'; }
+                            that._cachedBrokenResult = null;
+                            that._lastCheckedDocId = '';
+                            that._autoCheckLinks();
+                        });
+                    })(i, candidates);
+                }
+            }
+        }
+
+        // 更新底部状态
+        var fixAllBtn = dialog.querySelector('#cd-relink-fixall');
+        if (fixAllBtn) {
+            if (unfixable > 0) {
+                fixAllBtn.textContent = unfixable + ' 个无法修复，' + needManual + ' 个待确认';
+                fixAllBtn.style.color = 'var(--b3-theme-error,#e74c3c)';
+            } else if (needManual > 0) {
+                fixAllBtn.textContent = needManual + ' 个待确认';
+                fixAllBtn.style.color = 'var(--b3-theme-warning,#faad14)';
+            } else {
+                fixAllBtn.textContent = '✅ 全部修复完成';
+                fixAllBtn.style.color = 'var(--b3-theme-success,#52c41a)';
+            }
+        }
+    }
+
+    /**
+     * 无缓存时，并行搜索并修复链接（原 relinkBrokenLinks 的搜索逻辑）
+     */
+    async _searchAndFixLinks(result, docId, dialog) {
+        var that = this;
+        try {
+            var autoFixed = 0;
+            var needManual = [];
 
                 // 定义单个链接的搜索修复函数
                 async function processLink(item, i) {
@@ -3028,7 +4756,7 @@ class LocalBrowsePlugin extends Plugin {
                     var _abortFlag = { cancelled: false };
 
                     if (statusEl) {
-                        statusEl.textContent = '🔍 搜索中...';
+                        statusEl.textContent = '';
                         statusEl.style.color = 'var(--b3-theme-secondary,#999)';
                     }
 
@@ -3078,12 +4806,12 @@ class LocalBrowsePlugin extends Plugin {
 
                     // 第三轮：全盘深度搜索
                     if (candidates.length === 0) {
-                        var driveRoot = item.localPath.charAt(0) + ':\\';
+                        var driveRoot = (item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\';
                         var r3AllCandidates = [];
                         var r3TotalSearched = 0;
                         var r3TotalMatched = 0;
 
-                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 全盘深度搜索...</span>';
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">R3 全盘深度搜索...</span>';
 
                         await new Promise(function(resolve) {
                             that.deepSearch(driveRoot, item.fileName, function(partialResults, dirsScanned, matchedFiles) {
@@ -3147,7 +4875,7 @@ class LocalBrowsePlugin extends Plugin {
                         }
 
                         if (r3AllCandidates.length > 0) candidates = r3AllCandidates;
-                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R3 搜索完成（' + r3TotalSearched + ' 目录）</span>';
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">R3 搜索完成（' + r3TotalSearched + ' 目录）</span>';
                     }
 
                     // 处理搜索结果
@@ -3203,20 +4931,22 @@ class LocalBrowsePlugin extends Plugin {
                         }
                         candidateHtml += '</div>';
                         candidateHtml += '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:6px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
-                        candidateArea.innerHTML = candidateHtml;
-                        candidateArea._candidates = exactCandidates;
+                        if (candidateArea) {
+                            candidateArea.innerHTML = candidateHtml;
+                            candidateArea._candidates = exactCandidates;
+                        }
                         if (statusEl) {
                             statusEl.textContent = '⚠️ 待确认';
                             statusEl.style.color = 'var(--b3-theme-warning,#faad14)';
                         }
-                        var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                        var confirmBtn = candidateArea ? candidateArea.querySelector('.cd-relink-confirm-btn') : null;
                         if (confirmBtn) {
                             confirmBtn.addEventListener('click', async function() {
-                                var idx = parseInt(this.getAttribute('data-index'));
+                                var idx = parseInt(this.getAttribute('data-index'), 10);
                                 var area = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
                                 var selectedRadio = area.querySelector('input[type="radio"]:checked');
                                 if (!selectedRadio) return;
-                                var candIdx = parseInt(selectedRadio.value);
+                                var candIdx = parseInt(selectedRadio.value, 10);
                                 var chosen = area._candidates[candIdx];
                                 await that.replaceLink(docId, result.broken[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: result.broken });
                                 // 刷新底部状态统计
@@ -3232,7 +4962,7 @@ class LocalBrowsePlugin extends Plugin {
                                         bottomSpan.textContent = '✅ 全部修复完成';
                                         bottomSpan.style.color = 'var(--b3-theme-success,#52c41a)';
                                     } else {
-                                        bottomSpan.textContent = '⚠️ 已自动修复 ' + newFixed + '/' + result.broken.length + ' 个，' + newPending + ' 个待确认';
+                                        bottomSpan.textContent = '已自动修复 ' + newFixed + '/' + result.broken.length + ' 个，' + newPending + ' 个待确认';
                                         bottomSpan.style.color = 'var(--b3-theme-warning,#faad14)';
                                     }
                                 }
@@ -3241,9 +4971,9 @@ class LocalBrowsePlugin extends Plugin {
                         return { manual: true };
                     } else {
                         item._searchResults = [];
-                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">❌ 未找到同名文件</span>';
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">⚠️ 未找到同名文件</span>';
                         if (statusEl) {
-                            statusEl.textContent = '❌ 失效';
+                            statusEl.textContent = '🔗 失效';
                             statusEl.style.color = 'var(--b3-theme-error,#e74c3c)';
                         }
                         return { manual: true };
@@ -3290,14 +5020,49 @@ class LocalBrowsePlugin extends Plugin {
                         fixAllBtn.textContent = '✅ 全部修复完成';
                         fixAllBtn.style.color = 'var(--b3-theme-success,#52c41a)';
                     } else {
-                        fixAllBtn.textContent = '⚠️ 已自动修复 ' + autoFixed + '/' + result.broken.length + ' 个，' + needManual.length + ' 个待确认';
+                        fixAllBtn.textContent = '已自动修复 ' + autoFixed + '/' + result.broken.length + ' 个，' + needManual.length + ' 个待确认';
                         fixAllBtn.style.color = 'var(--b3-theme-warning,#faad14)';
                     }
                 }
-            }
+
+                // 修复完成后重扫链接状态，更新指示灯
+                that._lastCheckedDocId = '';
+                that._autoCheckLinks();
         } catch (e) {
             console.error('[LocalBrowse] relink scan error:', e);
             that.showToastMsg('扫描链接失败：' + (e.message || e));
+        }
+    }
+
+    /**
+     * 获取光标所在块的 block ID
+     * 用于 insertBlock API 的 previousID 参数，实现插入到光标位置
+     */
+    getFocusBlockId() {
+        try {
+            var selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return null;
+            var range = selection.getRangeAt(0);
+            var node = range.startContainer;
+
+            // 从光标位置向上查找带 data-node-id 的块元素
+            while (node && node !== document) {
+                if (node.nodeType === 1 && node.getAttribute && node.getAttribute('data-node-id')) {
+                    var nodeId = node.getAttribute('data-node-id');
+                    // 排除文档标题块（它的 ID 等于 docId，插入到它后面会插入到文档开头）
+                    // 只返回内容块的 ID
+                    if (node.classList && node.classList.contains('protyle-title')) {
+                        // 光标在标题上，返回 null，让调用方用 parentID
+                        return null;
+                    }
+                    return nodeId;
+                }
+                node = node.parentNode;
+            }
+            return null;
+        } catch (e) {
+            console.warn('[LocalBrowse] getFocusBlockId error:', e);
+            return null;
         }
     }
 
@@ -3436,8 +5201,8 @@ class LocalBrowsePlugin extends Plugin {
             if (decodedLinkTitle) {
                 var sizeMatch = decodedLinkTitle.match(/size=(\d+)/);
                 var mtimeMatch = decodedLinkTitle.match(/mtime=(\d+)/);
-                if (sizeMatch) fileFingerprint.size = parseInt(sizeMatch[1]);
-                if (mtimeMatch) fileFingerprint.mtime = parseInt(mtimeMatch[1]);
+                if (sizeMatch) fileFingerprint.size = parseInt(sizeMatch[1], 10);
+                if (mtimeMatch) fileFingerprint.mtime = parseInt(mtimeMatch[1], 10);
             }
 
             // 去重：同一个 URL 只检测一次
@@ -3452,8 +5217,8 @@ class LocalBrowsePlugin extends Plugin {
             if (fs && fs.existsSync && fs.existsSync(localPath)) {
                 valid++;
             } else {
-                // 提取文件名
-                var fileName = localPath.split('\\').pop().split('/').pop();
+                // 提取文件名（去掉 ? 后面的 URL 参数，如 ?t=0:05）
+                var fileName = localPath.split('\\').pop().split('/').pop().split('?')[0];
                 broken.push({
                     oldUrl: fullUrl,
                     localPath: localPath,
@@ -3471,7 +5236,15 @@ class LocalBrowsePlugin extends Plugin {
      * file:/// URL 转本地路径
      */
     fileUrlToLocalPath(url) {
-        var decoded = decodeURIComponent(url);
+        // 先去掉 URL fragment（#size=xxx&mtime=xxx），避免误判文件不存在
+        var urlWithoutFragment = url.split('#')[0];
+        var decoded;
+        try {
+            decoded = decodeURIComponent(urlWithoutFragment);
+        } catch (e) {
+            // 非法编码序列，使用原始字符串
+            decoded = urlWithoutFragment;
+        }
         // file:///D:/docs/file.pdf → D:\docs\file.pdf
         var local = decoded.replace(/^file:\/\/\//, '').replace(/\//g, '\\');
         return local;
@@ -3520,7 +5293,7 @@ class LocalBrowsePlugin extends Plugin {
                 '<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">' +
                     '<span style="font-size:14px">📄</span>' +
                     '<span style="font-weight:bold;font-size:13px;word-break:break-all">' + that.escapeHtml(item.fileName) + '</span>' +
-                    '<span class="cd-relink-status" data-index="' + i + '" style="margin-left:auto;font-size:11px;color:var(--b3-theme-secondary,#999);white-space:nowrap">❌ 失效</span>' +
+                    '<span class="cd-relink-status" data-index="' + i + '" style="margin-left:auto;font-size:11px;color:var(--b3-theme-secondary,#999);white-space:nowrap">🔗 失效</span>' +
                 '</div>' +
                 '<div style="font-size:11px;color:var(--b3-theme-secondary,#999);word-break:break-all;margin-bottom:6px;padding-left:20px">旧路径：' + that.escapeHtml(item.localPath) + '</div>' +
                 '<div class="cd-relink-candidate-area" data-index="' + i + '" style="padding-left:20px;font-size:11px;color:var(--b3-theme-secondary,#999);max-width:480px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>' +
@@ -3528,11 +5301,11 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         var contentHtml = '<div style="padding:16px;min-width:420px;max-width:560px;max-height:80vh;display:flex;flex-direction:column">' +
-            '<div style="font-weight:bold;font-size:14px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--b3-border,#eee)">🔗 修复失效链接</div>' +
+            '<div style="font-weight:bold;font-size:14px;margin-bottom:8px;padding-bottom:8px;border-bottom:1px solid var(--b3-border,#eee)">🔧 修复失效链接</div>' +
             '<div style="font-size:12px;color:var(--b3-theme-secondary,#999);margin-bottom:10px">找到 <b style="color:var(--b3-theme-error,#e74c3c)">' + brokenLinks.length + '</b> 个失效链接（共 ' + total + ' 个本地链接，<b style="color:var(--b3-theme-success,#52c41a)">' + valid + '</b> 个有效）</div>' +
             '<div class="cd-relink-list" style="flex:1;overflow-y:auto;min-height:0">' + listHtml +             '</div>' +
             '<div style="margin-top:12px;display:flex;justify-content:flex-end;gap:8px">' +
-                '<span id="cd-relink-fixall" style="padding:5px 16px;font-size:12px;background:transparent;color:var(--b3-theme-secondary,#999);border-radius:4px;pointer-events:none;user-select:none">🔍 搜索中...</span>' +
+                '<span id="cd-relink-fixall" style="padding:5px 16px;font-size:12px;background:transparent;color:var(--b3-theme-secondary,#999);border-radius:4px;pointer-events:none;user-select:none"></span>' +
                 '<button id="cd-relink-close" style="padding:5px 16px;font-size:12px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer">关闭</button>' +
             '</div>' +
         '</div>';
@@ -3556,6 +5329,9 @@ class LocalBrowsePlugin extends Plugin {
             if (e.target === dialog) {
                 dialog._relinkAborted = true;
                 document.body.removeChild(dialog);
+                // 关闭对话框后刷新指示灯状态
+                that._lastCheckedDocId = '';
+                that._autoCheckLinks();
             }
         });
 
@@ -3565,6 +5341,9 @@ class LocalBrowsePlugin extends Plugin {
             closeBtn.addEventListener('click', function() {
                 dialog._relinkAborted = true;
                 if (dialog.parentNode) document.body.removeChild(dialog);
+                // 关闭对话框后刷新指示灯状态
+                that._lastCheckedDocId = '';
+                that._autoCheckLinks();
             });
         }
     }
@@ -3641,17 +5420,19 @@ class LocalBrowsePlugin extends Plugin {
                     }
                     candidateHtml += '</div>';
                     candidateHtml += '<button class="cd-relink-confirm-btn" data-index="' + i + '" style="margin-top:6px;padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>';
-                    candidateArea.innerHTML = candidateHtml;
-                    candidateArea._candidates = exactCandidates;
+                    if (candidateArea) {
+                        candidateArea.innerHTML = candidateHtml;
+                        candidateArea._candidates = exactCandidates;
+                    }
 
-                    var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                    var confirmBtn = candidateArea ? candidateArea.querySelector('.cd-relink-confirm-btn') : null;
                     if (confirmBtn) {
                         confirmBtn.addEventListener('click', async function() {
-                            var idx = parseInt(this.getAttribute('data-index'));
+                            var idx = parseInt(this.getAttribute('data-index'), 10);
                             var area = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
                             var selectedRadio = area.querySelector('input[type="radio"]:checked');
                             if (!selectedRadio) return;
-                            var candIdx = parseInt(selectedRadio.value);
+                            var candIdx = parseInt(selectedRadio.value, 10);
                             var chosen = area._candidates[candIdx];
                             await that.replaceLink(docId, brokenLinks[idx].oldUrl, chosen.fullPath, idx, context);
                         });
@@ -3661,11 +5442,11 @@ class LocalBrowsePlugin extends Plugin {
             } else {
                 // 未找到
                 if (statusEl) {
-                    statusEl.textContent = '❌ 失效';
+                    statusEl.textContent = '🔗 失效';
                     statusEl.style.color = 'var(--b3-theme-error,#e74c3c)';
                 }
                 if (candidateArea) {
-                    candidateArea.innerHTML = '<span style="color:var(--b3-theme-error,#e74c3c)">❌ 未找到同名文件</span>';
+                    candidateArea.innerHTML = '<span style="color:var(--b3-theme-error,#e74c3c)">🔗 未找到同名文件</span>';
                 }
                 failed++;
             }
@@ -3681,13 +5462,16 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
 
-        if (fixed > 0 && failed === 0) {
-            that.showToastMsg('🎉 全部 ' + fixed + ' 个失效链接已修复');
-        } else if (fixed > 0) {
-            that.showToastMsg('✅ 已修复 ' + fixed + ' 个，' + failed + ' 个需要手动处理');
-        } else {
-            that.showToastMsg('❌ 未找到可自动修复的链接');
+        // 修复完成后重扫链接状态
+        that._lastCheckedDocId = '';
+        that._autoCheckLinks();
+
+        if (failed > 0) {
+            that.showToastMsg('已修复 ' + fixed + ' 个，' + failed + ' 个需要手动处理');
+        } else if (fixed === 0) {
+            that.showToastMsg('未找到可自动修复的链接');
         }
+        // 全部修复成功时，无提示
     }
 
     /**
@@ -3708,17 +5492,23 @@ class LocalBrowsePlugin extends Plugin {
 
             searchBtn.disabled = true;
             searchBtn.textContent = '搜索中...';
-            candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 正在搜索...</span>';
+            if (candidateArea) {
+                candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 正在搜索...</span>';
+            }
 
             // 异步搜索
             that.searchFileByName(item.fileName, searchDir, {
                 maxDepth: 5, maxResults: 20,
                 onProgress: function(info) {
-                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 已扫 ' + info.dirsScanned + ' 目录，精确 ' + info.exactCount + ' 模糊 ' + info.fuzzyCount + '</span>';
+                    if (candidateArea) {
+                        candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 已扫 ' + info.dirsScanned + ' 目录，精确 ' + info.exactCount + ' 模糊 ' + info.fuzzyCount + '</span>';
+                    }
                 }
             }).then(function(candidates) {
                 if (candidates.length === 0) {
-                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">未找到同名或相似文件</span>';
+                    if (candidateArea) {
+                        candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">未找到同名或相似文件</span>';
+                    }
                     searchBtn.disabled = false;
                     searchBtn.textContent = '查找新位置';
                     return;
@@ -3751,14 +5541,15 @@ class LocalBrowsePlugin extends Plugin {
                     '<button class="cd-relink-confirm-btn" data-index="' + itemIndex + '" style="padding:3px 10px;font-size:11px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer">确认替换</button>' +
                     '<button class="cd-relink-cancel-btn" data-index="' + itemIndex + '" style="padding:3px 10px;font-size:11px;background:transparent;color:var(--b3-theme-on-background,#333);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer">取消</button>' +
                 '</div>';
-                candidateArea.innerHTML = candidateHtml;
-
-                // 存储候选数据
-                candidateArea._candidates = candidates;
+                if (candidateArea) {
+                    candidateArea.innerHTML = candidateHtml;
+                    // 存储候选数据
+                    candidateArea._candidates = candidates;
+                }
 
                 // 绑定 radio 点击高亮
-                var radios = candidateArea.querySelectorAll('input[type="radio"]');
-                var labels = candidateArea.querySelectorAll('label');
+                var radios = candidateArea ? candidateArea.querySelectorAll('input[type="radio"]') : [];
+                var labels = candidateArea ? candidateArea.querySelectorAll('label') : [];
                 for (var r = 0; r < radios.length; r++) {
                     (function(radio, label) {
                         radio.addEventListener('change', function() {
@@ -3771,22 +5562,24 @@ class LocalBrowsePlugin extends Plugin {
                 }
 
                 // 确认替换按钮
-                var confirmBtn = candidateArea.querySelector('.cd-relink-confirm-btn');
+                var confirmBtn = candidateArea ? candidateArea.querySelector('.cd-relink-confirm-btn') : null;
                 if (confirmBtn) {
                     confirmBtn.addEventListener('click', function() {
-                        var selectedRadio = candidateArea.querySelector('input[type="radio"]:checked');
+                        var selectedRadio = candidateArea ? candidateArea.querySelector('input[type="radio"]:checked') : null;
                         if (!selectedRadio) return;
-                        var candIdx = parseInt(selectedRadio.value);
-                        var chosen = candidateArea._candidates[candIdx];
-                        that.replaceLink(context.docId, item.oldUrl, chosen.fullPath, itemIndex, context);
+                        var candIdx = parseInt(selectedRadio.value, 10);
+                        var chosen = candidateArea ? candidateArea._candidates[candIdx] : null;
+                        if (chosen) {
+                            that.replaceLink(context.docId, item.oldUrl, chosen.fullPath, itemIndex, context);
+                        }
                     });
                 }
 
                 // 取消按钮
-                var cancelBtn = candidateArea.querySelector('.cd-relink-cancel-btn');
+                var cancelBtn = candidateArea ? candidateArea.querySelector('.cd-relink-cancel-btn') : null;
                 if (cancelBtn) {
                     cancelBtn.addEventListener('click', function() {
-                        candidateArea.innerHTML = '';
+                        if (candidateArea) candidateArea.innerHTML = '';
                         searchBtn.disabled = false;
                         searchBtn.textContent = '查找新位置';
                     });
@@ -3795,7 +5588,9 @@ class LocalBrowsePlugin extends Plugin {
                 searchBtn.disabled = false;
                 searchBtn.textContent = '重新查找';
             }).catch(function(e) {
-                candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">搜索出错：' + that.escapeHtml(e.message || String(e)) + '</span>';
+                if (candidateArea) {
+                    candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-error,#e74c3c)">搜索出错：' + that.escapeHtml(e.message || String(e)) + '</span>';
+                }
                 searchBtn.disabled = false;
                 searchBtn.textContent = '查找新位置';
             });
@@ -4403,6 +6198,7 @@ class LocalBrowsePlugin extends Plugin {
         var newUrlRaw = that.localPathToFileUrlRaw(newLocalPath);  // 不编码版本，用于 DOM 替换
         var newUrlWithTitle = newFingerprintTitle ? (newUrl + ' "' + newFingerprintTitle + '"') : newUrl;
         var newUrlRawWithTitle = newFingerprintTitle ? (newUrlRaw + ' "' + newFingerprintTitle + '"') : newUrlRaw;
+        var isSilent = context && context.silent;
 
         try {
 
@@ -4414,7 +6210,7 @@ class LocalBrowsePlugin extends Plugin {
             });
             var childData = await childResp.json();
             if (childData.code !== 0 || !childData.data) {
-                that.showToastMsg('获取子块失败');
+                if (!isSilent) that.showToastMsg('获取子块失败');
                 return;
             }
             var childBlocks = childData.data;
@@ -4468,7 +6264,7 @@ class LocalBrowsePlugin extends Plugin {
                 for (var i = 0; i < Math.min(childBlocks.length, 5); i++) {
                     var md = childBlocks[i].markdown || '';
                 }
-                that.showToastMsg('未找到包含该链接的块');
+                if (!isSilent) that.showToastMsg('未找到包含该链接的块');
                 return;
             }
 
@@ -4480,7 +6276,7 @@ class LocalBrowsePlugin extends Plugin {
             });
             var domData = await domResp.json();
             if (domData.code !== 0 || !domData.data || !domData.data.dom) {
-                that.showToastMsg('获取块 DOM 失败');
+                if (!isSilent) that.showToastMsg('获取块 DOM 失败');
                 return;
             }
             var blockDom = domData.data.dom;
@@ -4520,7 +6316,7 @@ class LocalBrowsePlugin extends Plugin {
                 var oldEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/'));
                 if (newDom.indexOf(oldEncoded) !== -1) {
                     var escapedEncoded = escapeRegex(oldEncoded);
-                    var regex3 = new RegExp(escapedEncoded + '(#[^"\\s<>]*)?', 'g');
+                    var regex3 = new RegExp(escapedEncoded + '(#[^"\\s<>]*)?');
                     newDom = newDom.replace(regex3, newUrl);
                     replaced = true;
                 }
@@ -4531,7 +6327,7 @@ class LocalBrowsePlugin extends Plugin {
                 if (newDom.indexOf(oldSpaceEncoded) !== -1) {
                     var newSpaceEncoded = newUrlRaw.replace(/ /g, '%20');
                     var escapedSpace = escapeRegex(oldSpaceEncoded);
-                    var regex4 = new RegExp(escapedSpace + '(#[^"\\s<>]*)?', 'g');
+                    var regex4 = new RegExp(escapedSpace + '(#[^"\\s<>]*)?');
                     newDom = newDom.replace(regex4, newSpaceEncoded);
                     replaced = true;
                 }
@@ -4545,19 +6341,19 @@ class LocalBrowsePlugin extends Plugin {
 
                 if (newDom.indexOf(oldPathPart) !== -1) {
                     var escapedPath = escapeRegex(oldPathPart);
-                    var regex5a = new RegExp(escapedPath + '(#[^"\\s<>]*)?', 'g');
+                    var regex5a = new RegExp(escapedPath + '(#[^"\\s<>]*)?');
                     newDom = newDom.replace(regex5a, newPathPartRaw);
                     replaced = true;
                 } else if (newDom.indexOf(oldPathEncoded) !== -1) {
                     var escapedPathEnc = escapeRegex(oldPathEncoded);
-                    var regex5b = new RegExp(escapedPathEnc + '(#[^"\\s<>]*)?', 'g');
+                    var regex5b = new RegExp(escapedPathEnc + '(#[^"\\s<>]*)?');
                     newDom = newDom.replace(regex5b, newPathPartEncoded);
                     replaced = true;
                 }
             }
 
             if (!replaced) {
-                that.showToastMsg('未找到需要替换的链接');
+                if (!isSilent) that.showToastMsg('未找到需要替换的链接');
                 return;
             }
 
@@ -4581,7 +6377,7 @@ class LocalBrowsePlugin extends Plugin {
             });
             var updateData = await updateResp.json();
             if (updateData.code !== 0) {
-                that.showToastMsg('替换链接失败：' + (updateData.msg || '未知错误'));
+                if (!isSilent) that.showToastMsg('替换链接失败：' + (updateData.msg || '未知错误'));
                 return;
             }
 
@@ -4599,11 +6395,15 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
 
-            that.showToastMsg('✅ 已修复：' + (context.brokenLinks[itemIndex] ? context.brokenLinks[itemIndex].fileName : ''));
+            if (!isSilent) {
+                // 链接修复成功，无提示（已在 UI 中显示状态）
+            }
 
         } catch (e) {
             console.error('[LocalBrowse] replaceLink error:', e);
-            that.showToastMsg('替换链接失败：' + (e.message || e));
+            if (!isSilent) {
+                that.showToastMsg('替换链接失败：' + (e.message || e));
+            }
         }
     }
 }
