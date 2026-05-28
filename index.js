@@ -29,7 +29,7 @@ try {
     os = require('os');
     // console.log("[LocalBrowse] Node.js modules loaded successfully");
 } catch (e) {
-    console.error("[LocalBrowse] Failed to load Node.js modules:", e);
+    console.error("[LocalBrowse] Failed to load Node.js modules:", e);  // 顶层，this 不可用
 }
 
 class LocalBrowsePlugin extends Plugin {
@@ -73,10 +73,74 @@ class LocalBrowsePlugin extends Plugin {
         this.platformIcon = this.platform === 'darwin' ? '🍎' : (this.platform === 'linux' ? '🐧' : '🪟');
         this.platformName = this.platform === 'darwin' ? 'macOS' : (this.platform === 'linux' ? 'Linux' : 'Windows');
         this._sep = (path && path.sep) || (this.isWindows ? '\\' : '/');  // 跨平台路径分隔符
+        this.debug = localStorage.getItem('cd_debug') === 'true';  // 调试日志开关，默认关闭
+    }
+
+    /**
+     * 调试日志：仅在 debug 开关开启时输出
+     * 用法：this._log('消息') 或 this._log('消息', 附加数据)
+     */
+    _log(msg, data) {
+        if (!this.debug) return;
+        if (data !== undefined) {
+            console.log('[LocalBrowse] ' + msg, data);
+        } else {
+            console.log('[LocalBrowse] ' + msg);
+        }
+    }
+
+    /**
+     * 错误日志：始终输出（错误信息不应被静默）
+     */
+    _error(msg, data) {
+        if (data !== undefined) {
+            console.error('[LocalBrowse] ' + msg, data);
+        } else {
+            console.error('[LocalBrowse] ' + msg);
+        }
+    }
+
+    /**
+     * macOS APFS firmlink 路径规范化
+     * /System/Volumes/Data/Users/... → /Users/...
+     * 这两个路径指向同一个文件，统一为短路径形式
+     */
+    _normalizeMacPath(p) {
+        if (!p || typeof p !== 'string') return p;
+        // /System/Volumes/Data/ 前缀替换为 /
+        if (p.indexOf('/System/Volumes/Data/') === 0) {
+            return p.substring('/System/Volumes/Data'.length);
+        }
+        return p;
+    }
+
+    /**
+     * 搜索结果去重：macOS firmlink 导致同一文件出现两个路径
+     * 规范化后去重，保留规范化后路径较短的那个（即 /Users/... 而非 /System/Volumes/Data/Users/...）
+     */
+    _dedupCandidates(candidates) {
+        if (!candidates || candidates.length <= 1) return candidates;
+        var seen = {};
+        var deduped = [];
+        for (var i = 0; i < candidates.length; i++) {
+            var c = candidates[i];
+            var norm = this._normalizeMacPath(c.fullPath);
+            if (seen[norm]) {
+                this._log('_dedupCandidates - removing firmlink duplicate:', c.fullPath, '→ same as', seen[norm]);
+                continue;
+            }
+            seen[norm] = c.fullPath;
+            // 如果路径是 firmlink 长路径，替换为规范化短路径
+            if (c.fullPath !== norm) {
+                c.fullPath = norm;
+            }
+            deduped.push(c);
+        }
+        return deduped;
     }
 
     onload() {
-        console.log("[LocalBrowse] onload");
+        this._log("onload");
         this.registerIcons();
         this.loadFavorites();
         this.loadSortSettings();
@@ -113,7 +177,7 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     onunload() {
-        console.log("[LocalBrowse] onunload");
+        this._log("onunload");
         // 清理右键菜单残留的 document 级监听器
         this.hideContextMenu();
         // 清理滚动监听器
@@ -216,7 +280,7 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     uninstall() {
-        console.log("[LocalBrowse] uninstall");
+        this._log("uninstall");
         this.removeData('favorites');
         this.removeData('sortSettings');
         this.removeData('driveSettings');
@@ -230,7 +294,7 @@ class LocalBrowsePlugin extends Plugin {
         try {
             this.addIcons(svg);
         } catch (e) {
-            console.error("[LocalBrowse] addIcons failed:", e);
+            this._error("addIcons failed:", e);
         }
     }
 
@@ -265,7 +329,7 @@ class LocalBrowsePlugin extends Plugin {
                     that.renderFileTree();
                 },
                 destroy: function() {
-                    console.log('[LocalBrowse] Dock destroyed');
+                    that._log('Dock destroyed');
                     // Dock 销毁时清理资源，防止长时间闲置后重建时的冲突
                     that.hideContextMenu();
                     if (that._boundIconScroll) {
@@ -307,9 +371,9 @@ class LocalBrowsePlugin extends Plugin {
                     that.hideImagePreview();
                 }
             });
-            console.log("[LocalBrowse] Dock registered");
+            this._log("Dock registered");
         } catch (e) {
-            console.error("[LocalBrowse] addDock failed:", e);
+            this._error("addDock failed:", e);
         }
     }
 
@@ -359,7 +423,7 @@ class LocalBrowsePlugin extends Plugin {
             '</div>' +
             '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px">' +
                 '<span id="cd-stats-text">📊 加载中...</span>' +
-                '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
+                '<span id="cd-platform-badge" title="' + this.platformName + '" style="font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
             '</div>' +
             '<div id="cd-context-menu" style="display:none;position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);min-width:160px;padding:4px 0;font-size:13px;user-select:none">' +
             '</div>' +
@@ -514,7 +578,7 @@ class LocalBrowsePlugin extends Plugin {
         if (relinkBtn) {
             relinkBtn.addEventListener('click', function() {
                 that.relinkBrokenLinks().catch(function(e) {
-                    console.error('[LocalBrowse] relink error:', e);
+                    that._error('relink error:', e);
                     that.showToastMsg('修复链接出错：' + (e.message || e));
                 });
             });
@@ -710,7 +774,7 @@ class LocalBrowsePlugin extends Plugin {
         // 初始加载：优先跨端同步文件夹根目录（需验证存在），其次上次保存的路径，否则加载当前盘符根目录
         var initSyncRoot = this._getMySyncRoot();
         var initPath;
-        console.log('[LocalBrowse] renderFileTree: _getMySyncRoot()=' + initSyncRoot + ', currentPath=' + this.currentPath + ', syncRootsLoaded=' + this._syncRootsLoaded);
+        that._log('renderFileTree: _getMySyncRoot()=' + initSyncRoot + ', currentPath=' + this.currentPath + ', syncRootsLoaded=' + this._syncRootsLoaded);
         if (initSyncRoot && (this.isWindows ? /^[A-Za-z]:/.test(initSyncRoot) : initSyncRoot.charAt(0) === '/')) {
             // 同步文件夹路径格式正确，进一步验证是否实际存在
             if (fs && fs.existsSync && fs.existsSync(initSyncRoot)) {
@@ -721,7 +785,7 @@ class LocalBrowsePlugin extends Plugin {
         } else {
             initPath = this.currentPath || this.getRootPath();
         }
-        console.log('[LocalBrowse] renderFileTree: initPath=' + initPath);
+        that._log('renderFileTree: initPath=' + initPath);
         this.loadDirectory(initPath);
 
         // 渲染收藏夹（DOM 已就绪）
@@ -738,7 +802,7 @@ class LocalBrowsePlugin extends Plugin {
         // 递增加载版本号，旧回调检测到版本过时则丢弃结果（防止异步竞态覆盖）
         this._loadSeq++;
         var myLoadSeq = this._loadSeq;
-        console.log('[LocalBrowse] loadDirectory: path=' + dirPath + ', _loadSeq=' + myLoadSeq);
+        that._log('loadDirectory: path=' + dirPath + ', _loadSeq=' + myLoadSeq);
 
         // 取消正在进行的深度搜索（如果有）
         if (this._deepSearchAbort) {
@@ -910,7 +974,7 @@ class LocalBrowsePlugin extends Plugin {
             fs.readdir(normalizedPath, { withFileTypes: true }, function(err, entries) {
                 // 版本号已变（用户已导航到其他目录），丢弃本次过时结果
                 if (myLoadSeq !== that._loadSeq) {
-                    console.log('[LocalBrowse] loadDirectoryWithNode: stale callback discarded, mySeq=' + myLoadSeq + ', current=' + that._loadSeq);
+                    that._log('loadDirectoryWithNode: stale callback discarded, mySeq=' + myLoadSeq + ', current=' + that._loadSeq);
                     return;
                 }
 
@@ -982,7 +1046,7 @@ class LocalBrowsePlugin extends Plugin {
                 });
             });
         } catch (e) {
-            console.error('[LocalBrowse] loadDirectoryWithNode error:', e);
+            that._error('loadDirectoryWithNode error:', e);
             this.loadDirectoryWithAPI(dirPath, fileListEl);
         }
     }
@@ -1016,7 +1080,7 @@ class LocalBrowsePlugin extends Plugin {
                 that.showError('API 无法访问外部驱动器: ' + (data.msg || '未知错误'));
             }
         }).catch(function(e) {
-            console.error('[LocalBrowse] API error:', e);
+            that._error('API error:', e);
             that.showError('网络错误: ' + e.message);
         });
     }
@@ -1028,13 +1092,13 @@ class LocalBrowsePlugin extends Plugin {
         var isRootDir = /^[A-Za-z]:\\?$/.test(dirPath) || dirPath === '/' || dirPath === '';
         if (err.code === 'ENOENT' || err.code === 'EPERM' || err.code === 'EACCES') {
             if (isRootDir) {
-                console.error('[LocalBrowse] fs.readdir error:', err);
+                that._error('fs.readdir error:', err);
                 this.showError('无法访问 ' + dirPath + '，请确认挂载盘已启动且驱动器已挂载');
             } else {
                 this.renderFiles([], normalizedPath);
             }
         } else {
-            console.error('[LocalBrowse] fs.readdir error:', err);
+            that._error('fs.readdir error:', err);
             // 尝试降级到 API
             this.loadDirectoryWithAPI(dirPath, fileListEl);
         }
@@ -1089,7 +1153,7 @@ class LocalBrowsePlugin extends Plugin {
             that.renderFiles(files, normalizedPath);
         }).catch(function(e) {
             if (myLoadSeq !== that._loadSeq) return;  // 版本过时，不渲染错误
-            console.error('[LocalBrowse] _buildFileEntries error:', e);
+            that._error('_buildFileEntries error:', e);
             that.showError('读取目录失败: ' + (e.message || e));
         });
     }
@@ -1611,6 +1675,9 @@ class LocalBrowsePlugin extends Plugin {
                         var entry = entries[i];
                         if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') continue;
 
+                        // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
+                        if (entry.name === 'Data' && normalizedPath === '/System/Volumes/') continue;
+
                         var fullPath = normalizedPath + entry.name;
 
                         // 多关键词匹配
@@ -1681,7 +1748,7 @@ class LocalBrowsePlugin extends Plugin {
             searchRecursive(dirPath, 0);
             await allDonePromise;
         } catch (e) {
-            console.error('[LocalBrowse] deepSearch error:', e);
+            that._error('deepSearch error:', e);
         }
 
         // 清理 abort 标记
@@ -2891,7 +2958,7 @@ class LocalBrowsePlugin extends Plugin {
             var writeStream = fs.createWriteStream(destPath);
 
             readStream.on('error', function(err) {
-                console.error('[LocalBrowse] read stream error:', err);
+                that._error('read stream error:', err);
                 that.showToastMsg('❌ 复制失败: ' + err.message);
             });
 
@@ -2902,13 +2969,13 @@ class LocalBrowsePlugin extends Plugin {
             });
 
             writeStream.on('error', function(err) {
-                console.error('[LocalBrowse] write stream error:', err);
+                that._error('write stream error:', err);
                 that.showToastMsg('❌ 复制失败: ' + err.message);
             });
 
             readStream.pipe(writeStream);
         } catch (e) {
-            console.error('[LocalBrowse] fallback copy failed:', e);
+            that._error('fallback copy failed:', e);
             that.showToastMsg('❌ 复制失败: ' + e.message);
         }
     }
@@ -3006,7 +3073,7 @@ class LocalBrowsePlugin extends Plugin {
 
                 return true;
             } catch (e) {
-                console.error('[LocalBrowse] insert error:', e);
+                that._error('insert error:', e);
                 return false;
             }
         }
@@ -3152,7 +3219,7 @@ class LocalBrowsePlugin extends Plugin {
             // 刷新当前目录
             that.loadDirectory(that.currentPath);
         } catch(e) {
-            console.error('[LocalBrowse] moveFile error:', e);
+            that._error('moveFile error:', e);
             that.showToastMsg('移动失败：' + (e.message || '未知错误'));
         }
     }
@@ -3250,7 +3317,7 @@ class LocalBrowsePlugin extends Plugin {
             // 刷新当前目录
             that.loadDirectory(that.currentPath);
         } catch(e) {
-            console.error('[LocalBrowse] pasteFile error:', e);
+            that._error('pasteFile error:', e);
             that.showToastMsg('移动失败：' + (e.message || '未知错误'));
         }
     }
@@ -4108,13 +4175,13 @@ class LocalBrowsePlugin extends Plugin {
             var data = { sortBy: this.sortBy, sortOrder: this.sortOrder };
             if (typeof this.saveData === 'function') {
                 this.saveData('sortSettings', data).catch(function(e) {
-                    console.error('[LocalBrowse] save sort settings failed:', e);
+                    that._error('save sort settings failed:', e);
                 });
             } else {
                 localStorage.setItem('cd_sort_settings', JSON.stringify(data));
             }
         } catch (e) {
-            console.error('[LocalBrowse] save sort settings error:', e);
+            that._error('save sort settings error:', e);
         }
     }
 
@@ -4185,13 +4252,13 @@ class LocalBrowsePlugin extends Plugin {
             var data = { driveLetter: this.driveLetter };
             if (typeof this.saveData === 'function') {
                 this.saveData('driveSettings', data).catch(function(e) {
-                    console.error('[LocalBrowse] save drive settings failed:', e);
+                    that._error('save drive settings failed:', e);
                 });
             } else {
                 localStorage.setItem('cd_drive_settings', JSON.stringify(data));
             }
         } catch (e) {
-            console.error('[LocalBrowse] save drive settings error:', e);
+            that._error('save drive settings error:', e);
         }
     }
 
@@ -4246,7 +4313,7 @@ class LocalBrowsePlugin extends Plugin {
                                     that.currentPath = loadedPath;
                                     that._syncDriveLetterFromPath(loadedPath);
                                 } else {
-                                    console.log('[LocalBrowse] 路径在当前设备不存在，忽略:', loadedPath);
+                                    that._log('路径在当前设备不存在，忽略:', loadedPath);
                                     // 清除当前设备的无效路径记录
                                     var _deviceId = that._getDeviceId();
                                     var _platformPaths = data[that.platform];
@@ -4256,7 +4323,7 @@ class LocalBrowsePlugin extends Plugin {
                                     }
                                 }
                             } else {
-                                console.log('[LocalBrowse] 忽略跨平台路径:', loadedPath);
+                                that._log('忽略跨平台路径:', loadedPath);
                             }
                         }
                     }
@@ -4306,7 +4373,7 @@ class LocalBrowsePlugin extends Plugin {
                     if (!data[that.platform]) data[that.platform] = {};
                     data[that.platform][that._getDeviceId()] = that.currentPath;
                     that.saveData('pathSettings', data).catch(function(e) {
-                        console.error('[LocalBrowse] save path settings failed:', e);
+                        that._error('save path settings failed:', e);
                     });
                 }).catch(function() {
                     // 读取失败时，用仅含当前设备的数据写入
@@ -4314,7 +4381,7 @@ class LocalBrowsePlugin extends Plugin {
                     data[that.platform] = {};
                     data[that.platform][that._getDeviceId()] = that.currentPath;
                     that.saveData('pathSettings', data).catch(function(e) {
-                        console.error('[LocalBrowse] save path settings failed:', e);
+                        that._error('save path settings failed:', e);
                     });
                 });
             } else {
@@ -4323,7 +4390,7 @@ class LocalBrowsePlugin extends Plugin {
                 localStorage.setItem('cd_path_settings', JSON.stringify(data));
             }
         } catch (e) {
-            console.error('[LocalBrowse] save path settings error:', e);
+            that._error('save path settings error:', e);
         }
     }
 
@@ -4356,7 +4423,7 @@ class LocalBrowsePlugin extends Plugin {
                 localStorage.removeItem('cd_path_map');
             }
         } catch (e) {
-            console.error('[LocalBrowse] save path map error:', e);
+            that._error('save path map error:', e);
         }
     }
 
@@ -4382,7 +4449,7 @@ class LocalBrowsePlugin extends Plugin {
                 var osName = (sys.OS || sys.os || sys.platform || sys.Platform || '');
                 if (osName) {
                     osName = String(osName).toLowerCase();
-                    console.log('[LocalBrowse] _detectPlatform OS field:', osName);
+                    that._log('_detectPlatform OS field:', osName);
                     if (osName === 'windows') return 'win32';
                     if (osName === 'darwin') return 'darwin';
                     if (osName === 'linux') return 'linux';
@@ -4390,7 +4457,7 @@ class LocalBrowsePlugin extends Plugin {
                 // 2b. 从 Container 字段推断
                 var container = (sys.Container || sys.container || '');
                 if (container) {
-                    console.log('[LocalBrowse] _detectPlatform Container:', container);
+                    that._log('_detectPlatform Container:', container);
                     if (container === 'docker' || container === 'android' || container === 'harmony') {
                         return 'linux';
                     }
@@ -4399,20 +4466,20 @@ class LocalBrowsePlugin extends Plugin {
                 // 2c. 从 DataDir 路径格式推断
                 var dataDir = (sys.DataDir || sys.dataDir || '');
                 if (dataDir) {
-                    console.log('[LocalBrowse] _detectPlatform DataDir:', dataDir);
+                    that._log('_detectPlatform DataDir:', dataDir);
                     if (/^[A-Za-z]:/.test(dataDir)) return 'win32';
                     if (dataDir.indexOf('/home/') === 0 || dataDir.indexOf('/mnt/') === 0 || dataDir.indexOf('/media/') === 0) return 'linux';
                     if (dataDir.indexOf('/Users/') === 0 || dataDir.indexOf('/Volumes/') === 0) return 'darwin';
                     if (dataDir.charAt(0) === '/') return 'linux'; // Unix 类兜底
                 }
             } else {
-                console.log('[LocalBrowse] _detectPlatform: window.siyuan.config.system not available');
+                that._log('_detectPlatform: window.siyuan.config.system not available');
             }
         } catch (e) {
-            console.log('[LocalBrowse] _detectPlatform error:', e);
+            that._log('_detectPlatform error:', e);
         }
         // 3. 兜底默认
-        console.log('[LocalBrowse] _detectPlatform fallback to win32');
+        that._log('_detectPlatform fallback to win32');
         return 'win32';
     }
 
@@ -4427,7 +4494,7 @@ class LocalBrowsePlugin extends Plugin {
 
         var detected = this._detectPlatform();
         if (detected !== this.platform) {
-            console.log('[LocalBrowse] platform corrected in renderFileTree:', this.platform, '→', detected);
+            that._log('platform corrected in renderFileTree:', this.platform, '→', detected);
             this.platform = detected;
             this.isWindows = (this.platform === 'win32');
             this.platformIcon = this.platform === 'darwin' ? '🍎' : (this.platform === 'linux' ? '🐧' : '🪟');
@@ -4454,7 +4521,7 @@ class LocalBrowsePlugin extends Plugin {
                     if (sys) {
                         this._deviceId = sys.Name || sys.name || sys.ID || sys.id || sys.deviceId || '';
                         if (this._deviceId) {
-                            console.log('[LocalBrowse] _getDeviceId from config:', this._deviceId);
+                            that._log('_getDeviceId from config:', this._deviceId);
                         }
                     }
                 } catch (e) {}
@@ -4462,7 +4529,7 @@ class LocalBrowsePlugin extends Plugin {
             // 3. 兜底
             if (!this._deviceId) {
                 this._deviceId = 'unknown';
-                console.log('[LocalBrowse] _getDeviceId fallback to unknown');
+                that._log('_getDeviceId fallback to unknown');
             }
         }
         return this._deviceId;
@@ -4765,7 +4832,7 @@ class LocalBrowsePlugin extends Plugin {
                     try { pathExists = fs.existsSync(normalizedCandidate); } catch(e) {}
                 }
                 if (pathExists) {
-                    console.log('[LocalBrowse] _getMySyncRoot: deviceId mismatch detected, migrating from "' + keys[0] + '" to "' + deviceId + '"');
+                    that._log('_getMySyncRoot: deviceId mismatch detected, migrating from "' + keys[0] + '" to "' + deviceId + '"');
                     platformRoots[deviceId] = normalizedCandidate;
                     delete platformRoots[keys[0]];
                     this.saveSyncRoots();
@@ -4920,7 +4987,7 @@ class LocalBrowsePlugin extends Plugin {
                         try { oldPathExists = fs.existsSync(oldVal); } catch(e) {}
                     }
                     if (oldPathExists) {
-                        console.log('[LocalBrowse] _migrateSyncRoots: migrating deviceId "' + oldKey + '" → "' + deviceId + '" for platform ' + this.platform);
+                        that._log('_migrateSyncRoots: migrating deviceId "' + oldKey + '" → "' + deviceId + '" for platform ' + this.platform);
                         currentRoots[deviceId] = oldVal;
                         delete currentRoots[oldKey];
                         migrated = true;
@@ -4942,7 +5009,7 @@ class LocalBrowsePlugin extends Plugin {
         try {
             if (typeof this.loadData === 'function') {
                 this.loadData('syncRoots').then(function(data) {
-                    console.log('[LocalBrowse] loadSyncRoots completed: data=' + JSON.stringify(data) + ', dockPanel=' + !!that.dockPanel + ', currentPath=' + that.currentPath);
+                    that._log('loadSyncRoots completed: data=' + JSON.stringify(data) + ', dockPanel=' + !!that.dockPanel + ', currentPath=' + that.currentPath);
                     if (data && typeof data === 'object') {
                         that.syncRoots = data;
                         that._migrateSyncRoots();  // 旧格式迁移为新格式（多设备）
@@ -4955,7 +5022,7 @@ class LocalBrowsePlugin extends Plugin {
                     that._navigateToSyncRootOnLoad();
                 }).catch(function(err) {
                     // 忽略加载失败，使用默认值
-                    console.log('[LocalBrowse] loadSyncRoots failed:', err);
+                    that._log('loadSyncRoots failed:', err);
                     that._syncRootsLoaded = true;
                 });
             } else {
@@ -4988,35 +5055,35 @@ class LocalBrowsePlugin extends Plugin {
      */
     _navigateToSyncRootOnLoad() {
         var syncRoot = this._getMySyncRoot();
-        console.log('[LocalBrowse] _navigateToSyncRootOnLoad: syncRoot=' + syncRoot + ', currentPath=' + this.currentPath + ', dockPanel=' + !!this.dockPanel + ', _loadSeq=' + this._loadSeq);
+        that._log('_navigateToSyncRootOnLoad: syncRoot=' + syncRoot + ', currentPath=' + this.currentPath + ', dockPanel=' + !!this.dockPanel + ', _loadSeq=' + this._loadSeq);
         if (!syncRoot) return;
         // 校验路径是否适合当前平台
         if (this.isWindows) {
             if (!/^[A-Za-z]:/.test(syncRoot)) {
-                console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - platform mismatch');
+                that._log('_navigateToSyncRootOnLoad: skip - platform mismatch');
                 return;
             }
         } else {
             if (syncRoot.charAt(0) !== '/') {
-                console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - platform mismatch');
+                that._log('_navigateToSyncRootOnLoad: skip - platform mismatch');
                 return;
             }
         }
         // 校验路径在当前设备上实际存在
         if (fs && fs.existsSync && !fs.existsSync(syncRoot)) {
-            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - path not exists');
+            that._log('_navigateToSyncRootOnLoad: skip - path not exists');
             return;
         }
         // Dock 面板已就绪时，导航到同步文件夹根目录
         // 即使 this.currentPath 已等于 syncRoot（loadPathSettings 异步设置），
         // 也要调用 loadDirectory，因为显示内容可能仍是 C:\ 的加载结果
         if (this.dockPanel && this.dockPanel.element) {
-            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: navigating to ' + syncRoot);
+            that._log('_navigateToSyncRootOnLoad: navigating to ' + syncRoot);
             this.currentPath = syncRoot;
             this._syncDriveLetterFromPath(syncRoot);
             this.loadDirectory(syncRoot);
         } else {
-            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - dockPanel not ready');
+            that._log('_navigateToSyncRootOnLoad: skip - dockPanel not ready');
         }
     }
 
@@ -5037,11 +5104,11 @@ class LocalBrowsePlugin extends Plugin {
             if (typeof this.saveData === 'function') {
                 if (Object.keys(this.syncRoots).length > 0) {
                     this.saveData('syncRoots', this.syncRoots).catch(function(e) {
-                        console.error('[LocalBrowse] save sync roots failed:', e);
+                        that._error('save sync roots failed:', e);
                     });
                 } else {
                     this.saveData('syncRoots', {}).catch(function(e) {
-                        console.error('[LocalBrowse] save sync roots failed:', e);
+                        that._error('save sync roots failed:', e);
                     });
                 }
             } else {
@@ -5052,7 +5119,7 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
         } catch (e) {
-            console.error('[LocalBrowse] save sync roots error:', e);
+            that._error('save sync roots error:', e);
         }
     }
 
@@ -5182,11 +5249,11 @@ class LocalBrowsePlugin extends Plugin {
                     (startPath ? ("$dlg.SelectedPath = '" + startPath.replace(/'/g, "''") + "'\r\n") : '') +
                     "if ($dlg.ShowDialog() -eq 'OK') { Write-Output $dlg.SelectedPath }\r\n";
                 fs.writeFileSync(tmpFile, '\ufeff' + psScript, 'utf8');
-                console.log('[LocalBrowse] browse ps1:', tmpFile);
+                that._log('browse ps1:', tmpFile);
                 child.exec('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"', { encoding: 'utf8', timeout: 60000 }, function(err, stdout, stderr) {
-                    console.log('[LocalBrowse] browse result err:', err ? err.message : null, 'stdout:', stdout ? stdout.trim() : null);
+                    that._log('browse result err:', err ? err.message : null, 'stdout:', stdout ? stdout.trim() : null);
                     if (err) {
-                        console.error('[LocalBrowse] ps1 err:', err.message);
+                        that._error('ps1 err:', err.message);
                         // PowerShell 失败，回退到内置目录选择器
                         that.pickDirectory(startPath, done);
                     } else {
@@ -5206,7 +5273,7 @@ class LocalBrowsePlugin extends Plugin {
                 // Linux: zenity
                 child.exec('zenity --file-selection --directory --title="Select sync folder"', { encoding: 'utf8', timeout: 60000 }, function(err, stdout) {
                     if (err) {
-                        console.error('[LocalBrowse] zenity error:', err.message);
+                        that._error('zenity error:', err.message);
                         that.pickDirectory(startPath, done);
                         return;
                     }
@@ -5220,7 +5287,7 @@ class LocalBrowsePlugin extends Plugin {
                 return;
             }
         } catch (e) {
-            console.error('[LocalBrowse] browse folder error:', e);
+            that._error('browse folder error:', e);
         }
         // 最终回退：内置目录选择器
         that.pickDirectory(startPath, done);
@@ -5340,7 +5407,7 @@ class LocalBrowsePlugin extends Plugin {
         if (!localPath || !this.syncRoots) return null;
         var myRoot = this._getMySyncRoot();
         if (!myRoot) {
-            console.log('[LocalBrowse] _crossSyncRepair: myRoot is empty! platform=' + this.platform + ', deviceId=' + this._getDeviceId() + ', syncRoots=' + JSON.stringify(this.syncRoots));
+            that._log('_crossSyncRepair: myRoot is empty! platform=' + this.platform + ', deviceId=' + this._getDeviceId() + ', syncRoots=' + JSON.stringify(this.syncRoots));
             return null;
         }
 
@@ -5376,7 +5443,7 @@ class LocalBrowsePlugin extends Plugin {
                 };
             }
         }
-        console.log('[LocalBrowse] _crossSyncRepair: no matching otherRoot found for localPath=' + localPath + ', otherRoots=' + JSON.stringify(otherRoots.map(function(r) { return r.path; })));
+        that._log('_crossSyncRepair: no matching otherRoot found for localPath=' + localPath + ', otherRoots=' + JSON.stringify(otherRoots.map(function(r) { return r.path; })));
         return null;
     }
 
@@ -5482,13 +5549,13 @@ class LocalBrowsePlugin extends Plugin {
             var data = { currentView: this.currentView };
             if (typeof this.saveData === 'function') {
                 this.saveData('viewSettings', data).catch(function(e) {
-                    console.error('[LocalBrowse] save view settings failed:', e);
+                    that._error('save view settings failed:', e);
                 });
             } else {
                 localStorage.setItem('cd_view_settings', JSON.stringify(data));
             }
         } catch (e) {
-            console.error('[LocalBrowse] save view settings error:', e);
+            that._error('save view settings error:', e);
         }
     }
 
@@ -5556,7 +5623,7 @@ class LocalBrowsePlugin extends Plugin {
                     fullData[that.platform] = that.favorites;
                     return that.saveData('favorites', fullData);
                 }).catch(function(e) {
-                    console.error('[LocalBrowse] save favorites failed:', e);
+                    that._error('save favorites failed:', e);
                 });
             } else {
                 var saved = localStorage.getItem('cd_favorites');
@@ -5573,7 +5640,7 @@ class LocalBrowsePlugin extends Plugin {
                 localStorage.setItem('cd_favorites', JSON.stringify(fullData));
             }
         } catch (e) {
-            console.error('[LocalBrowse] save favorites error:', e);
+            that._error('save favorites error:', e);
         }
         this.renderFavorites();
     }
@@ -6322,7 +6389,7 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         if (docId === that._lastCheckedDocId && that._linkStatus !== 'none' && that._linkStatus !== 'checking') return;
-        console.log('[LocalBrowse] autoCheckLinks - checking doc:', docId);
+        that._log('autoCheckLinks - checking doc:', docId);
         // 切换文档时重置跨端修复循环计数器
         if (docId !== that._lastCheckedDocId && that._crossSyncFixCount) {
             delete that._crossSyncFixCount[that._lastCheckedDocId];
@@ -6334,7 +6401,7 @@ class LocalBrowsePlugin extends Plugin {
 
         try {
             var result = await that.scanBrokenLinks(docId);
-            console.log('[LocalBrowse] autoCheckLinks - scan result:', result ? (result.total + ' total, ' + (result.broken ? result.broken.length : 0) + ' broken') : 'null');
+            that._log('autoCheckLinks - scan result:', result ? (result.total + ' total, ' + (result.broken ? result.broken.length : 0) + ' broken') : 'null');
             if (!result || result.total === 0) {
                 // 没有本地链接时显示白灯
                 that._updateLinkIndicator('none');
@@ -6352,15 +6419,15 @@ class LocalBrowsePlugin extends Plugin {
                             var csf0Item = result.crossSyncFixed[csf0];
                             try {
                                 await that.replaceLink(docId, csf0Item.oldUrl, csf0Item.newPath, csf0, { silent: true });
-                                console.log('[LocalBrowse] autoCheckLinks - cross-sync fixed:', csf0Item.oldUrl, '→', csf0Item.newPath);
+                                that._log('autoCheckLinks - cross-sync fixed:', csf0Item.oldUrl, '→', csf0Item.newPath);
                             } catch(e) {
-                                console.error('[LocalBrowse] autoCheckLinks - cross-sync fix failed:', csf0Item.oldUrl, e);
+                                that._error('autoCheckLinks - cross-sync fix failed:', csf0Item.oldUrl, e);
                             }
                         }
                         // 跨端修复可能改变了文档内容，重置检查状态
                         that._lastCheckedDocId = '';
                     } else {
-                        console.log('[LocalBrowse] autoCheckLinks - cross-sync fix loop detected for doc', docId, '(count=' + that._crossSyncFixCount[docId] + '), skipping re-check');
+                        that._log('autoCheckLinks - cross-sync fix loop detected for doc', docId, '(count=' + that._crossSyncFixCount[docId] + '), skipping re-check');
                     }
                 }
                 // 显示绿灯
@@ -6387,19 +6454,19 @@ class LocalBrowsePlugin extends Plugin {
                         try {
                             await that.replaceLink(docId, csfItem.oldUrl, csfItem.newPath, csf, { silent: true });
                             autoFixed++;
-                            console.log('[LocalBrowse] autoCheckLinks - cross-sync fixed:', csfItem.oldUrl, '→', csfItem.newPath);
+                            that._log('autoCheckLinks - cross-sync fixed:', csfItem.oldUrl, '→', csfItem.newPath);
                         } catch(e) {
-                            console.error('[LocalBrowse] autoCheckLinks - cross-sync fix failed:', csfItem.oldUrl, e);
+                            that._error('autoCheckLinks - cross-sync fix failed:', csfItem.oldUrl, e);
                         }
                     }
                 } else {
-                    console.log('[LocalBrowse] autoCheckLinks - cross-sync fix loop detected (broken branch) for doc', docId, '(count=' + that._crossSyncFixCount[docId] + ')');
+                    that._log('autoCheckLinks - cross-sync fix loop detected (broken branch) for doc', docId, '(count=' + that._crossSyncFixCount[docId] + ')');
                 }
             }
 
             for (var i = 0; i < result.broken.length; i++) {
                 var item = result.broken[i];
-                console.log('[LocalBrowse] autoCheckLinks - fixing:', item.fileName, 'from', item.localPath);
+                that._log('autoCheckLinks - fixing:', item.fileName, 'from', item.localPath);
                 var candidates = [];
                 var parentDir = '';
                 var lastSep = Math.max(item.localPath.lastIndexOf('\\'), item.localPath.lastIndexOf('/'));
@@ -6465,6 +6532,9 @@ class LocalBrowsePlugin extends Plugin {
                     if (r3All.length > 0) candidates = r3All;
                 }
 
+                // macOS firmlink 去重：/System/Volumes/Data/... 和 /... 是同一个文件
+                candidates = that._dedupCandidates(candidates);
+
                 if (candidates.length === 0) {
                     unfixable++;
                     item._searchResults = [];
@@ -6474,19 +6544,19 @@ class LocalBrowsePlugin extends Plugin {
                     try {
                         await that.replaceLink(docId, item.oldUrl, candidates[0].fullPath, i, { silent: true });
                         autoFixed++;
-                        console.log('[LocalBrowse] autoCheckLinks - auto fixed:', item.fileName, '→', candidates[0].fullPath);
+                        that._log('autoCheckLinks - auto fixed:', item.fileName, '→', candidates[0].fullPath);
                     } catch(e) {
                         unfixable++;
                         item._searchResults = candidates;
                         pendingItems.push(item);
-                        console.error('[LocalBrowse] autoCheckLinks - auto fix failed:', item.fileName, e);
+                        that._error('autoCheckLinks - auto fix failed:', item.fileName, e);
                     }
                 } else {
                     // 多个匹配 → 需要手动选择
                     needManual++;
                     item._searchResults = candidates;
                     pendingItems.push(item);
-                    console.log('[LocalBrowse] autoCheckLinks - need manual:', item.fileName, candidates.length, 'candidates');
+                    that._log('autoCheckLinks - need manual:', item.fileName, candidates.length, 'candidates');
                 }
             }
 
@@ -6498,7 +6568,7 @@ class LocalBrowsePlugin extends Plugin {
                 valid: result.valid
             };
 
-            console.log('[LocalBrowse] autoCheckLinks - result: autoFixed=' + autoFixed + ', needManual=' + needManual + ', unfixable=' + unfixable);
+            that._log('autoCheckLinks - result: autoFixed=' + autoFixed + ', needManual=' + needManual + ', unfixable=' + unfixable);
             if (unfixable > 0) {
                 that._updateLinkIndicator('red');
             } else if (needManual > 0) {
@@ -6513,7 +6583,7 @@ class LocalBrowsePlugin extends Plugin {
                 that._lastCheckedDocId = '';
             }
         } catch (e) {
-            console.error('[LocalBrowse] auto check error:', e);
+            that._error('auto check error:', e);
             that._updateLinkIndicator('none');
         } finally {
             that._autoCheckRunning = false;
@@ -6527,11 +6597,11 @@ class LocalBrowsePlugin extends Plugin {
      */
     async relinkBrokenLinks() {
         var that = this;
-        console.log('[LocalBrowse] relinkBrokenLinks started');
+        that._log('relinkBrokenLinks started');
 
         // 1. 获取当前活动文档 ID
         var docId = that.getCurrentDocId();
-        console.log('[LocalBrowse] relinkBrokenLinks - docId:', docId);
+        that._log('relinkBrokenLinks - docId:', docId);
         if (!docId) {
             that.showToastMsg('请先打开一个文档');
             return;
@@ -6543,7 +6613,7 @@ class LocalBrowsePlugin extends Plugin {
         if (that._cachedBrokenResult && that._cachedBrokenResult.docId === docId && that._cachedBrokenResult.broken && that._cachedBrokenResult.broken.length > 0) {
             result = that._cachedBrokenResult;
             useCache = true;
-            console.log('[LocalBrowse] relinkBrokenLinks - using cached result');
+            that._log('relinkBrokenLinks - using cached result');
         }
 
         // 3. 无缓存时重新扫描
@@ -6551,7 +6621,7 @@ class LocalBrowsePlugin extends Plugin {
             try {
                 result = await that.scanBrokenLinks(docId);
             } catch(e) {
-                console.error('[LocalBrowse] relinkBrokenLinks - scan error:', e);
+                that._error('relinkBrokenLinks - scan error:', e);
                 that.showToastMsg('扫描链接失败：' + (e.message || e));
                 return;
             }
@@ -6863,6 +6933,9 @@ class LocalBrowsePlugin extends Plugin {
                         if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">R3 搜索完成（' + r3TotalSearched + ' 目录）</span>';
                     }
 
+                    // macOS firmlink 去重：/System/Volumes/Data/... 和 /... 是同一个文件
+                    candidates = that._dedupCandidates(candidates);
+
                     // 处理搜索结果
                     var exactCandidates = candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
                     if (item.fileFingerprint && (item.fileFingerprint.size !== null || item.fileFingerprint.mtime !== null)) {
@@ -6971,7 +7044,7 @@ class LocalBrowsePlugin extends Plugin {
                     (function(idx) {
                         processPromises.push(
                             processLink(result.broken[idx], idx).catch(function(e) {
-                                console.error('[LocalBrowse] processLink error for item', idx, e);
+                                that._error('processLink error for item', idx, e);
                                 // 更新 UI 显示错误状态
                                 var errStatusEl = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
                                 var errCandidateArea = dialog.querySelector('.cd-relink-candidate-area[data-index="' + idx + '"]');
@@ -7014,7 +7087,7 @@ class LocalBrowsePlugin extends Plugin {
                 that._lastCheckedDocId = '';
                 that._autoCheckLinks();
         } catch (e) {
-            console.error('[LocalBrowse] relink scan error:', e);
+            that._error('relink scan error:', e);
             that.showToastMsg('扫描链接失败：' + (e.message || e));
         }
     }
@@ -7075,7 +7148,7 @@ class LocalBrowsePlugin extends Plugin {
                         }
                     }
                 } catch (e2) {
-                    console.log('[LocalBrowse] getCurrentDocId - method1 error:', e2.message);
+                    that._log('getCurrentDocId - method1 error:', e2.message);
                 }
             }
 
@@ -7096,16 +7169,16 @@ class LocalBrowsePlugin extends Plugin {
                 if (container) {
                     var titleEl3 = container.querySelector('.protyle-title');
                     if (titleEl3 && titleEl3.dataset && titleEl3.dataset.nodeId) {
-                        console.log('[LocalBrowse] getCurrentDocId - method3 (wysiwyg→title):', titleEl3.dataset.nodeId);
+                        that._log('getCurrentDocId - method3 (wysiwyg→title):', titleEl3.dataset.nodeId);
                         return titleEl3.dataset.nodeId;
                     }
                 }
             }
 
-            console.log('[LocalBrowse] getCurrentDocId - all methods failed');
+            that._log('getCurrentDocId - all methods failed');
             return null;
         } catch (e) {
-            console.error('[LocalBrowse] getCurrentDocId error:', e);
+            that._error('getCurrentDocId error:', e);
             return null;
         }
     }
@@ -7219,11 +7292,11 @@ class LocalBrowsePlugin extends Plugin {
                     if (!that._isCurrentPlatformLink(localPath)) {
                         // 不是当前平台的链接格式
                         var inSync = that._isInSyncFolder(localPath);
-                        console.log('[LocalBrowse] cross-platform link: ' + localPath + ', isInSync=' + inSync + ', mySyncRoot=' + that._getMySyncRoot());
+                        that._log('cross-platform link: ' + localPath + ', isInSync=' + inSync + ', mySyncRoot=' + that._getMySyncRoot());
                         if (inSync) {
                             // 在同步文件夹内 → 尝试跨端修复
                             var crossResult = that._crossSyncRepair(localPath, fileName);
-                            console.log('[LocalBrowse] crossSyncRepair result: ' + (crossResult ? ('newPath=' + crossResult.newPath + ', exists=' + crossResult.exists) : 'null'));
+                            that._log('crossSyncRepair result: ' + (crossResult ? ('newPath=' + crossResult.newPath + ', exists=' + crossResult.exists) : 'null'));
                             if (crossResult && crossResult.exists) {
                                 // 前缀替换后文件存在 → 直接修复，不加入 broken
                                 if (!crossSyncFixed) crossSyncFixed = [];
@@ -7248,7 +7321,7 @@ class LocalBrowsePlugin extends Plugin {
                                 continue;
                             }
                             // crossResult 为 null（无法匹配任何平台的 syncRoot）→ 忽略
-                            console.log('[LocalBrowse] cross-platform link SILENTLY IGNORED (crossResult=null): ' + localPath + ' — likely _getMySyncRoot() returned empty on this device');
+                            that._log('cross-platform link SILENTLY IGNORED (crossResult=null): ' + localPath + ' — likely _getMySyncRoot() returned empty on this device');
                         }
                         // 不是当前平台格式且不在同步文件夹内 → 忽略（不加入 broken，不修复）
                         continue;
@@ -7983,7 +8056,10 @@ class LocalBrowsePlugin extends Plugin {
                             }
                         } else if (isDir) {
                             if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
-                            queue.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
+                            // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
+                            var nextDir = path.join(item.dir, entry.name);
+                            if (entry.name === 'Data' && item.dir === '/System/Volumes') continue;
+                            queue.push({ dir: nextDir, depth: item.depth + 1 });
                         } else if (isSymlink) {
                             // 符号链接，尝试判断是否为目录
                             try {
@@ -8176,6 +8252,8 @@ class LocalBrowsePlugin extends Plugin {
                         if (isDir) {
                             // 目录过滤：跳过系统目录、隐藏目录、开发目录
                             if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
+                            // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
+                            if (entry.name === 'Data' && normalizedPath === '/System/Volumes/') continue;
                             searchRecursive(fullPath);
                         } else if (!isFile && !isDir) {
                             // OTHER 类型（symlink/junction）：尝试 fs.statSync 判断是否为目录
@@ -8219,7 +8297,7 @@ class LocalBrowsePlugin extends Plugin {
             searchRecursive(searchDir);
             await allDonePromise;
         } catch (e) {
-            console.error('[LocalBrowse] deepSearchFileByName error:', e);
+            that._error('deepSearchFileByName error:', e);
         }
 
         // 网盘兼容：如果递归搜索没找到任何结果，尝试用插件的 deepSearch 方法
@@ -8294,14 +8372,14 @@ class LocalBrowsePlugin extends Plugin {
                 newFingerprintTitle = 'size=' + newStat.size + '&mtime=' + (newStat.mtime ? newStat.mtime.getTime() : 0);
             }
         } catch(e) {
-            console.log('[LocalBrowse] replaceLink: fs.statSync failed for', newLocalPath, e.message);
+            that._log('replaceLink: fs.statSync failed for', newLocalPath, e.message);
         }
 
         // 修复：改用 toFileUrl（不编码中文），和 insertLocalFileLink 保持一致，避免中文显示为 % 编码乱码
         var newUrl = that.toFileUrl(newLocalPath);
         var newUrlWithTitle = newFingerprintTitle ? (newUrl + ' "' + newFingerprintTitle + '"') : newUrl;
 
-        console.log('[LocalBrowse] replaceLink: docId=' + docId + ', oldUrl=' + oldUrl + ', newUrl=' + newUrl);
+        that._log('replaceLink: docId=' + docId + ', oldUrl=' + oldUrl + ', newUrl=' + newUrl);
 
         try {
 
@@ -8313,7 +8391,7 @@ class LocalBrowsePlugin extends Plugin {
             });
             var childData = await childResp.json();
             if (childData.code !== 0 || !childData.data) {
-                console.log('[LocalBrowse] replaceLink: step1 failed - getChildBlocks returned code=' + childData.code);
+                that._log('replaceLink: step1 failed - getChildBlocks returned code=' + childData.code);
                 if (!isSilent) that.showToastMsg('获取子块失败');
                 return;
             }
@@ -8351,15 +8429,15 @@ class LocalBrowsePlugin extends Plugin {
             }
 
             if (!targetBlock) {
-                console.log('[LocalBrowse] replaceLink: step2 failed - no block contains oldUrl, tried variants:', oldUrlVariants);
+                that._log('replaceLink: step2 failed - no block contains oldUrl, tried variants:', oldUrlVariants);
                 for (var i = 0; i < Math.min(childBlocks.length, 5); i++) {
                     var md = childBlocks[i].markdown || '';
-                    console.log('[LocalBrowse] replaceLink: block[' + i + '] md(0..200):', md.substring(0, 200));
+                    that._log('replaceLink: block[' + i + '] md(0..200):', md.substring(0, 200));
                 }
                 if (!isSilent) that.showToastMsg('未找到包含该链接的块');
                 return;
             }
-            console.log('[LocalBrowse] replaceLink: step2 found block', targetBlock.id, 'matchUrl=', targetMatchUrl);
+            that._log('replaceLink: step2 found block', targetBlock.id, 'matchUrl=', targetMatchUrl);
 
             // === 步骤3：在 markdown 中替换链接 ===
             // 直接修改 block.markdown（思源的真正存储格式），然后用 dataType:'markdown' 更新
@@ -8426,11 +8504,11 @@ class LocalBrowsePlugin extends Plugin {
             }
 
             if (!replaced) {
-                console.log('[LocalBrowse] replaceLink: step3 failed - no markdown replacement matched');
+                that._log('replaceLink: step3 failed - no markdown replacement matched');
                 if (!isSilent) that.showToastMsg('未找到需要替换的链接');
                 return;
             }
-            console.log('[LocalBrowse] replaceLink: step3 markdown replacement succeeded');
+            that._log('replaceLink: step3 markdown replacement succeeded');
 
             // === 步骤4：用 dataType: 'markdown' 更新该子块 ===
             var updateResp = await fetch('/api/block/updateBlock', {
@@ -8444,11 +8522,11 @@ class LocalBrowsePlugin extends Plugin {
             });
             var updateData = await updateResp.json();
             if (updateData.code !== 0) {
-                console.log('[LocalBrowse] replaceLink: step4 updateBlock failed - code=' + updateData.code + ', msg=' + (updateData.msg || ''));
+                that._log('replaceLink: step4 updateBlock failed - code=' + updateData.code + ', msg=' + (updateData.msg || ''));
                 if (!isSilent) that.showToastMsg('替换链接失败：' + (updateData.msg || '未知错误'));
                 return;
             }
-            console.log('[LocalBrowse] replaceLink: step4 updateBlock (markdown) succeeded, blockId=' + targetBlock.id);
+            that._log('replaceLink: step4 updateBlock (markdown) succeeded, blockId=' + targetBlock.id);
 
             // 替换成功，更新 UI
             if (context && context.dialog) {
@@ -8469,7 +8547,7 @@ class LocalBrowsePlugin extends Plugin {
             }
 
         } catch (e) {
-            console.error('[LocalBrowse] replaceLink error:', e);
+            that._error('replaceLink error:', e);
             if (!isSilent) {
                 that.showToastMsg('替换链接失败：' + (e.message || e));
             }

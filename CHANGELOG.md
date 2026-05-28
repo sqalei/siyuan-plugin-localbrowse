@@ -1,3 +1,16 @@
+## v0.6.1
+
+### 🐛 Bug 修复
+
+- 修复 macOS APFS firmlink 导致同一文件返回两个路径（`/Users/...` 和 `/System/Volumes/Data/Users/...`），搜索时重复扫描且用户需在"同一文件"间手动选择的问题
+  - 搜索递归时跳过 `/System/Volumes/Data` 目录，避免重复扫描
+  - 搜索结果自动去重（`_normalizeMacPath` + `_dedupCandidates`）
+
+### 🔧 其他
+
+- 移除底部状态栏 🐛 debug 按钮，调试日志默认关闭
+- 保留 `localStorage.setItem('cd_debug', 'true')` 控制台手动开启方式
+
 ## v0.6.0
 
 ### ✨ 新功能
