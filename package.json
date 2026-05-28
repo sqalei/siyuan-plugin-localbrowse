@@ -1,21 +1,21 @@
 {
   "name": "siyuan-plugin-localbrowse",
-  "version": "0.5.6",
+  "version": "0.6.0",
   "displayName": {
     "default": "LocalBrowse",
     "zh_CN": "本地文件浏览器"
   },
   "description": {
-    "default": "Browse local files in Dock panel, search, bookmark folders, and double-click to insert file links or copy to assets as SiYuan attachments",
-    "zh_CN": "在Dock面板浏览本地文件，支持搜索、收藏、排序、图标/列表视图，双击插入文件链接或复制到assets作为思源附件"
+    "default": "After inserting local file links, this plugin supports: auto-fix broken links when files move, cross-platform and cross-device sync, all data stored locally - no cloud, no upload",
+    "zh_CN": "插入本地链接后，本插件支持：本地文件挪动位置后，支持失效链接自动修复，并且支持跨平台，跨设备同步，所有数据均保存在本地，无离线，不笔记。"
   },
   "author": "sqalei",
   "minAppVersion": "3.0.0",
   "backends": [
-    "windows"
+    "all"
   ],
   "frontends": [
-    "desktop"
+    "all"
   ],
   "readme": {
     "default": "README.md",
@@ -28,7 +28,9 @@
     "local",
     "file browser",
     "mount",
-    "attachment"
+    "attachment",
+    "cross-platform",
+    "本地文件"
   ],
   "scripts": {
     "build": "node build.js"

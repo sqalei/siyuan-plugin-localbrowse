@@ -4,10 +4,10 @@
         "description": "在Dock面板快速浏览本地文件，便捷插入本地文件链接为思源附件"
     },
     "panel": {
-        "title": "从本地驱动器选择文件",
+        "title": "从本地存储选择文件",
         "dockTitle": "本地文件",
         "browse": "浏览文件",
-        "noDrive": "未检测到挂载的驱动器",
+        "noDrive": "未检测到可访问的存储",
         "insert": "插入为附件",
         "loading": "加载中...",
         "empty": "此目录为空",
@@ -23,10 +23,10 @@
         "mountPath": "挂载路径",
         "addPath": "添加自定义路径",
         "removePath": "移除",
-        "customPathPlaceholder": "输入自定义路径（如 D:\\我的云盘）"
+        "customPathPlaceholder": "输入自定义路径（如 /home/用户/我的云盘 或 D:\\我的云盘）"
     },
     "hints": {
-        "ensureMounted": "请确保驱动器已挂载",
+        "ensureMounted": "请确保存储路径可访问",
         "addCustom": "或在设置中添加自定义路径"
     }
 }

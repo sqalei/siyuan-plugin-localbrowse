@@ -1,9 +1,9 @@
-# Install script for siyuan-plugin-clouddrive
+# Install script for siyuan-plugin-localbrowse
 # Run this script in PowerShell to install the plugin
 
-$PluginDir = "$env:USERPROFILE\.siyuan\data\plugins\siyuan-plugin-clouddrive"
+$PluginDir = "$env:USERPROFILE\.siyuan\data\plugins\siyuan-plugin-localbrowse"
 
-Write-Host "Installing siyuan-plugin-clouddrive..." -ForegroundColor Cyan
+Write-Host "Installing siyuan-plugin-localbrowse..." -ForegroundColor Cyan
 
 # Create plugin directory if not exists
 if (-not (Test-Path $PluginDir)) {

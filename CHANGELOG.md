@@ -1,3 +1,43 @@
+## v0.6.0
+
+### ✨ 新功能
+
+- **🔄 跨端同步文件夹升级：支持同平台多设备**
+  - 新增支持同平台跨设备场景（如两台 Windows 电脑不同盘符：`D:\BaiduSyncdisk` ↔ `E:\BaiduSyncdisk`）
+  - 数据格式升级：每平台从单条路径变为按设备（主机名）存储，多台同平台设备不再互相覆盖
+  - 完整路径前缀匹配替代文件夹名匹配，更加精确，不会误判同名文件夹
+  - 旧格式自动迁移：迁移前验证路径在当前设备是否实际存在，防止其他设备的路径被错误归到本机
+  - 设置面板简化：只显示当前设备配置 + 平台胶囊标签，去掉其他平台未配置提示
+- **📂 强制统一同步文件夹名称为 LocalBrowseSync**
+  - 浏览按钮选择网盘同步目录的父文件夹，自动创建 LocalBrowseSync 子文件夹
+  - 所有设备统一使用 LocalBrowseSync 作为同步文件夹，无需手动确保名称一致
+- **🏠 启动时默认显示跨端同步文件夹**
+  - 打开思源笔记时优先导航到跨端同步文件夹根目录，防止上次保存的子目录因文件移动而失效
+  - 未配置同步文件夹时回退到上次路径或盘符根目录
+- **☁️ macOS 云盘快捷方式**
+  - 目录选择器中自动扫描主目录下的百度网盘、百度网盘同步空间等云盘文件夹
+- **🐳 Docker/鸿蒙 API 双模式**
+  - 新增 API 模式（鸿蒙 HarmonyOS 适用的只读模式），自动检测 Docker 容器环境
+  - API 模式下禁用文件操作（复制到 assets、右键插入等），file:/// 链接自动屏蔽
+  - Docker 版平台和设备 ID 正确识别（读取 `window.siyuan.config.system` 多字段）
+
+### 🐛 Bug 修复
+
+- 修复同平台跨设备链接不走跨端修复通道的问题（`_isCurrentPlatformLink` 返回 true 时跳过了 `_isInSyncFolder` 检查）
+- 修复深度搜索递归未过滤隐藏文件（`.` 开头、`$RECYCLE.BIN`、`System Volume Information`）
+- 修复 `_isInSyncFolder` 基于名称匹配导致误判（改为精确前缀 + 段边界检查）
+- 修复 `_crossSyncRepair` 前缀匹配不够精确（`BaiduSyncdisk` 可能匹配 `BaiduSyncdiskBackup`）
+- 修复路径拼接末尾多余 `/`（路径恰好是 syncRoot 本身时）
+- 修复 `goUp()` 在 Unix 挂载点路径刷新原地（`/Volumes` goUp 到 `/`）
+- 修复 `syncRoots` 异步加载与保存的数据竞争（添加 `_syncRootsLoaded` 标志）
+- 修复 macOS 浏览按钮点击无反应（osascript 静默失败，改为直接使用内置 `pickDirectory()`）
+- 修复 `pickDirectory` 选择目录后关闭同步配置面板（添加 `e.stopPropagation()` 阻止事件冒泡）
+- 修复跨平台路径污染：macOS 使用后 Windows 显示空目录（`loadPathSettings` 增加平台路径校验 + `fs.existsSync` 验证）
+- 修复跨设备路径污染：另一台 Windows 设备打开时显示空目录（旧格式迁移 + 新格式读取均增加 `fs.existsSync` 验证，无效记录自动清理）
+- 修复 `loadDriveSettings` 盘符跨设备同步导致无效盘符（增加 `fs.existsSync` 校验，localStorage 降级同样校验）
+- 修复 `_migrateSyncRoots` 当前平台旧格式迁移将其他设备路径错误归到本机（增加 `fs.existsSync` 验证）
+- 修复 `_syncRootInlineCloseBound` 内存泄漏（保存引用并在 `onunload` 清理）
+
 ## v0.5.6
 
 ### ✨ 新功能

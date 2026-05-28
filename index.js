@@ -37,14 +37,14 @@ class LocalBrowsePlugin extends Plugin {
         super(options);
         this.dockPanel = null;
         this.currentPath = '';
-        this.driveLetter = 'C';
+        this.driveLetter = this.isWindows ? 'C' : '/';  // Windows: 盘符字母; macOS/Linux: 根路径或卷路径
         this.workspacePath = '';
         this.assetsPath = '';
         this.cachedFiles = [];      // 当前目录完整文件列表（用于搜索过滤）
         this.cachedPath = '';       // 当前缓存对应的目录路径
         this.isDeepSearchMode = false; // 是否处于深度搜索模式
         this.preSearchPath = '';    // 深度搜索前所在的目录，用于返回
-        this.availableDrives = [];  // 可用盘符列表
+        this.availableDrives = [];  // 可用存储列表 [{value, label}]
         this.favorites = [];        // 收藏的文件夹列表 [{path, name}]
         this.currentView = 'list';  // 当前视图模式：list | icon
         this.sortBy = 'name';       // 排序方式：name | size | mtime
@@ -63,6 +63,16 @@ class LocalBrowsePlugin extends Plugin {
         this._clipboardCut = null;   // 剪切板：记录剪切的文件/文件夹路径 {path, name, isDir}
         this._linkStatus = 'none';    // 链接状态指示灯: none/green/yellow/red/checking
         this._lastCheckedDocId = '';  // 上次检测的文档 ID，避免重复扫描
+        this.pathMap = null;          // 路径映射: { container: '/mnt/sync', host: 'C:\\Users\\sqalei\\坚果云' }
+        this.syncRoots = {};          // 跨端同步文件夹: { win32: { "DESKTOP-ABC": "D:\\BaiduSyncdisk" }, darwin: { "macbook-pro": "/Users/sqalei/BaiduSyncdisk" } }
+        this._syncRootsLoaded = false;  // syncRoots 是否已从存储加载完成（防止异步竞争）
+        this._loadSeq = 0;              // 目录加载版本号，防止异步回调覆盖（竞态条件）
+        this._deviceId = '';            // 当前设备标识（用主机名，不随思源同步）
+        this.platform = this._detectPlatform();  // 平台检测：win32/darwin/linux
+        this.isWindows = (this.platform === 'win32');
+        this.platformIcon = this.platform === 'darwin' ? '🍎' : (this.platform === 'linux' ? '🐧' : '🪟');
+        this.platformName = this.platform === 'darwin' ? 'macOS' : (this.platform === 'linux' ? 'Linux' : 'Windows');
+        this._sep = (path && path.sep) || (this.isWindows ? '\\' : '/');  // 跨平台路径分隔符
     }
 
     onload() {
@@ -73,6 +83,8 @@ class LocalBrowsePlugin extends Plugin {
         this.loadDriveSettings();
         this.loadViewSettings();
         this.loadPathSettings();
+        this.loadPathMap();
+        this.loadSyncRoots();
         this.registerDock();
 
         // 链接指示灯初始化 + 自动检测
@@ -175,6 +187,12 @@ class LocalBrowsePlugin extends Plugin {
         if (this._sortMenuClickHandler) {
             document.removeEventListener('click', this._sortMenuClickHandler);
             this._sortMenuClickHandler = null;
+        }
+        // 清理同步文件夹内联面板的 document 点击监听器
+        if (this._syncRootInlineClickHandler) {
+            document.removeEventListener('click', this._syncRootInlineClickHandler);
+            this._syncRootInlineClickHandler = null;
+            this._syncRootInlineCloseBound = false;
         }
         // 清理排序菜单 DOM 残留
         var sortMenu = document.getElementById('cd-sort-menu');
@@ -298,16 +316,34 @@ class LocalBrowsePlugin extends Plugin {
     renderFileTree() {
         if (!this.dockPanel || !this.dockPanel.element) return;
         
+        // Docker/浏览器版：构造函数执行时 window.siyuan.config.system 可能还没就绪，
+        // 导致平台被错误检测为 win32。Dock 面板渲染时重新检测并修正。
+        this._correctPlatformIfNeeded();
+
         var that = this;
         var el = this.dockPanel.element;
         
+        var isDocker = that._isDockerBrowser();
         el.innerHTML = '<div class="cd-container" style="height:100%;display:flex;flex-direction:column;padding:4px;box-sizing:border-box;font-size:13px;overflow:hidden">' +
             '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px">' +
                 '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
+                '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
                 '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
                 '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
-                '<button id="cd-refresh" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="刷新" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">↻</button>' +
-                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0" title="点击修复失效链接">🔘</button>' +
+                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0;opacity:0.6;transition:opacity 0.2s" title="点击修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔘</button>' +
+            '</div>' +
+            '<div id="cd-syncroot-inline" style="margin-bottom:2px;padding:6px 8px;background:var(--b3-theme-surface,#f0f0f0);border-radius:4px;display:none;flex-shrink:0">' +
+                '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">' +
+                    '<span style="font-size:12px;color:var(--b3-theme-on-background,#333);font-weight:700">跨端同步文件夹</span>' +
+                    '<span style="font-size:10px;padding:1px 6px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:8px;color:var(--b3-theme-secondary,#888);line-height:1.4" title="' + this._getDeviceId() + '">' + this.platformName + '</span>' +
+                '</div>' +
+                '<div style="font-size:9px;color:var(--b3-theme-secondary,#888);margin-bottom:4px;line-height:1.3">选择网盘同步目录的父文件夹，将自动创建 LocalBrowseSync 子文件夹</div>' +
+                '<div style="display:flex;gap:4px;align-items:center">' +
+                    '<input id="cd-syncroot-path" type="text" placeholder="如 D:\\BaiduSyncdisk（自动拼接 LocalBrowseSync）" style="flex:1;min-width:0;padding:3px 6px;font-size:11px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+                    '<button id="cd-syncroot-browse" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="浏览选择父文件夹">📂</button>' +
+                    '<button id="cd-syncroot-save" style="padding:3px 8px;font-size:11px;background:#ccc;color:#888;border:none;border-radius:3px;cursor:default;flex-shrink:0">保存</button>' +
+                    '<button id="cd-syncroot-clear" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-error,#d32f2f);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="清除同步文件夹">✕</button>' +
+                '</div>' +
             '</div>' +
             '<div id="cd-search-wrap" style="margin-bottom:2px;position:relative;flex-shrink:0;display:none">' +
                 '<input id="cd-search" type="text" placeholder="搜索当前目录（按 Enter 深度搜索）..." style="width:100%;padding:6px 56px 6px 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
@@ -323,6 +359,7 @@ class LocalBrowsePlugin extends Plugin {
             '</div>' +
             '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px">' +
                 '<span id="cd-stats-text">📊 加载中...</span>' +
+                '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
             '</div>' +
             '<div id="cd-context-menu" style="display:none;position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);min-width:160px;padding:4px 0;font-size:13px;user-select:none">' +
             '</div>' +
@@ -333,12 +370,143 @@ class LocalBrowsePlugin extends Plugin {
             '</div>' +
         '</div>';
         
-        // 绑定刷新按钮（innerHTML 已同步渲染，无需 setTimeout）
-        var refreshBtn = el.querySelector('#cd-refresh');
-        if (refreshBtn) {
-            refreshBtn.addEventListener('click', function() {
-                that.loadDirectory(that.currentPath || that.driveLetter + ':\\');
+        // 保存按钮脏状态检测
+        var _updateSaveDirty = function() {
+            var pathInput = el.querySelector('#cd-syncroot-path');
+            var saveBtn = el.querySelector('#cd-syncroot-save');
+            if (!pathInput || !saveBtn) return;
+            var currentVal = (pathInput.value || '').trim();
+            var savedVal = that._getMySyncRoot() || '';
+            var isDirty = currentVal !== savedVal;
+            saveBtn.style.background = isDirty ? 'var(--b3-theme-primary,#4285f4)' : '#ccc';
+            saveBtn.style.color = isDirty ? '#fff' : '#888';
+            saveBtn.style.cursor = isDirty ? 'pointer' : 'default';
+        };
+
+        // 绑定跨端文件夹保存按钮
+        var syncSaveBtn = el.querySelector('#cd-syncroot-save');
+        if (syncSaveBtn) {
+            syncSaveBtn.addEventListener('click', function() {
+                // 防止异步加载未完成时保存导致数据覆盖
+                if (!that._syncRootsLoaded) {
+                    that.showToastMsg('配置加载中，请稍后再试');
+                    return;
+                }
+                var pathInput = el.querySelector('#cd-syncroot-path');
+                var val = (pathInput && pathInput.value || '').trim();
+                if (val) {
+                    // 自动确保路径以 LocalBrowseSync 结尾
+                    var syncFolderName = 'LocalBrowseSync';
+                    var pathBasename = val.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+                    var finalPath = val;
+                    if (pathBasename !== syncFolderName) {
+                        // 用户输入的是父目录，自动拼接 LocalBrowseSync
+                        finalPath = val.replace(/[\\/]+$/, '') + (that.isWindows ? '\\' : '/') + syncFolderName;
+                    }
+
+                    // 检查父目录是否存在
+                    var parentDir = finalPath.replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join(that.isWindows ? '\\' : '/');
+                    try {
+                        var stat = fs.statSync(parentDir);
+                        if (!stat.isDirectory()) {
+                            that.showToastMsg('父目录不是文件夹');
+                            return;
+                        }
+                    } catch (e) {
+                        that.showToastMsg('父目录不存在或无法访问');
+                        return;
+                    }
+
+                    // 如果 LocalBrowseSync 子文件夹不存在，自动创建
+                    try {
+                        if (!fs.existsSync(finalPath)) {
+                            fs.mkdirSync(finalPath, { recursive: true });
+                            that.showToastMsg('已创建 ' + syncFolderName + ' 文件夹');
+                        }
+                    } catch (e) {
+                        that.showToastMsg('无法创建 ' + syncFolderName + ' 文件夹：' + (e.message || e));
+                        return;
+                    }
+
+                    // 更新输入框显示完整路径
+                    if (pathInput) pathInput.value = finalPath;
+
+                    that._setMySyncRoot(finalPath);
+                    that.saveSyncRoots();
+                    that.renderFavorites();
+                    that._updateSyncPill();
+                    _updateSaveDirty();
+                    that.showToastMsg(that.platformName + ' 同步文件夹已保存');
+                } else {
+                    that._clearMySyncRoot();
+                    that.saveSyncRoots();
+                    that.renderFavorites();
+                    that._updateSyncPill();
+                    _updateSaveDirty();
+                    that.showToastMsg(that.platformName + ' 同步文件夹已清除');
+                }
             });
+        }
+        // 绑定跨端文件夹清除按钮
+        var syncClearBtn = el.querySelector('#cd-syncroot-clear');
+        if (syncClearBtn) {
+            syncClearBtn.addEventListener('click', function() {
+                if (!that._syncRootsLoaded) {
+                    that.showToastMsg('配置加载中，请稍后再试');
+                    return;
+                }
+                that._clearMySyncRoot();
+                that.saveSyncRoots();
+                var pathInput = el.querySelector('#cd-syncroot-path');
+                if (pathInput) pathInput.value = '';
+                that.renderFavorites();
+                that._updateSyncPill();
+                _updateSaveDirty();
+                that.showToastMsg(that.platformName + ' 同步文件夹已清除');
+            });
+        }
+        // 绑定跨端文件夹浏览按钮
+        var syncBrowseBtn = el.querySelector('#cd-syncroot-browse');
+        if (syncBrowseBtn) {
+            syncBrowseBtn.addEventListener('click', function() {
+                that._browseSyncFolder(el, function(selectedDir) {
+                    // 浏览选择的是父目录，自动拼接 LocalBrowseSync
+                    var syncFolderName = 'LocalBrowseSync';
+                    if (selectedDir) {
+                        var basename = selectedDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
+                        var finalPath = selectedDir;
+                        if (basename !== syncFolderName) {
+                            finalPath = selectedDir.replace(/[\\/]+$/, '') + (that.isWindows ? '\\' : '/') + syncFolderName;
+                        }
+                        var pathInput = el.querySelector('#cd-syncroot-path');
+                        if (pathInput) pathInput.value = finalPath;
+                    }
+                    _updateSaveDirty();
+                });
+            });
+        }
+        // 绑定输入框变化检测
+        var syncPathInput = el.querySelector('#cd-syncroot-path');
+        if (syncPathInput) {
+            syncPathInput.addEventListener('input', _updateSaveDirty);
+        }
+
+        // 点击外部关闭同步文件夹内联面板
+        if (!that._syncRootInlineCloseBound) {
+            that._syncRootInlineCloseBound = true;
+            that._syncRootInlineClickHandler = function(e) {
+                var inlinePanel = document.getElementById('cd-syncroot-inline');
+                if (!inlinePanel || inlinePanel.style.display === 'none') return;
+                var target = e.target;
+                var favList = document.getElementById('cd-favorites-list');
+                var syncFolderTab = favList && favList.firstChild;
+                var isInsidePanel = inlinePanel.contains(target);
+                var isOnTab = syncFolderTab && syncFolderTab.contains(target);
+                if (!isInsidePanel && !isOnTab) {
+                    inlinePanel.style.display = 'none';
+                }
+            };
+            document.addEventListener('click', that._syncRootInlineClickHandler);
         }
 
         // 绑定链接状态指示灯
@@ -369,7 +537,7 @@ class LocalBrowsePlugin extends Plugin {
                     var sorted = that.sortFiles(that.cachedFiles.slice());
                     that.doRender(sorted, that.cachedPath, '', that.isDeepSearchMode);
                 } else {
-                    that.loadDirectory(that.currentPath || that.driveLetter + ':\\');
+                    that.loadDirectory(that.currentPath || that.getRootPath());
                 }
             });
         }
@@ -385,23 +553,23 @@ class LocalBrowsePlugin extends Plugin {
         }
 
 
-        // 检测并绑定盘符下拉框
+        // 检测并绑定存储下拉框（跨平台）
         that.detectDrives(function(drives) {
             var driveSelect = el.querySelector('#cd-drive-select');
             if (driveSelect) {
                 driveSelect.innerHTML = '';
                 if (drives.length === 0) {
-                    var defaultLetter = that.driveLetter || 'T';
+                    var fallbackValue = that.driveLetter || (that.isWindows ? 'C' : '/');
                     var opt = document.createElement('option');
-                    opt.value = defaultLetter;
-                    opt.textContent = defaultLetter + ':';
+                    opt.value = fallbackValue;
+                    opt.textContent = that.isWindows ? (fallbackValue + ':') : fallbackValue;
                     driveSelect.appendChild(opt);
                 } else {
                     for (var i = 0; i < drives.length; i++) {
                         var opt = document.createElement('option');
-                        opt.value = drives[i];
-                        opt.textContent = drives[i] + ':';
-                        if (drives[i] === that.driveLetter) {
+                        opt.value = drives[i].value;
+                        opt.textContent = drives[i].label;
+                        if (drives[i].value === that.driveLetter) {
                             opt.selected = true;
                         }
                         driveSelect.appendChild(opt);
@@ -410,10 +578,45 @@ class LocalBrowsePlugin extends Plugin {
                 driveSelect.addEventListener('change', function() {
                     that.driveLetter = this.value;
                     that.saveDriveSettings();
-                    that.loadDirectory(that.driveLetter + ':\\');
+                    that.loadDirectory(that.getRootPath());
                 });
             }
         });
+
+        // 绑定同步文件夹 pill 按钮（盘符下拉框旁边）
+        var syncPill = el.querySelector('#cd-syncroot-pill');
+        if (syncPill && !isDocker) {
+            syncPill.addEventListener('click', function() {
+                var sp = that._getMySyncRoot();
+                if (sp) {
+                    that.loadDirectory(sp);
+                } else {
+                    that.showToastMsg('请先右键配置同步文件夹');
+                }
+            });
+            syncPill.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var inlinePanel = document.getElementById('cd-syncroot-inline');
+                if (inlinePanel) {
+                    var isVisible = inlinePanel.style.display !== 'none';
+                    inlinePanel.style.display = isVisible ? 'none' : 'block';
+                    if (!isVisible) {
+                        // 仅在路径为空时才填充已保存的值，避免覆盖用户已输入但未保存的路径
+                        var pathInput = inlinePanel.querySelector('#cd-syncroot-path');
+                        if (pathInput && !pathInput.value.trim()) {
+                            pathInput.value = that._getMySyncRoot() || '';
+                        }
+                        var saveBtn = inlinePanel.querySelector('#cd-syncroot-save');
+                        if (saveBtn) {
+                            saveBtn.style.background = '#ccc';
+                            saveBtn.style.color = '#888';
+                            saveBtn.style.cursor = 'default';
+                        }
+                    }
+                }
+            });
+        }
 
         // 绑定搜索框
         var searchInput = el.querySelector('#cd-search');
@@ -504,11 +707,26 @@ class LocalBrowsePlugin extends Plugin {
             });
         }
 
-        // 初始加载：优先上次保存的路径，否则加载当前盘符根目录
-        this.loadDirectory(this.currentPath || this.driveLetter + ':\\');
+        // 初始加载：优先跨端同步文件夹根目录（需验证存在），其次上次保存的路径，否则加载当前盘符根目录
+        var initSyncRoot = this._getMySyncRoot();
+        var initPath;
+        console.log('[LocalBrowse] renderFileTree: _getMySyncRoot()=' + initSyncRoot + ', currentPath=' + this.currentPath + ', syncRootsLoaded=' + this._syncRootsLoaded);
+        if (initSyncRoot && (this.isWindows ? /^[A-Za-z]:/.test(initSyncRoot) : initSyncRoot.charAt(0) === '/')) {
+            // 同步文件夹路径格式正确，进一步验证是否实际存在
+            if (fs && fs.existsSync && fs.existsSync(initSyncRoot)) {
+                initPath = initSyncRoot;
+            } else {
+                initPath = this.currentPath || this.getRootPath();
+            }
+        } else {
+            initPath = this.currentPath || this.getRootPath();
+        }
+        console.log('[LocalBrowse] renderFileTree: initPath=' + initPath);
+        this.loadDirectory(initPath);
 
         // 渲染收藏夹（DOM 已就绪）
         this.renderFavorites();
+        this._updateSyncPill();
     }
 
     /**
@@ -516,6 +734,11 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadDirectory(dirPath) {
         var that = this;
+
+        // 递增加载版本号，旧回调检测到版本过时则丢弃结果（防止异步竞态覆盖）
+        this._loadSeq++;
+        var myLoadSeq = this._loadSeq;
+        console.log('[LocalBrowse] loadDirectory: path=' + dirPath + ', _loadSeq=' + myLoadSeq);
 
         // 取消正在进行的深度搜索（如果有）
         if (this._deepSearchAbort) {
@@ -545,18 +768,8 @@ class LocalBrowsePlugin extends Plugin {
         this._thumbQueue = [];
         this._thumbLoading = 0;
 
-        // 同步当前路径的盘符到下拉框
-        var driveMatch = dirPath.match(/^([A-Za-z]):/);
-        if (driveMatch) {
-            var newDrive = driveMatch[1].toUpperCase();
-            if (newDrive !== that.driveLetter) {
-                that.driveLetter = newDrive;
-                var driveSelect = document.getElementById('cd-drive-select');
-                if (driveSelect) {
-                    driveSelect.value = newDrive;
-                }
-            }
-        }
+        // 同步当前路径的存储位置到下拉框（跨平台）
+        that._syncDriveLetterFromPath(dirPath, true);
 
         var fileListEl = document.getElementById('cd-file-list');
         var breadcrumbEl = document.getElementById('cd-breadcrumb');
@@ -586,19 +799,21 @@ class LocalBrowsePlugin extends Plugin {
             breadcrumbEl.style.cursor = 'default';
 
             var parts = [];
-            var cleanPath = dirPath.endsWith('\\') ? dirPath.slice(0, -1) : dirPath;
+            // 安全获取路径分隔符（path 模块在 Docker 中应可用，但做 null 保护）
+            var _sep = this._sep;
+            var cleanPath = dirPath.endsWith(_sep) ? dirPath.slice(0, -1) : dirPath;
 
-            if (/^[A-Za-z]:$/.test(cleanPath)) {
-                parts = [{name: '🏠', path: cleanPath + '\\'}];
+            if (/^[A-Za-z]:$/.test(cleanPath) || cleanPath === '/') {
+                parts = [{name: '🏠', path: cleanPath + (this.isWindows ? '\\' : '/')}];
             } else {
-                var segments = cleanPath.split('\\');
+                var segments = cleanPath.split(_sep);
                 var accumulated = '';
                 for (var i = 0; i < segments.length; i++) {
                     if (i === 0) {
-                        accumulated = segments[0] + '\\';
+                        accumulated = segments[0] + _sep;
                         parts.push({name: '🏠', path: accumulated});
                     } else {
-                        accumulated += segments[i] + '\\';
+                        accumulated += segments[i] + _sep;
                         parts.push({name: segments[i], path: accumulated});
                     }
                 }
@@ -656,16 +871,24 @@ class LocalBrowsePlugin extends Plugin {
     goUp() {
         var currentPath = this.currentPath;
         if (!currentPath) return;
-        // 清理末尾反斜杠
-        var cleanPath = currentPath.endsWith('\\') ? currentPath.slice(0, -1) : currentPath;
-        // 如果是盘符根目录（如 C:），不再往上了
-        if (/^[A-Za-z]:$/.test(cleanPath)) return;
-        // 取上级目录
-        var lastSlash = cleanPath.lastIndexOf('\\');
-        if (lastSlash <= 1) {
-            // 上一级是盘符根目录
+        // 清理末尾路径分隔符（跨平台：Windows \ 或 Linux /）
+        var sep = this._sep;
+        var cleanPath = currentPath.endsWith(sep) ? currentPath.slice(0, -1) : currentPath;
+        // 如果是盘符根目录（如 C:）或 Unix 根目录 /，不再往上了
+        if (/^[A-Za-z]:$/.test(cleanPath) || cleanPath === '/') return;
+        // 取上级目录（跨平台：Windows 用 \，Linux 用 /）
+        var lastSlash = cleanPath.lastIndexOf(sep);
+        if (lastSlash < 0) {
+            // 无分隔符（不应该发生），回到根路径
+            this.loadDirectory(this.getRootPath());
+        } else if (lastSlash === 0) {
+            // Unix: 路径形如 /Volumes 或 /home，上级是根目录 /
+            this.loadDirectory('/');
+        } else if (this.isWindows && lastSlash === 2 && cleanPath.charAt(1) === ':') {
+            // Windows: 如 C:\Users → 上级是 C:\
             this.loadDirectory(cleanPath.substring(0, lastSlash + 1));
         } else {
+            // 正常上级目录
             this.loadDirectory(cleanPath.substring(0, lastSlash));
         }
     }
@@ -675,33 +898,46 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadDirectoryWithNode(dirPath, fileListEl) {
         var that = this;
+        var myLoadSeq = this._loadSeq;  // 捕获当前加载版本号，回调中检查是否过时
         
         try {
             // 标准化路径
             var normalizedPath = dirPath;
-            if (!normalizedPath.endsWith('\\')) {
-                normalizedPath += '\\';
+            if (!normalizedPath.endsWith(that._sep)) {
+                normalizedPath += that._sep;
             }
             
             fs.readdir(normalizedPath, { withFileTypes: true }, function(err, entries) {
+                // 版本号已变（用户已导航到其他目录），丢弃本次过时结果
+                if (myLoadSeq !== that._loadSeq) {
+                    console.log('[LocalBrowse] loadDirectoryWithNode: stale callback discarded, mySeq=' + myLoadSeq + ', current=' + that._loadSeq);
+                    return;
+                }
+
                 if (err) {
-                    // 根目录无法访问是真正的问题；子目录 ENOENT/EPERM 在挂载盘上通常是空文件夹的正常表现
-                    var isRootDir = /^[A-Za-z]:\\?$/.test(dirPath);
-                    if (err.code === 'ENOENT' || err.code === 'EPERM' || err.code === 'EACCES') {
-                        if (isRootDir) {
-                            console.error('[LocalBrowse] fs.readdir error:', err);
-                            that.showError('无法访问 ' + dirPath + '，请确认挂载盘已启动且驱动器已挂载');
-                        } else {
-                            that.renderFiles([], normalizedPath);
-                        }
-                    } else {
-                        console.error('[LocalBrowse] fs.readdir error:', err);
-                        // 尝试降级到 API
-                        that.loadDirectoryWithAPI(dirPath, fileListEl);
+                    // withFileTypes 可能在某些 Docker 环境下不支持，回退到普通 readdir
+                    if (err.code === 'ERR_INVALID_ARG_VALUE' || err.code === 'ENOSYS' || err.code === 'ENOTSUP') {
+                        fs.readdir(normalizedPath, function(err2, filenames) {
+                            if (myLoadSeq !== that._loadSeq) return;  // 版本过时检查
+                            if (err2) {
+                                that._handleDirReadError(dirPath, normalizedPath, err2, fileListEl);
+                                return;
+                            }
+                            that._buildFileEntries(filenames, normalizedPath, fileListEl);
+                        });
+                        return;
                     }
+                    that._handleDirReadError(dirPath, normalizedPath, err, fileListEl);
                     return;
                 }
                 
+                // 过滤隐藏文件和系统目录
+                entries = entries.filter(function(entry) {
+                    return entry.name.charAt(0) !== '.' &&
+                           entry.name !== '$RECYCLE.BIN' &&
+                           entry.name !== 'System Volume Information';
+                });
+
                 // 异步并行 stat，避免同步阻塞主线程
                 var statTasks = [];
                 for (var i = 0; i < entries.length; i++) {
@@ -716,6 +952,9 @@ class LocalBrowsePlugin extends Plugin {
                 }
 
                 Promise.all(statTasks).then(function(results) {
+                    // 所有 stat 完成后再检查一次版本号，防止过时结果覆盖最新渲染
+                    if (myLoadSeq !== that._loadSeq) return;
+
                     var files = [];
                     for (var i = 0; i < results.length; i++) {
                         var r = results[i];
@@ -753,6 +992,7 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadDirectoryWithAPI(dirPath, fileListEl) {
         var that = this;
+        var myLoadSeq = this._loadSeq;  // 捕获当前加载版本号
         
         fetch('/api/file/readDir', {
             method: 'POST',
@@ -762,8 +1002,16 @@ class LocalBrowsePlugin extends Plugin {
         }).then(function(resp) {
             return resp.json();
         }).then(function(data) {
+            // 版本号已变（用户已导航到其他目录），丢弃本次过时结果
+            if (myLoadSeq !== that._loadSeq) return;
+
             if (data.code === 0 && Array.isArray(data.data)) {
-                that.renderFiles(data.data, dirPath);
+                var files = data.data.filter(function(f) {
+                    return f.name && f.name.charAt(0) !== '.' &&
+                           f.name !== '$RECYCLE.BIN' &&
+                           f.name !== 'System Volume Information';
+                });
+                that.renderFiles(files, dirPath);
             } else {
                 that.showError('API 无法访问外部驱动器: ' + (data.msg || '未知错误'));
             }
@@ -774,18 +1022,208 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 检测可用盘符（Windows A-Z）
+     * 处理目录读取错误（统一的错误处理逻辑）
+     */
+    _handleDirReadError(dirPath, normalizedPath, err, fileListEl) {
+        var isRootDir = /^[A-Za-z]:\\?$/.test(dirPath) || dirPath === '/' || dirPath === '';
+        if (err.code === 'ENOENT' || err.code === 'EPERM' || err.code === 'EACCES') {
+            if (isRootDir) {
+                console.error('[LocalBrowse] fs.readdir error:', err);
+                this.showError('无法访问 ' + dirPath + '，请确认挂载盘已启动且驱动器已挂载');
+            } else {
+                this.renderFiles([], normalizedPath);
+            }
+        } else {
+            console.error('[LocalBrowse] fs.readdir error:', err);
+            // 尝试降级到 API
+            this.loadDirectoryWithAPI(dirPath, fileListEl);
+        }
+    }
+
+    /**
+     * 从文件名数组构建文件条目（无 withFileTypes 时的 fallback）
+     */
+    _buildFileEntries(filenames, normalizedPath, fileListEl) {
+        var that = this;
+        var myLoadSeq = this._loadSeq;  // 捕获当前加载版本号
+        // 过滤隐藏文件和系统目录
+        filenames = filenames.filter(function(name) {
+            return name.charAt(0) !== '.' &&
+                   name !== '$RECYCLE.BIN' &&
+                   name !== 'System Volume Information';
+        });
+        var statTasks = [];
+        for (var i = 0; i < filenames.length; i++) {
+            (function(name) {
+                var fullPath = normalizedPath + name;
+                statTasks.push(new Promise(function(resolve) {
+                    fs.stat(fullPath, function(err, stat) {
+                        resolve({ name: name, fullPath: fullPath, stat: err ? null : stat });
+                    });
+                }));
+            })(filenames[i]);
+        }
+        Promise.all(statTasks).then(function(results) {
+            // 版本号已变，丢弃过时结果
+            if (myLoadSeq !== that._loadSeq) return;
+
+            var files = [];
+            for (var i = 0; i < results.length; i++) {
+                var r = results[i];
+                var size = 0;
+                var mtime = 0;
+                var isDir = false;
+                if (r.stat) {
+                    size = r.stat.size;
+                    mtime = r.stat.mtime ? r.stat.mtime.getTime() : 0;
+                    try { isDir = r.stat.isDirectory(); } catch(e) {}
+                }
+                files.push({
+                    name: r.name,
+                    isDir: isDir,
+                    size: size,
+                    mtime: mtime,
+                    path: r.fullPath
+                });
+            }
+            that.renderFiles(files, normalizedPath);
+        }).catch(function(e) {
+            if (myLoadSeq !== that._loadSeq) return;  // 版本过时，不渲染错误
+            console.error('[LocalBrowse] _buildFileEntries error:', e);
+            that.showError('读取目录失败: ' + (e.message || e));
+        });
+    }
+
+    /**
+     * 检测可用存储（跨平台）
+     * Windows: 扫描 A-Z 盘符
+     * macOS: 根目录 + /Volumes/ 下挂载卷
+     * Linux: 根目录 + /mnt/ + /media/ + 用户主目录
+     * @returns [{value, label}] - value 用于逻辑，label 用于 UI 显示
      */
     detectDrives(callback) {
         var that = this;
         var drives = [];
 
+        // 无 fs 模块时的回退（Docker/鸿蒙版，通过 API 扫描）
         if (!fs) {
-            that.availableDrives = ['T'];
-            callback(['T']);
+            if (that.isWindows) {
+                drives = [{value: 'T', label: 'T:'}];
+            } else {
+                drives.push({value: '/', label: '🏠 /', isDefault: true});
+                // 尝试通过 API 扫描 /mnt/ /media/ 等挂载点
+                that._apiScanLinuxMounts(function(mountDrives) {
+                    drives = drives.concat(mountDrives);
+                    that.availableDrives = drives;
+                    callback(drives);
+                });
+                return; // 异步扫描，等回调
+            }
+            that.availableDrives = drives;
+            callback(drives);
             return;
         }
 
+        // macOS: 根目录 + /Volumes/ 下挂载卷 + 用户主目录 + 常见网盘目录
+        if (that.platform === 'darwin') {
+            drives.push({value: '/', label: '🏠 /', isDefault: true});
+            try {
+                var volumes = fs.readdirSync('/Volumes/');
+                for (var v = 0; v < volumes.length; v++) {
+                    var volName = volumes[v];
+                    if (volName.charAt(0) === '.') continue;  // 排除隐藏项
+                    var volPath = '/Volumes/' + volName;
+                    try {
+                        var stat = fs.statSync(volPath);
+                        if (stat.isDirectory() && !stat.isSymbolicLink()) {
+                            var icon = volName.toLowerCase().indexOf('macintosh') >= 0 ? '💻' : '📁';
+                            drives.push({value: volPath, label: icon + ' ' + volName, isDefault: false});
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+            // 用户主目录
+            if (os && os.homedir) {
+                try {
+                    var homeDir = os.homedir();
+                    if (homeDir && homeDir !== '/') {
+                        drives.push({value: homeDir, label: '🏠 ~', isDefault: false});
+                        // 扫描常见网盘目录
+                        var cloudDirs = ['BaiduNetdisk_mac', 'BaiduNetdisk', '百度网盘', '百度网盘同步空间', 'BaiduSyncdisk'];
+                        for (var cd = 0; cd < cloudDirs.length; cd++) {
+                            var cloudPath = homeDir + '/' + cloudDirs[cd];
+                            try {
+                                if (fs.existsSync(cloudPath) && fs.statSync(cloudPath).isDirectory()) {
+                                    drives.push({value: cloudPath, label: '☁️ ' + cloudDirs[cd], isDefault: false});
+                                }
+                            } catch(e) {}
+                        }
+                    }
+                } catch(e) {}
+            }
+            that.availableDrives = drives;
+            callback(drives);
+            return;
+        }
+
+        // Linux: 根目录 + /mnt/ + /media/ + 用户主目录
+        if (!that.isWindows) {
+            drives.push({value: '/', label: '🏠 /', isDefault: true});
+            // 读取 /mnt/ 下挂载点
+            try {
+                var mnts = fs.readdirSync('/mnt/');
+                for (var m = 0; m < mnts.length; m++) {
+                    var mName = mnts[m];
+                    if (mName.charAt(0) === '.') continue;
+                    var mPath = '/mnt/' + mName;
+                    try {
+                        if (fs.statSync(mPath).isDirectory()) {
+                            drives.push({value: mPath, label: '📁 ' + mName, isDefault: false});
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+            // 读取 /media/ 下子目录（自动挂载的 U 盘等）
+            try {
+                var mediaEntries = fs.readdirSync('/media/');
+                for (var me = 0; me < mediaEntries.length; me++) {
+                    var mediaUser = mediaEntries[me];
+                    if (mediaUser.charAt(0) === '.') continue;
+                    var mediaUserPath = '/media/' + mediaUser;
+                    try {
+                        if (fs.statSync(mediaUserPath).isDirectory()) {
+                            drives.push({value: mediaUserPath, label: '📁 ' + mediaUser, isDefault: false});
+                            // 读取用户下的子挂载点
+                            var subEntries = fs.readdirSync(mediaUserPath);
+                            for (var se = 0; se < subEntries.length; se++) {
+                                var subName = subEntries[se];
+                                if (subName.charAt(0) === '.') continue;
+                                var subPath = mediaUserPath + '/' + subName;
+                                try {
+                                    if (fs.statSync(subPath).isDirectory()) {
+                                        drives.push({value: subPath, label: '🔌 ' + subName, isDefault: false});
+                                    }
+                                } catch(e) {}
+                            }
+                        }
+                    } catch(e) {}
+                }
+            } catch(e) {}
+            // 用户主目录
+            if (os && os.homedir) {
+                try {
+                    var homeDir = os.homedir();
+                    if (homeDir && homeDir !== '/') {
+                        drives.push({value: homeDir, label: '🏠 ~', isDefault: false});
+                    }
+                } catch(e) {}
+            }
+            that.availableDrives = drives;
+            callback(drives);
+            return;
+        }
+
+        // Windows: 扫描 A-Z 盘符
         var letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
         var checked = 0;
         var finished = false;
@@ -794,8 +1232,8 @@ class LocalBrowsePlugin extends Plugin {
         var timeout = setTimeout(function() {
             if (!finished) {
                 finished = true;
-                drives.sort();
-                if (drives.length === 0) drives.push('T');
+                drives.sort(function(a, b) { return a.value.localeCompare(b.value); });
+                if (drives.length === 0) drives.push({value: 'T', label: 'T:', isDefault: true});
                 that.availableDrives = drives;
                 callback(drives);
             }
@@ -805,8 +1243,8 @@ class LocalBrowsePlugin extends Plugin {
             if (finished) return;
             finished = true;
             clearTimeout(timeout);
-            drives.sort();
-            if (drives.length === 0) drives.push('T');
+            drives.sort(function(a, b) { return a.value.localeCompare(b.value); });
+            if (drives.length === 0) drives.push({value: 'T', label: 'T:', isDefault: true});
             that.availableDrives = drives;
             callback(drives);
         }
@@ -818,7 +1256,7 @@ class LocalBrowsePlugin extends Plugin {
                     if (finished) return;
                     checked++;
                     if (!err) {
-                        drives.push(letter);
+                        drives.push({value: letter, label: letter + ':', isDefault: letter === 'C'});
                     }
                     if (checked === letters.length) {
                         tryFinish();
@@ -894,7 +1332,7 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         // 保存搜索前的目录，用于返回
-        this.preSearchPath = this.currentPath || this.driveLetter + ':\\';
+        this.preSearchPath = this.currentPath || this.getRootPath();
 
         // 禁用搜索框并显示 loading，同时显示叉按钮用于取消
         if (searchInput) searchInput.disabled = true;
@@ -945,7 +1383,7 @@ class LocalBrowsePlugin extends Plugin {
             scheduleRender();
         }
 
-        this.deepSearch(this.currentPath || this.driveLetter + ':\\', query, onPartialResult, function(finalResults, wasCancelled) {
+        this.deepSearch(this.currentPath || this.getRootPath(), query, onPartialResult, function(finalResults, wasCancelled) {
             if (that._searchRenderTimer) {
                 clearTimeout(that._searchRenderTimer);
                 that._searchRenderTimer = null;
@@ -1146,13 +1584,22 @@ class LocalBrowsePlugin extends Plugin {
             if (abortFlag.cancelled) return;
 
             var normalizedPath = currentDir;
-            if (!normalizedPath.endsWith('\\')) normalizedPath += '\\';
+            if (!normalizedPath.endsWith(that._sep)) normalizedPath += that._sep;
 
             taskStarted();
             schedule(function() {
                 if (abortFlag.cancelled) { taskFinished(); return Promise.resolve(); }
 
-                return fs.promises.readdir(normalizedPath, { withFileTypes: true }).then(function(entries) {
+                return that._fsReaddir(normalizedPath).then(function(rawEntries) {
+                    // 统一 entry 格式：fs 返回 Dirent 对象，API 返回 plain object
+                    var entries = rawEntries.map(function(e) {
+                        return {
+                            name: e.name,
+                            isDir: typeof e.isDirectory === 'function' ? e.isDirectory() : e.isDir,
+                            isFile: typeof e.isFile === 'function' ? e.isFile() : !e.isDir,
+                            isSymlink: typeof e.isSymbolicLink === 'function' ? e.isSymbolicLink() : (e.isSymlink || false)
+                        };
+                    });
                     var subPromises = [];
                     var batchResults = [];
 
@@ -1162,9 +1609,11 @@ class LocalBrowsePlugin extends Plugin {
                         if (abortFlag.cancelled) break;
 
                         var entry = entries[i];
+                        if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') continue;
+
                         var fullPath = normalizedPath + entry.name;
 
-                        // 多关键词匹配：所有关键词都必须出现在文件名中
+                        // 多关键词匹配
                         var lowerName = entry.name.toLowerCase();
                         var allMatch = true;
                         for (var ki = 0; ki < keywords.length; ki++) {
@@ -1176,13 +1625,13 @@ class LocalBrowsePlugin extends Plugin {
                         if (allMatch) {
                             var item = {
                                 name: entry.name,
-                                isDir: entry.isDirectory(),
+                                isDir: entry.isDir,
                                 path: fullPath,
                                 relativePath: that.getRelativePath(fullPath, dirPath)
                             };
-                            if (!entry.isDirectory()) {
+                            if (!entry.isDir) {
                                 // 异步取 size 和 mtime
-                                var statP = fs.promises.stat(fullPath).then(function(st) {
+                                var statP = that._fsStat(fullPath).then(function(st) {
                                     item.size = st.size;
                                     item.mtime = st.mtime ? st.mtime.getTime() : 0;
                                 }).catch(function() {
@@ -1195,9 +1644,7 @@ class LocalBrowsePlugin extends Plugin {
                             matchedFiles++;
                         }
 
-                        if (entry.isDirectory()) {
-                            // 子目录递归搜索自行通过 schedule 排队，不阻塞当前目录
-                            // 这样并发池能立即释放当前槽位，调度更多目录搜索
+                        if (entry.isDir) {
                             searchRecursive(fullPath, depth + 1);
                         }
                     }
@@ -1251,7 +1698,7 @@ class LocalBrowsePlugin extends Plugin {
      */
     getRelativePath(fullPath, basePath) {
         var normBase = basePath;
-        if (!normBase.endsWith('\\')) normBase += '\\';
+        if (!normBase.endsWith(this._sep)) normBase += this._sep;
         if (fullPath.indexOf(normBase) === 0) {
             return fullPath.substring(normBase.length);
         }
@@ -1370,12 +1817,12 @@ class LocalBrowsePlugin extends Plugin {
                 var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
                 var name = that.escapeHtml(f.name);
                 var itemClass = f.isDir ? 'cd-dir' : 'cd-file';
-                var fullPath = f.path || ((currentPath.endsWith('\\') ? currentPath : currentPath + '\\') + f.name);
+                var fullPath = f.path || ((currentPath.endsWith(that._sep) ? currentPath : currentPath + that._sep) + f.name);
 
                 var relativePathHtml = '';
                 if (isDeepSearch && f.relativePath) {
                     var displayPath = that.escapeHtml(f.relativePath);
-                    var lastSlash = displayPath.lastIndexOf('\\');
+                    var lastSlash = Math.max(displayPath.lastIndexOf('\\'), displayPath.lastIndexOf('/'));
                     var folderPath = lastSlash > 0 ? displayPath.substring(0, lastSlash) : '';
                     if (folderPath) {
                         relativePathHtml = '<div style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">📂 ' + folderPath + '</div>';
@@ -1401,10 +1848,11 @@ class LocalBrowsePlugin extends Plugin {
                         (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
                     '</div>';
                 } else {
-                    // 文件夹默认不显示箭头，异步检测有子项后再插入
+                    // 文件夹直接显示展开箭头，点击时再检测是否有子项；文件显示空占位
+                    var isDockerList1 = that._isDockerBrowser();
                     var expander = f.isDir ?
-                        '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
-                        '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+                        '<span class="cd-list-expand" title="' + (isDockerList1 ? 'Docker 环境不支持展开' : '展开/折叠') + '" style="cursor:' + (isDockerList1 ? 'not-allowed' : 'pointer') + ';width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px;vertical-align:middle' + (isDockerList1 ? ';opacity:0.35' : '') + '"><svg viewBox="0 0 32 32" style="width:10px;height:10px;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor;pointer-events:none"><path d="M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z"></path></svg></span>' :
+                        '<span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px"></span>';
 
                     html += '<div class="cd-item ' + itemClass + '" ' +
                         'data-path="' + that.escapeHtml(fullPath) + '" ' +
@@ -1432,9 +1880,6 @@ class LocalBrowsePlugin extends Plugin {
 
         // 恢复滚动位置
         that._restoreScrollPosition(fileListEl, currentPath);
-
-        // 异步检测空文件夹，移除空文件夹的展开箭头
-        that.checkEmptyFolders(fileListEl);
     }
 
     /**
@@ -1479,14 +1924,15 @@ class LocalBrowsePlugin extends Plugin {
             var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
             var name = that.escapeHtml(f.name);
             var itemClass = f.isDir ? 'cd-dir' : 'cd-file';
-            var fullPath = f.path || ((currentPath.endsWith('\\') ? currentPath : currentPath + '\\') + f.name);
+            var fullPath = f.path || ((currentPath.endsWith(that._sep) ? currentPath : currentPath + that._sep) + f.name);
             var timeStr = f.mtime ? that.formatTime(f.mtime) : '';
             var sizeStr = f.isDir ? '' : that.formatSize(f.size);
 
-            // 文件夹默认不显示箭头，异步检测有子项后再插入
+            // 文件夹直接显示展开箭头，点击时再检测是否有子项；文件显示空占位
+            var isDockerList2 = that._isDockerBrowser();
             var expander = f.isDir ?
-                '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
-                '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+                '<span class="cd-list-expand" title="' + (isDockerList2 ? 'Docker 环境不支持展开' : '展开/折叠') + '" style="cursor:' + (isDockerList2 ? 'not-allowed' : 'pointer') + ';width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px;vertical-align:middle' + (isDockerList2 ? ';opacity:0.35' : '') + '"><svg viewBox="0 0 32 32" style="width:10px;height:10px;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor;pointer-events:none"><path d="M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z"></path></svg></span>' :
+                '<span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px"></span>';
 
             html += '<div class="cd-item ' + itemClass + '" ' +
                 'data-path="' + that.escapeHtml(fullPath) + '" ' +
@@ -1516,9 +1962,6 @@ class LocalBrowsePlugin extends Plugin {
         state.renderedCount = endIdx;
 
         that.bindItemEvents(fileListEl, files, currentPath);
-
-        // 异步检测本批中的空文件夹
-        that.checkEmptyFolders(fileListEl);
 
         state.isLoading = false;
 
@@ -1583,157 +2026,226 @@ class LocalBrowsePlugin extends Plugin {
      * 异步检测空文件夹，移除空文件夹的展开箭头
      * 策略：先快速渲染（文件夹默认不显示箭头），再异步检测有子项的文件夹并插入箭头
      */
-    checkEmptyFolders(container) {
-        if (!fs) return;
-        var that = this;
-        var dirItems = container.querySelectorAll('.cd-item[data-isdir="true"]');
-        if (dirItems.length === 0) return;
-
-        var checkTasks = [];
-        for (var i = 0; i < dirItems.length; i++) {
-            (function(item) {
-                var itemPath = item.dataset.path;
-                // 已经处理过的跳过
-                if (item.dataset.hasChildren === 'true') return;
-
-                checkTasks.push(new Promise(function(resolve) {
-                    fs.readdir(itemPath, function(err, entries) {
-                        var hasVisible = false;
-                        if (!err && entries) {
-                            for (var j = 0; j < entries.length; j++) {
-                                var n = entries[j];
-                                if (n.charAt(0) !== '.' && n !== '$RECYCLE.BIN' && n !== 'System Volume Information') {
-                                    hasVisible = true;
-                                    break;
-                                }
-                            }
-                        }
-                        resolve({ item: item, hasChildren: hasVisible });
-                    });
-                }));
-            })(dirItems[i]);
-        }
-
-        Promise.all(checkTasks).then(function(results) {
-            for (var i = 0; i < results.length; i++) {
-                var r = results[i];
-                if (r.hasChildren) {
-                    // 有子项的文件夹：插入展开箭头
-                    var slot = r.item.querySelector('.cd-list-expand-slot');
-                    if (slot) {
-                        var svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-                        svg.setAttribute('class', 'cd-list-expand');
-                        svg.setAttribute('data-path', r.item.dataset.path);
-                        svg.setAttribute('viewBox', '0 0 32 32');
-                        svg.style.cssText = 'cursor:pointer;width:10px;height:10px;margin-right:6px;flex-shrink:0;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor';
-                        var pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-                        pathEl.setAttribute('d', 'M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z');
-                        svg.appendChild(pathEl);
-                        slot.parentNode.replaceChild(svg, slot);
-                    }
-                    r.item.dataset.hasChildren = 'true';
-                }
-            }
-        });
+    /**
+     * 移除文件夹的展开箭头（点击展开后发现是空文件夹时调用）
+     */
+    _removeExpandArrow(item) {
+        var expander = item.querySelector('.cd-list-expand');
+        if (!expander) return;
+        // 替换为空占位，保持对齐
+        var placeholder = document.createElement('span');
+        placeholder.style.cssText = 'width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px';
+        expander.parentNode.replaceChild(placeholder, expander);
+        item.dataset.hasChildren = 'false';
     }
 
     /**
      * 渲染列表视图中展开的子项
+     * 优化：先渲染前 50 条立即展开，剩余后台分批追加
+     * stat 信息（大小/时间）异步补齐（_fillStatInfo）
      */
     renderListChildren(containerEl, dirPath, level) {
         var that = this;
-        if (!fs) return;
         level = level || 1;
 
         containerEl.style.display = 'block';
 
-        fs.readdir(dirPath, { withFileTypes: true }, function(err, entries) {
-            if (err) {
-                containerEl.innerHTML = '<div style="padding:8px 12px;font-size:12px;color:var(--b3-theme-secondary,#999)">无法读取</div>';
-                delete containerEl.dataset.loading;
-                return;
-            }
-
+        // 双模式：fs 优先，API 兜底
+        this._fsReaddir(dirPath).then(function(entries) {
+            // 过滤隐藏文件和系统目录
             entries = entries.filter(function(entry) {
                 return entry.name.charAt(0) !== '.' &&
                        entry.name !== '$RECYCLE.BIN' &&
                        entry.name !== 'System Volume Information';
             });
             entries.sort(function(a, b) {
-                if (a.isDirectory() && !b.isDirectory()) return -1;
-                if (!a.isDirectory() && b.isDirectory()) return 1;
+                if (a.isDir && !b.isDir) return -1;
+                if (!a.isDir && b.isDir) return 1;
                 return a.name.localeCompare(b.name);
             });
 
             if (entries.length === 0) {
                 containerEl.innerHTML = '';
+                containerEl.style.display = 'none';
+                delete containerEl.dataset.loading;
+                var parentItem = containerEl.previousElementSibling;
+                if (parentItem && parentItem.classList.contains('cd-item')) {
+                    that._removeExpandArrow(parentItem);
+                }
                 return;
             }
 
-            // 异步并行获取所有子项的 stat
-            var statTasks = [];
-            for (var i = 0; i < entries.length; i++) {
+            // 立即渲染前 50 条
+            var FIRST_BATCH = 50;
+            var firstEntries = entries.slice(0, FIRST_BATCH);
+            var html = that._buildListItemsHtml(firstEntries, dirPath, level);
+
+            containerEl.innerHTML = html;
+            delete containerEl.dataset.loading;
+            that.bindItemEvents(containerEl, [], dirPath);
+
+            // 先补前 50 条的 stat
+            that._fillStatInfo(containerEl, firstEntries, dirPath);
+
+            // 后台分批追加剩余条目
+            if (entries.length > FIRST_BATCH) {
+                that._appendRemainingItems(containerEl, entries, dirPath, level, FIRST_BATCH);
+            }
+        }).catch(function(err) {
+            console.warn('[LocalBrowse] renderListChildren error:', err);
+            containerEl.innerHTML = '<div style="padding:8px 12px;font-size:12px;color:var(--b3-theme-secondary,#999)">无法读取</div>';
+            delete containerEl.dataset.loading;
+        });
+    }
+    _buildListItemsHtml(entries, dirPath, level) {
+        var that = this;
+        var html = '';
+        var indent = level * 18;
+        var isDockerBuildList = that._isDockerBrowser();
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            var fullPath = path.join(dirPath, entry.name);
+            var isDir = typeof entry.isDirectory === 'function' ? entry.isDirectory() : entry.isDir;
+            var icon = isDir ? '📁' : that.getFileIcon(entry.name);
+
+            var expander = isDir ?
+                '<span class="cd-list-expand" title="' + (isDockerBuildList ? 'Docker 环境不支持展开' : '展开/折叠') + '" style="cursor:' + (isDockerBuildList ? 'not-allowed' : 'pointer') + ';width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px;vertical-align:middle' + (isDockerBuildList ? ';opacity:0.35' : '') + '"><svg viewBox="0 0 32 32" style="width:10px;height:10px;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor;pointer-events:none"><path d="M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z"></path></svg></span>' :
+                '<span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px"></span>';
+
+            html += '<div class="cd-item ' + (isDir ? 'cd-dir' : 'cd-file') + '" ' +
+                'data-path="' + that.escapeHtml(fullPath) + '" ' +
+                'data-name="' + that.escapeHtml(entry.name) + '" ' +
+                'data-isdir="' + isDir + '" ' +
+                'data-has-children="false" ' +
+                'data-level="' + level + '" ' +
+                'draggable="true" ' +
+                'style="display:flex;align-items:center;padding:6px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f0f0f0);transition:background 0.15s;padding-left:' + (12 + indent) + 'px">' +
+                expander +
+                '<span style="font-size:15px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + '</span>' +
+                '<span class="cd-stat-size" style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right"></span>' +
+                '<span class="cd-stat-time" style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap"></span>' +
+            '</div>' +
+            '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="' + level + '" style="display:none"></div>';
+        }
+        return html;
+    }
+
+    /**
+     * 后台分批追加剩余列表项（每批 50 条）
+     * 每批渲染后触发 stat 补齐，用 requestAnimationFrame 让主线程喘口气
+     */
+    _appendRemainingItems(containerEl, entries, dirPath, level, startIndex) {
+        var that = this;
+        var BATCH = 50;
+
+        function appendBatch() {
+            // 容器已被卸载（用户折叠或导航走了）
+            if (!containerEl.parentNode) return;
+
+            var end = Math.min(startIndex + BATCH, entries.length);
+            var batchEntries = entries.slice(startIndex, end);
+            var html = that._buildListItemsHtml(batchEntries, dirPath, level);
+
+            // 追加到容器末尾
+            containerEl.insertAdjacentHTML('beforeend', html);
+
+            // 绑定新增条目的事件
+            that.bindItemEvents(containerEl, [], dirPath);
+
+            // 异步补这批条目的 stat
+            that._fillStatInfo(containerEl, batchEntries, dirPath);
+
+            startIndex = end;
+            if (startIndex < entries.length) {
+                // 让主线程休息一帧再追加下一批
+                requestAnimationFrame(appendBatch);
+            }
+        }
+
+        // 用 rAF 延迟启动，先让前 50 条的 DOM 渲染完
+        requestAnimationFrame(appendBatch);
+    }
+
+    /**
+     * 异步批量补齐 stat 信息（文件大小、修改时间）
+     * 每批最多 20 个并发，避免网盘环境下的 IO 风暴
+     */
+    _fillStatInfo(containerEl, entries, dirPath) {
+        var that = this;
+        if (!fs || !fs.stat) {
+            // API 模式：没有完整 stat 信息，尝试用 _fsStat 异步补齐
+            that._fillStatInfoAPI(containerEl, entries, dirPath);
+            return;
+        }
+        var BATCH = 20;
+        var index = 0;
+
+        function nextBatch() {
+            var tasks = [];
+            var batchEntries = [];
+            for (var i = 0; index < entries.length && i < BATCH; index++, i++) {
                 (function(entry) {
                     var fullPath = path.join(dirPath, entry.name);
-                    statTasks.push(new Promise(function(resolve) {
+                    batchEntries.push({ entry: entry, fullPath: fullPath });
+                    tasks.push(new Promise(function(resolve) {
                         fs.stat(fullPath, function(err, stat) {
                             resolve({ entry: entry, fullPath: fullPath, stat: err ? null : stat });
                         });
                     }));
-                })(entries[i]);
+                })(entries[index]);
             }
 
-            Promise.all(statTasks).then(function(results) {
-                var html = '';
-                var indent = level * 18; // 每层缩进 18px
+            if (tasks.length === 0) return;
+
+            Promise.all(tasks).then(function(results) {
                 for (var i = 0; i < results.length; i++) {
                     var r = results[i];
-                    var entry = r.entry;
-                    var fullPath = r.fullPath;
-                    var stat = r.stat;
-                    var isDir = entry.isDirectory();
-                    if (!isDir && !entry.isFile() && stat) {
-                        try { isDir = stat.isDirectory(); } catch(e) {}
-                    }
-                    var icon = isDir ? '📁' : that.getFileIcon(entry.name);
-                    var sizeStr = '';
-                    var timeStr = '';
-                    if (stat) {
-                        if (!isDir) sizeStr = that.formatSize(stat.size);
-                        if (stat.mtime) timeStr = that.formatTime(stat.mtime);
-                    }
+                    if (!r.stat) continue;
+                    if (!containerEl.parentNode) return;
 
-                    // 文件夹默认不显示箭头，异步检测有子项后再插入
-                    var expander = isDir ?
-                        '<span class="cd-list-expand-slot" style="width:16px;display:inline-block;flex-shrink:0"></span>' :
-                        '<span style="width:16px;display:inline-block;flex-shrink:0"></span>';
+                    var itemEl = containerEl.querySelector('.cd-item[data-path="' + CSS.escape(r.fullPath) + '"]');
+                    if (!itemEl) continue;
 
-                    html += '<div class="cd-item ' + (isDir ? 'cd-dir' : 'cd-file') + '" ' +
-                        'data-path="' + that.escapeHtml(fullPath) + '" ' +
-                        'data-name="' + that.escapeHtml(entry.name) + '" ' +
-                        'data-isdir="' + isDir + '" ' +
-                        'data-has-children="false" ' +
-                        'data-level="' + level + '" ' +
-                        'draggable="true" ' +
-                        'style="display:flex;align-items:center;padding:6px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f0f0f0);transition:background 0.15s;padding-left:' + (12 + indent) + 'px">' +
-                        expander +
-                        '<span style="font-size:15px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + '</span>' +
-                        (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
-                        (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
-                    '</div>' +
-                    '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="' + level + '" style="display:none"></div>';
+                    var isDir = typeof r.entry.isDirectory === 'function' ? r.entry.isDirectory() : r.entry.isDir;
+                    if (!isDir) {
+                        var sizeEl = itemEl.querySelector('.cd-stat-size');
+                        if (sizeEl) sizeEl.textContent = that.formatSize(r.stat.size);
+                    }
+                    if (r.stat.mtime) {
+                        var timeEl = itemEl.querySelector('.cd-stat-time');
+                        if (timeEl) timeEl.textContent = that.formatTime(r.stat.mtime);
+                    }
                 }
-
-                containerEl.innerHTML = html;
-                // 加载完成，清除 loading 标记
-                delete containerEl.dataset.loading;
-                // 绑定事件到 containerEl 自身，让子项的事件能冒泡到它
-                that.bindItemEvents(containerEl, [], dirPath);
-                // 异步检测有子项的文件夹并插入箭头
-                that.checkEmptyFolders(containerEl);
+                nextBatch();
             });
-        });
+        }
+
+        nextBatch();
+    }
+
+    /**
+     * API 模式下异步补齐 stat 信息（大小/时间）
+     * API 不返回文件大小，仅补时间
+     */
+    _fillStatInfoAPI(containerEl, entries, dirPath) {
+        var that = this;
+        for (var i = 0; i < entries.length; i++) {
+            var entry = entries[i];
+            if (!containerEl.parentNode) return;
+            var fullPath = path.join(dirPath, entry.name);
+            var itemEl = containerEl.querySelector('.cd-item[data-path="' + CSS.escape(fullPath) + '"]');
+            if (!itemEl) continue;
+            var isDir = typeof entry.isDirectory === 'function' ? entry.isDirectory() : entry.isDir;
+            if (!isDir && entry.size) {
+                var sizeEl = itemEl.querySelector('.cd-stat-size');
+                if (sizeEl) sizeEl.textContent = that.formatSize(entry.size);
+            }
+            if (entry.updated) {
+                var timeEl = itemEl.querySelector('.cd-stat-time');
+                if (timeEl) timeEl.textContent = that.formatTime(new Date(entry.updated * 1000));
+            }
+        }
     }
 
 
@@ -1744,7 +2256,7 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         var name = that.escapeHtml(f.name);
         var itemClass = f.isDir ? 'cd-dir' : 'cd-file';
-        var fullPath = f.path || ((currentPath.endsWith('\\') ? currentPath : currentPath + '\\') + f.name);
+        var fullPath = f.path || ((currentPath.endsWith(that._sep) ? currentPath : currentPath + that._sep) + f.name);
         var isImg = !f.isDir && that.isImageFile(f.name);
 
         var iconHtml;
@@ -1821,10 +2333,15 @@ class LocalBrowsePlugin extends Plugin {
                     // 获取当前层级
                     var currentLevel = parseInt(item.dataset.level || '0', 10);
 
-                    // 如果点击的是展开箭头（SVG 或其子元素），则展开/折叠
+                    // 如果点击的是展开箭头（wrapper 或其内部的 SVG/path），则展开/折叠
                     var isExpandClick = e.target.classList.contains('cd-list-expand') ||
-                        (e.target.parentElement && e.target.parentElement.classList.contains('cd-list-expand'));
+                        (e.target.parentElement && e.target.parentElement.classList.contains('cd-list-expand')) ||
+                        (e.target.parentElement && e.target.parentElement.parentElement && e.target.parentElement.parentElement.classList.contains('cd-list-expand'));
                     if (isExpandClick) {
+                        // Docker 浏览器模式下禁止展开子目录
+                        if (that._isDockerBrowser()) {
+                            return;
+                        }
                         if (childrenEl) {
                             if (childrenEl.style.display === 'none') {
                                 if (childrenEl.innerHTML === '') {
@@ -1834,13 +2351,13 @@ class LocalBrowsePlugin extends Plugin {
                                 } else {
                                     childrenEl.style.display = 'block';
                                 }
-                                expander.style.transform = 'rotate(90deg)';
+                                if (expander) expander.style.transform = 'rotate(90deg)';
                             } else if (childrenEl.dataset.loading === 'true') {
                                 // 正在加载中，忽略重复点击
                                 return;
                             } else {
                                 childrenEl.style.display = 'none';
-                                expander.style.transform = 'rotate(0deg)';
+                                if (expander) expander.style.transform = 'rotate(0deg)';
                             }
                         }
                         return;
@@ -2041,6 +2558,11 @@ class LocalBrowsePlugin extends Plugin {
      * 处理文件点击：插入本地文件链接
      */
     handleFileClick(filePath, fileName) {
+        // Docker 浏览器模式下 file:/// 链接无法打开，禁止插入
+        if (this._isDockerBrowser()) {
+            this.showToastMsg('Docker 浏览器环境下无法打开本地文件链接，已禁止插入');
+            return;
+        }
         // 直接插入本地文件链接
         this.insertLocalFileLink(filePath, fileName);
     }
@@ -2217,7 +2739,46 @@ class LocalBrowsePlugin extends Plugin {
         // 处理文件名冲突：先生成唯一文件名
         var finalName = that.resolveAssetName(fileName);
 
-        // 优先用思源 API 复制（更安全，不会触发数据保护）
+        // API 模式下用思源 putFile API：先读取文件内容，再写入 assets
+        if (that._fsMode() === 'api') {
+            that._fsReadFile(filePath).then(function(arrayBuffer) {
+                if (!arrayBuffer) {
+                    that.showToastMsg('❌ 无法读取文件: ' + fileName);
+                    return;
+                }
+                // 用 Blob + putFile 上传到 assets
+                var blob = new Blob([arrayBuffer]);
+                var formData = new FormData();
+                formData.append('path', 'data/assets/' + finalName);
+                formData.append('file', blob, finalName);
+                formData.append('isDir', 'false');
+                formData.append('modTime', String(Date.now()));
+
+                fetch('/api/file/putFile', {
+                    method: 'POST',
+                    credentials: 'include',
+                    body: formData
+                }).then(function(resp) {
+                    return resp.json();
+                }).then(function(data) {
+                    if (data.code === 0) {
+                        that.insertAssetToEditor('assets/' + finalName, fileName);
+                    } else {
+                        console.warn('[LocalBrowse] API putFile failed:', data.msg);
+                        that.showToastMsg('❌ 复制到 assets 失败: ' + data.msg);
+                    }
+                }).catch(function(e) {
+                    console.warn('[LocalBrowse] API putFile error:', e);
+                    that.showToastMsg('❌ 复制到 assets 失败');
+                });
+            }).catch(function(e) {
+                console.warn('[LocalBrowse] _fsReadFile error:', e);
+                that.showToastMsg('❌ 无法读取文件: ' + fileName);
+            });
+            return;
+        }
+
+        // Node.js 模式：优先用思源 API 复制（更安全，不会触发数据保护）
         fetch('/api/file/copyFile', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -2281,8 +2842,8 @@ class LocalBrowsePlugin extends Plugin {
         var assetsDir = dataDir.replace(/\\/g, '/') + '/assets';
         var destPath = assetsDir + '/' + uniqueName;
 
-        // 如果已存在（极罕见），再追加随机数
-        if (fs.existsSync(destPath)) {
+        // 如果已存在（极罕见），再追加随机数（仅 Node.js 模式可检查）
+        if (fs && fs.existsSync && fs.existsSync(destPath)) {
             uniqueName = timestamp + '-' + randomSuffix + '-' + Math.random().toString(36).substring(2, 6);
             if (ext) uniqueName += '.' + ext;
         }
@@ -2552,19 +3113,40 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         try {
-            var srcDrive = srcPath.charAt(0).toUpperCase();
-            var destDrive = targetDir.charAt(0).toUpperCase();
+            if (that.isWindows) {
+                // Windows: 检查盘符是否相同（rename 不能跨盘）
+                var srcDrive = srcPath.charAt(0).toUpperCase();
+                var destDrive = targetDir.charAt(0).toUpperCase();
 
-            if (srcDrive !== destDrive) {
-                if (isDir) {
-                    that.copyDirectorySync(srcPath, finalDestPath);
-                    that.removeDirectorySync(srcPath);
+                if (srcDrive !== destDrive) {
+                    if (isDir) {
+                        that.copyDirectorySync(srcPath, finalDestPath);
+                        that.removeDirectorySync(srcPath);
+                    } else {
+                        fs.copyFileSync(srcPath, finalDestPath);
+                        fs.unlinkSync(srcPath);
+                    }
                 } else {
-                    fs.copyFileSync(srcPath, finalDestPath);
-                    fs.unlinkSync(srcPath);
+                    fs.renameSync(srcPath, finalDestPath);
                 }
             } else {
-                fs.renameSync(srcPath, finalDestPath);
+                // macOS/Linux: 先尝试 rename，跨文件系统时回退到 copy+delete
+                try {
+                    fs.renameSync(srcPath, finalDestPath);
+                } catch(renameErr) {
+                    if (renameErr.code === 'EXDEV' || renameErr.code === 'EPERM') {
+                        // 跨文件系统：copy + delete
+                        if (isDir) {
+                            that.copyDirectorySync(srcPath, finalDestPath);
+                            that.removeDirectorySync(srcPath);
+                        } else {
+                            fs.copyFileSync(srcPath, finalDestPath);
+                            fs.unlinkSync(srcPath);
+                        }
+                    } else {
+                        throw renameErr;
+                    }
+                }
             }
 
             // 刷新当前目录
@@ -2624,22 +3206,42 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         try {
-            // 检查是否跨盘符（Windows 下 rename 不能跨盘）
-            var srcDrive = srcPath.charAt(0).toUpperCase();
-            var destDrive = targetDir.charAt(0).toUpperCase();
+            if (that.isWindows) {
+                // Windows: 检查是否跨盘符（rename 不能跨盘）
+                var srcDrive = srcPath.charAt(0).toUpperCase();
+                var destDrive = targetDir.charAt(0).toUpperCase();
 
-            if (srcDrive !== destDrive) {
-                // 跨盘符：先复制再删除
-                if (isDir) {
-                    that.copyDirectorySync(srcPath, finalDestPath);
-                    that.removeDirectorySync(srcPath);
+                if (srcDrive !== destDrive) {
+                    // 跨盘符：先复制再删除
+                    if (isDir) {
+                        that.copyDirectorySync(srcPath, finalDestPath);
+                        that.removeDirectorySync(srcPath);
+                    } else {
+                        fs.copyFileSync(srcPath, finalDestPath);
+                        fs.unlinkSync(srcPath);
+                    }
                 } else {
-                    fs.copyFileSync(srcPath, finalDestPath);
-                    fs.unlinkSync(srcPath);
+                    // 同盘符：直接 rename
+                    fs.renameSync(srcPath, finalDestPath);
                 }
             } else {
-                // 同盘符：直接 rename
-                fs.renameSync(srcPath, finalDestPath);
+                // macOS/Linux: 先尝试 rename，跨文件系统时回退到 copy+delete
+                try {
+                    fs.renameSync(srcPath, finalDestPath);
+                } catch(renameErr) {
+                    if (renameErr.code === 'EXDEV' || renameErr.code === 'EPERM') {
+                        // 跨文件系统：copy + delete
+                        if (isDir) {
+                            that.copyDirectorySync(srcPath, finalDestPath);
+                            that.removeDirectorySync(srcPath);
+                        } else {
+                            fs.copyFileSync(srcPath, finalDestPath);
+                            fs.unlinkSync(srcPath);
+                        }
+                    } else {
+                        throw renameErr;
+                    }
+                }
             }
 
             // 粘贴成功，无提示
@@ -2809,6 +3411,7 @@ class LocalBrowsePlugin extends Plugin {
         // 先关闭可能已打开的菜单
         that.hideContextMenu();
 
+        var isDocker = that._isDockerBrowser();
         var items = [];
         if (isDir) {
             items.push({ icon: '📂', label: '打开', action: function() { that.loadDirectory(filePath); } });
@@ -2819,27 +3422,27 @@ class LocalBrowsePlugin extends Plugin {
                 items.push({ icon: '⭐', label: '添加到收藏', action: function() { that.addFavorite(filePath, fileName); } });
             }
             items.push({ type: 'divider' });
-            items.push({ icon: '🔗', label: '添加到文档', action: function() { that.insertLocalFileLink(filePath, fileName, true); } });
+            items.push({ icon: '🔗', label: '添加到文档', action: isDocker ? null : function() { that.insertLocalFileLink(filePath, fileName, true); }, disabled: isDocker });
             items.push({ type: 'divider' });
-            items.push({ icon: '✂️', label: '剪切', action: function() { that.cutFile(filePath, fileName, isDir); } });
+            items.push({ icon: '✂️', label: '剪切', action: isDocker ? null : function() { that.cutFile(filePath, fileName, isDir); }, disabled: isDocker });
             // 如果有剪切内容，显示粘贴选项
             if (that._clipboardCut) {
                 items.push({ type: 'divider' });
-                items.push({ icon: '📋', label: '粘贴「' + that._clipboardCut.name + '」', action: function() { that.pasteFile(filePath); } });
+                items.push({ icon: '📋', label: '粘贴「' + that._clipboardCut.name + '」', action: isDocker ? null : function() { that.pasteFile(filePath); }, disabled: isDocker });
             }
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         } else {
-            items.push({ icon: '📂', label: '打开文件', action: function() { that.openFile(filePath); } });
-            items.push({ icon: '📁', label: '打开所在文件夹', action: function() { that.openContainingFolder(filePath); } });
+            items.push({ icon: '📂', label: '打开文件', action: isDocker ? null : function() { that.openFile(filePath); }, disabled: isDocker });
+            items.push({ icon: '📁', label: '打开所在文件夹', action: isDocker ? null : function() { that.openContainingFolder(filePath); }, disabled: isDocker });
             items.push({ type: 'divider' });
-            items.push({ icon: '📋', label: '复制路径', action: function() { that.copyFilePath(filePath); } });
-            items.push({ icon: '🔗', label: '复制 Markdown 链接', action: function() { that.copyMarkdownLink(filePath, fileName); } });
+            items.push({ icon: '📋', label: '复制路径', action: isDocker ? null : function() { that.copyFilePath(filePath); }, disabled: isDocker });
+            items.push({ icon: '🔗', label: '复制 Markdown 链接', action: isDocker ? null : function() { that.copyMarkdownLink(filePath, fileName); }, disabled: isDocker });
             items.push({ type: 'divider' });
-            items.push({ icon: '📎', label: '插入本地链接', action: function() { that.handleFileClick(filePath, fileName); } });
+            items.push({ icon: '📎', label: '插入本地链接', action: isDocker ? null : function() { that.handleFileClick(filePath, fileName); }, disabled: isDocker });
             items.push({ icon: '📦', label: '插入本地文件', action: function() { that.copyFileToAssets(filePath, fileName); } });
             items.push({ type: 'divider' });
-            items.push({ icon: '✂️', label: '剪切', action: function() { that.cutFile(filePath, fileName, isDir); } });
+            items.push({ icon: '✂️', label: '剪切', action: isDocker ? null : function() { that.cutFile(filePath, fileName, isDir); }, disabled: isDocker });
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         }
@@ -2850,7 +3453,8 @@ class LocalBrowsePlugin extends Plugin {
             if (item.type === 'divider') {
                 html += '<div style="height:1px;background:var(--b3-border,#eee);margin:4px 0"></div>';
             } else {
-                html += '<div class="cd-menu-item" data-idx="' + i + '" style="padding:6px 14px;cursor:pointer;white-space:nowrap;transition:background 0.1s;display:flex;align-items:center;gap:8px">' +
+                var disabledStyle = item.disabled ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;';
+                html += '<div class="cd-menu-item' + (item.disabled ? ' cd-menu-item-disabled' : '') + '" data-idx="' + i + '" style="padding:6px 14px;white-space:nowrap;transition:background 0.1s;display:flex;align-items:center;gap:8px;' + disabledStyle + '">' +
                     '<span style="font-size:14px;width:18px;text-align:center;flex-shrink:0">' + item.icon + '</span>' +
                     '<span style="flex:1">' + item.label + '</span>' +
                 '</div>';
@@ -2861,6 +3465,8 @@ class LocalBrowsePlugin extends Plugin {
         // 绑定菜单项点击（通过 data-idx 获取 items 数组中的真实位置）
         var menuItems = menuEl.querySelectorAll('.cd-menu-item');
         for (var j = 0; j < menuItems.length; j++) {
+            // disabled 项不绑定点击和悬停
+            if (menuItems[j].classList.contains('cd-menu-item-disabled')) continue;
             menuItems[j].addEventListener('click', function(e) {
                 e.stopPropagation();
                 that.hideContextMenu();
@@ -2953,9 +3559,10 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 用系统默认程序打开文件
+     * 用系统默认程序打开文件（跨平台：Electron > cmd/open/xdg-open）
      */
     openFile(filePath) {
+        var that = this;
         try {
             var electron = window.require && window.require('electron');
             if (electron && electron.shell && electron.shell.openPath) {
@@ -2963,28 +3570,43 @@ class LocalBrowsePlugin extends Plugin {
                 return;
             }
         } catch (e) {}
-        // 降级：使用 spawn 避免 shell 注入（cp.exec 拼接字符串有命令注入风险）
         try {
             var cp = require('child_process');
-            cp.spawn('cmd', ['/c', 'start', '""', filePath], { stdio: 'ignore', detached: true }).unref();
+            if (that.isWindows) {
+                cp.spawn('cmd', ['/c', 'start', '""', filePath], { stdio: 'ignore', detached: true }).unref();
+            } else if (that.platform === 'darwin') {
+                cp.spawn('open', [filePath], { stdio: 'ignore', detached: true }).unref();
+            } else {
+                cp.spawn('xdg-open', [filePath], { stdio: 'ignore', detached: true }).unref();
+            }
         } catch (e) {
             this.showToastMsg('无法打开文件，请手动访问：' + filePath);
         }
     }
 
     /**
-     * 打开文件所在文件夹
-     * Windows 上直接用 explorer /select 确保窗口在前台
-     * 避免 electron.shell.showItemInFolder 后台打开的已知问题
+     * 打开文件所在文件夹（跨平台）
+     * Windows: explorer /select
+     * macOS: open -R（在 Finder 中显示并选中）
+     * Linux: xdg-open 目录
      */
     openContainingFolder(filePath) {
+        var that = this;
         try {
             var cp = require('child_process');
-            // Windows: explorer /select 直接打开并选中文件，窗口自动在前台
-            cp.spawn('explorer', ['/select,', filePath], {
-                stdio: 'ignore',
-                detached: true
-            }).unref();
+            if (that.isWindows) {
+                cp.spawn('explorer', ['/select,', filePath], {
+                    stdio: 'ignore',
+                    detached: true
+                }).unref();
+            } else if (that.platform === 'darwin') {
+                // macOS: 在 Finder 中显示并选中文件
+                cp.spawn('open', ['-R', filePath], { stdio: 'ignore', detached: true }).unref();
+            } else {
+                // Linux: 打开文件所在目录
+                var dir = filePath.substring(0, Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\')));
+                cp.spawn('xdg-open', [dir || '/'], { stdio: 'ignore', detached: true }).unref();
+            }
             return;
         } catch (e) {
             this.showToastMsg('无法打开文件夹，请手动访问');
@@ -3164,7 +3786,9 @@ class LocalBrowsePlugin extends Plugin {
      * 将本地路径转换为 file:/// URL
      */
     toFileUrl(filePath) {
-        var normalizedPath = filePath.replace(/\\/g, '/');
+        // Docker 路径映射：容器路径 → 宿主机路径
+        var mappedPath = this.containerToHost(filePath);
+        var normalizedPath = mappedPath.replace(/\\/g, '/').replace(/\/+/g, '/');
         if (normalizedPath.startsWith('file:///')) {
             return normalizedPath;
         } else if (normalizedPath.startsWith('file://')) {
@@ -3194,24 +3818,6 @@ class LocalBrowsePlugin extends Plugin {
         return !!videoExts[ext];
     }
 
-    /**
-     * 获取文件类型图标（用于非图片/视频文件的链接前缀）
-     */
-    getFileIcon(fileName) {
-        var ext = fileName.split('.').pop().toLowerCase();
-        var iconMap = {
-            'pdf': '📄',
-            'doc': '📝','docx': '📝',
-            'xls': '📊','xlsx': '📊',
-            'ppt': '📊','pptx': '📊',
-            'txt': '📃',
-            'zip': '📦','rar': '📦','7z': '📦',
-            'mp3': '🎵','wav': '🎵','flac': '🎵','aac': '🎵',
-            'epub': '📖',
-            'md': '📝'
-        };
-        return iconMap[ext] || '📎';
-    }
 
     /**
      * 显示图片悬浮预览
@@ -3521,7 +4127,23 @@ class LocalBrowsePlugin extends Plugin {
             if (typeof this.loadData === 'function') {
                 this.loadData('driveSettings').then(function(data) {
                     if (data && typeof data === 'object' && data.driveLetter) {
-                        that.driveLetter = data.driveLetter;
+                        // 校验盘符在当前设备上是否存在（防止跨设备同步来的无效盘符）
+                        var dl = data.driveLetter;
+                        var isValid = false;
+                        if (that.isWindows) {
+                            // Windows: 盘符字母，校验盘符是否存在
+                            if (fs && fs.existsSync) {
+                                isValid = fs.existsSync(dl + ':\\');
+                            }
+                        } else {
+                            // macOS/Linux: 完整路径，校验路径是否存在
+                            if (fs && fs.existsSync) {
+                                isValid = fs.existsSync(dl);
+                            }
+                        }
+                        if (isValid) {
+                            that.driveLetter = dl;
+                        }
                     }
                 }).catch(function() {
                     // 忽略加载失败
@@ -3530,7 +4152,23 @@ class LocalBrowsePlugin extends Plugin {
                 var saved = localStorage.getItem('cd_drive_settings');
                 if (saved) {
                     var parsed = JSON.parse(saved);
-                    if (parsed.driveLetter) that.driveLetter = parsed.driveLetter;
+                    if (parsed.driveLetter) {
+                        // localStorage 降级也需要校验盘符是否存在（硬件变更等情况）
+                        var dl = parsed.driveLetter;
+                        var isValid = false;
+                        if (this.isWindows) {
+                            if (fs && fs.existsSync) {
+                                isValid = fs.existsSync(dl + ':\\');
+                            }
+                        } else {
+                            if (fs && fs.existsSync) {
+                                isValid = fs.existsSync(dl);
+                            }
+                        }
+                        if (isValid) {
+                            this.driveLetter = dl;
+                        }
+                    }
                 }
             }
         } catch (e) {
@@ -3558,7 +4196,9 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 从 data.json 加载路径设置
+     * 从 data.json 加载路径设置（按设备主机名隔离）
+     * 新格式: { win32: { "DESKTOP-ABC": "D:\\path", "LAPTOP-XYZ": "E:\\path" }, darwin: { ... } }
+     * 旧格式兼容: { currentPath: "D:\\path" } → 自动迁移为新格式
      */
     loadPathSettings() {
         var that = this;
@@ -3566,14 +4206,60 @@ class LocalBrowsePlugin extends Plugin {
             if (typeof this.loadData === 'function') {
                 this.loadData('pathSettings').then(function(data) {
                     if (data && typeof data === 'object') {
-                    if (data.currentPath) {
-                        that.currentPath = data.currentPath;
-                        var driveMatch = data.currentPath.match(/^([A-Za-z]):/);
-                        if (driveMatch) {
-                            that.driveLetter = driveMatch[1].toUpperCase();
+                        var loadedPath = '';
+                        // 旧格式兼容：{ currentPath: "D:\\xxx" }
+                        // currentPath 可能是任意一台设备保存的路径，需要验证后才迁移到当前设备名下
+                        if (data.currentPath) {
+                            var legacyPath = data.currentPath;
+                            // 校验路径是否适合当前平台
+                            var legacyValid = that.isWindows ? /^[A-Za-z]:/.test(legacyPath) : legacyPath.charAt(0) === '/';
+                            if (legacyValid && fs && fs.existsSync && fs.existsSync(legacyPath)) {
+                                // 路径在当前设备上存在，迁移到当前设备名下
+                                var deviceId = that._getDeviceId();
+                                if (!data[that.platform]) data[that.platform] = {};
+                                data[that.platform][deviceId] = legacyPath;
+                                loadedPath = legacyPath;
+                            }
+                            // 无论是否迁移成功，都删除旧格式
+                            delete data.currentPath;
+                            that.saveData('pathSettings', data).catch(function() {});
+                        }
+                        // 新格式：{ win32: { "DESKTOP-ABC": "D:\\xxx" } }
+                        else if (data[that.platform]) {
+                            var deviceId = that._getDeviceId();
+                            var platformPaths = data[that.platform];
+                            if (platformPaths && typeof platformPaths === 'object' && platformPaths[deviceId]) {
+                                loadedPath = platformPaths[deviceId];
+                            }
+                        }
+                        if (loadedPath) {
+                            // 校验路径是否适合当前平台（防止跨平台路径污染）
+                            var isValidForPlatform = false;
+                            if (that.isWindows) {
+                                isValidForPlatform = /^[A-Za-z]:/.test(loadedPath);
+                            } else {
+                                isValidForPlatform = loadedPath.charAt(0) === '/';
+                            }
+                            if (isValidForPlatform) {
+                                // 进一步校验路径是否在当前设备上实际存在（防止跨设备路径污染）
+                                if (fs && fs.existsSync && fs.existsSync(loadedPath)) {
+                                    that.currentPath = loadedPath;
+                                    that._syncDriveLetterFromPath(loadedPath);
+                                } else {
+                                    console.log('[LocalBrowse] 路径在当前设备不存在，忽略:', loadedPath);
+                                    // 清除当前设备的无效路径记录
+                                    var _deviceId = that._getDeviceId();
+                                    var _platformPaths = data[that.platform];
+                                    if (_platformPaths && typeof _platformPaths === 'object' && _platformPaths[_deviceId]) {
+                                        delete _platformPaths[_deviceId];
+                                        that.saveData('pathSettings', data).catch(function() {});
+                                    }
+                                }
+                            } else {
+                                console.log('[LocalBrowse] 忽略跨平台路径:', loadedPath);
+                            }
                         }
                     }
-                }
                 }).catch(function() {
                     // 忽略加载失败
                 });
@@ -3582,10 +4268,18 @@ class LocalBrowsePlugin extends Plugin {
                 if (saved) {
                     var parsed = JSON.parse(saved);
                     if (parsed.currentPath) {
-                        that.currentPath = parsed.currentPath;
-                        var driveMatch = parsed.currentPath.match(/^([A-Za-z]):/);
-                        if (driveMatch) {
-                            that.driveLetter = driveMatch[1].toUpperCase();
+                        var localPath = parsed.currentPath;
+                        var isValidLocal = false;
+                        if (that.isWindows) {
+                            isValidLocal = /^[A-Za-z]:/.test(localPath);
+                        } else {
+                            isValidLocal = localPath.charAt(0) === '/';
+                        }
+                        if (isValidLocal) {
+                            if (fs && fs.existsSync && fs.existsSync(localPath)) {
+                                that.currentPath = localPath;
+                                that._syncDriveLetterFromPath(localPath);
+                            }
                         }
                     }
                 }
@@ -3596,21 +4290,1160 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 保存路径设置到 data.json
+     * 保存路径设置到 data.json（按设备主机名隔离）
+     * 先读取现有数据（保留其他设备的路径），再写入当前设备的路径
      */
     savePathSettings() {
         var that = this;
         try {
-            var data = { currentPath: this.currentPath };
             if (typeof this.saveData === 'function') {
-                this.saveData('pathSettings', data).catch(function(e) {
-                    console.error('[LocalBrowse] save path settings failed:', e);
+                // 先读取现有数据，避免覆盖其他设备的路径
+                this.loadData('pathSettings').then(function(existing) {
+                    var data = (existing && typeof existing === 'object') ? existing : {};
+                    // 清理旧格式残留
+                    if (data.currentPath) delete data.currentPath;
+                    // 按平台+设备写入
+                    if (!data[that.platform]) data[that.platform] = {};
+                    data[that.platform][that._getDeviceId()] = that.currentPath;
+                    that.saveData('pathSettings', data).catch(function(e) {
+                        console.error('[LocalBrowse] save path settings failed:', e);
+                    });
+                }).catch(function() {
+                    // 读取失败时，用仅含当前设备的数据写入
+                    var data = {};
+                    data[that.platform] = {};
+                    data[that.platform][that._getDeviceId()] = that.currentPath;
+                    that.saveData('pathSettings', data).catch(function(e) {
+                        console.error('[LocalBrowse] save path settings failed:', e);
+                    });
                 });
             } else {
+                // localStorage 降级：仍用旧格式（仅当前设备可用，不跨端）
+                var data = { currentPath: that.currentPath };
                 localStorage.setItem('cd_path_settings', JSON.stringify(data));
             }
         } catch (e) {
             console.error('[LocalBrowse] save path settings error:', e);
+        }
+    }
+
+    /**
+     * 加载路径映射配置
+     */
+    loadPathMap() {
+        var that = this;
+        try {
+            var saved = localStorage.getItem('cd_path_map');
+            if (saved) {
+                var parsed = JSON.parse(saved);
+                if (parsed && parsed.container && parsed.host) {
+                    that.pathMap = parsed;
+                }
+            }
+        } catch (e) {
+            // 忽略错误
+        }
+    }
+
+    /**
+     * 保存路径映射配置
+     */
+    savePathMap() {
+        try {
+            if (this.pathMap) {
+                localStorage.setItem('cd_path_map', JSON.stringify(this.pathMap));
+            } else {
+                localStorage.removeItem('cd_path_map');
+            }
+        } catch (e) {
+            console.error('[LocalBrowse] save path map error:', e);
+        }
+    }
+
+    // ========== 跨端同步文件夹：多设备支持辅助方法 ==========
+
+    /**
+     * 检测当前运行平台
+     * 1. 桌面版：使用 Node.js os 模块
+     * 2. Docker/浏览器版：从 window.siyuan.config.system 读取后端平台
+     *    尝试 OS/os/platform 字段，或从 Container/dataDir 推断
+     * 3. 兜底：默认 win32
+     */
+    _detectPlatform() {
+        // 1. 桌面版：Node.js os 模块
+        if (os && os.platform) {
+            return os.platform();
+        }
+        // 2. Docker/浏览器版：多字段尝试 + 推断
+        try {
+            var sys = window.siyuan && window.siyuan.config && window.siyuan.config.system;
+            if (sys) {
+                // 2a. 直接读取 OS 字段（多种可能命名）
+                var osName = (sys.OS || sys.os || sys.platform || sys.Platform || '');
+                if (osName) {
+                    osName = String(osName).toLowerCase();
+                    console.log('[LocalBrowse] _detectPlatform OS field:', osName);
+                    if (osName === 'windows') return 'win32';
+                    if (osName === 'darwin') return 'darwin';
+                    if (osName === 'linux') return 'linux';
+                }
+                // 2b. 从 Container 字段推断
+                var container = (sys.Container || sys.container || '');
+                if (container) {
+                    console.log('[LocalBrowse] _detectPlatform Container:', container);
+                    if (container === 'docker' || container === 'android' || container === 'harmony') {
+                        return 'linux';
+                    }
+                    if (container === 'ios') return 'darwin';
+                }
+                // 2c. 从 DataDir 路径格式推断
+                var dataDir = (sys.DataDir || sys.dataDir || '');
+                if (dataDir) {
+                    console.log('[LocalBrowse] _detectPlatform DataDir:', dataDir);
+                    if (/^[A-Za-z]:/.test(dataDir)) return 'win32';
+                    if (dataDir.indexOf('/home/') === 0 || dataDir.indexOf('/mnt/') === 0 || dataDir.indexOf('/media/') === 0) return 'linux';
+                    if (dataDir.indexOf('/Users/') === 0 || dataDir.indexOf('/Volumes/') === 0) return 'darwin';
+                    if (dataDir.charAt(0) === '/') return 'linux'; // Unix 类兜底
+                }
+            } else {
+                console.log('[LocalBrowse] _detectPlatform: window.siyuan.config.system not available');
+            }
+        } catch (e) {
+            console.log('[LocalBrowse] _detectPlatform error:', e);
+        }
+        // 3. 兜底默认
+        console.log('[LocalBrowse] _detectPlatform fallback to win32');
+        return 'win32';
+    }
+
+    /**
+     * 修正平台检测（Docker/浏览器版专用）
+     * 构造函数执行时 window.siyuan.config.system 可能未就绪，
+     * 导致平台被错误检测为 win32。在 Dock 面板渲染时调用此方法修正。
+     */
+    _correctPlatformIfNeeded() {
+        // 桌面版 os 模块可用，不需要修正
+        if (os && os.platform) return;
+
+        var detected = this._detectPlatform();
+        if (detected !== this.platform) {
+            console.log('[LocalBrowse] platform corrected in renderFileTree:', this.platform, '→', detected);
+            this.platform = detected;
+            this.isWindows = (this.platform === 'win32');
+            this.platformIcon = this.platform === 'darwin' ? '🍎' : (this.platform === 'linux' ? '🐧' : '🪟');
+            this.platformName = this.platform === 'darwin' ? 'macOS' : (this.platform === 'linux' ? 'Linux' : 'Windows');
+            this.driveLetter = this.isWindows ? 'C' : '/';
+            this._sep = (path && path.sep) || (this.isWindows ? '\\' : '/');
+        }
+    }
+
+    /**
+     * 获取当前设备标识（主机名，不随思源同步）
+     * 用于区分同一平台的多台设备（如两台 Windows 电脑）
+     */
+    _getDeviceId() {
+        if (!this._deviceId) {
+            // 1. 桌面版：Node.js os 模块
+            if (os && os.hostname) {
+                this._deviceId = os.hostname();
+            }
+            // 2. Docker/浏览器版：思源 config.system.Name/ID/id
+            else {
+                try {
+                    var sys = window.siyuan && window.siyuan.config && window.siyuan.config.system;
+                    if (sys) {
+                        this._deviceId = sys.Name || sys.name || sys.ID || sys.id || sys.deviceId || '';
+                        if (this._deviceId) {
+                            console.log('[LocalBrowse] _getDeviceId from config:', this._deviceId);
+                        }
+                    }
+                } catch (e) {}
+            }
+            // 3. 兜底
+            if (!this._deviceId) {
+                this._deviceId = 'unknown';
+                console.log('[LocalBrowse] _getDeviceId fallback to unknown');
+            }
+        }
+        return this._deviceId;
+    }
+
+    // ========== fs/API 双模式封装（Docker/鸿蒙版支持） ==========
+
+    /**
+     * 异步读取目录内容
+     * 桌面版：fs.readdirSync（同步包装为 Promise）
+     * Docker/鸿蒙版：/api/file/readDir
+     * @param {string} dirPath 目录路径
+     * @returns {Promise<Array<{name:string, isDir:boolean, isSymlink:boolean, updated:number}>>}
+     */
+    _fsReaddir(dirPath) {
+        var that = this;
+        return new Promise(function(resolve, reject) {
+            if (fs && fs.readdirSync) {
+                try {
+                    var entries = fs.readdirSync(dirPath, { withFileTypes: true });
+                    var result = entries.map(function(e) {
+                        return {
+                            name: e.name,
+                            isDir: e.isDirectory(),
+                            isSymlink: e.isSymbolicLink && e.isSymbolicLink(),
+                            updated: 0
+                        };
+                    });
+                    resolve(result);
+                } catch (err) {
+                    reject(err);
+                }
+            } else {
+                fetch('/api/file/readDir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: dirPath }),
+                    credentials: 'include'
+                }).then(function(resp) { return resp.json(); }).then(function(data) {
+                    if (data.code === 0 && Array.isArray(data.data)) {
+                        resolve(data.data);
+                    } else {
+                        reject(new Error(data.msg || 'API readDir failed'));
+                    }
+                }).catch(reject);
+            }
+        });
+    }
+
+    /**
+     * 异步判断路径是否存在
+     * 桌面版：fs.existsSync
+     * Docker/鸿蒙版：尝试 readDir（目录）或 getFile（文件），根据返回判断
+     * @param {string} filePath 文件/目录路径
+     * @param {boolean} [isDirHint] 提示是否为目录（优化 API 调用）
+     * @returns {Promise<boolean>}
+     */
+    _fsExists(filePath, isDirHint) {
+        return new Promise(function(resolve, reject) {
+            if (fs && fs.existsSync) {
+                resolve(fs.existsSync(filePath));
+            } else {
+                // 尝试 readDir（如果是目录会成功，如果不是会失败）
+                fetch('/api/file/readDir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: filePath }),
+                    credentials: 'include'
+                }).then(function(resp) { return resp.json(); }).then(function(data) {
+                    if (data.code === 0) {
+                        resolve(true);  // 目录存在
+                    } else {
+                        // readDir 失败，可能是文件而非目录，也可能是真的不存在
+                        // 尝试 getFile 检查文件
+                        fetch('/api/file/getFile', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ path: filePath }),
+                            credentials: 'include'
+                        }).then(function(resp) {
+                            resolve(resp.ok && resp.status === 200);
+                        }).catch(function() {
+                            resolve(false);
+                        });
+                    }
+                }).catch(function() {
+                    resolve(false);
+                });
+            }
+        });
+    }
+
+    /**
+     * 异步获取文件/目录信息
+     * 桌面版：fs.statSync
+     * Docker/鸿蒙版：用 readDir 列出父目录，匹配文件名获取信息
+     * 注意：API 版没有完整 stat 信息（没有 size），只有 isDir/isSymlink/updated
+     * @param {string} filePath 文件/目录路径
+     * @returns {Promise<{isDirectory:boolean, isFile:boolean, size:number, mtime:Date, isSymlink:boolean}>}
+     */
+    _fsStat(filePath) {
+        var that = this;
+        return new Promise(function(resolve, reject) {
+            if (fs && fs.statSync) {
+                try {
+                    var st = fs.statSync(filePath);
+                    resolve({
+                        isDirectory: function() { return st.isDirectory(); },
+                        isFile: function() { return st.isFile(); },
+                        size: st.size,
+                        mtime: st.mtime,
+                        isSymlink: function() { return st.isSymbolicLink && st.isSymbolicLink(); }
+                    });
+                } catch (err) {
+                    reject(err);
+                }
+            } else {
+                // API 版：列出父目录，匹配文件名
+                var sep = that._sep || '/';
+                var parentDir = filePath.substring(0, filePath.lastIndexOf(sep)) || sep;
+                var fileName = filePath.substring(filePath.lastIndexOf(sep) + 1);
+                fetch('/api/file/readDir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: parentDir }),
+                    credentials: 'include'
+                }).then(function(resp) { return resp.json(); }).then(function(data) {
+                    if (data.code === 0 && Array.isArray(data.data)) {
+                        var entry = data.data.find(function(e) { return e.name === fileName; });
+                        if (entry) {
+                            resolve({
+                                isDirectory: function() { return entry.isDir; },
+                                isFile: function() { return !entry.isDir; },
+                                size: 0,  // API 不返回 size
+                                mtime: entry.updated ? new Date(entry.updated * 1000) : new Date(),
+                                isSymlink: function() { return entry.isSymlink; }
+                            });
+                        } else {
+                            reject(new Error('File not found: ' + fileName));
+                        }
+                    } else {
+                        reject(new Error(data.msg || 'API readDir failed'));
+                    }
+                }).catch(reject);
+            }
+        });
+    }
+
+    /**
+     * 异步读取文件内容（二进制）
+     * 桌面版：fs.readFileSync
+     * Docker/鸿蒙版：/api/file/getFile
+     * @param {string} filePath 文件路径
+     * @param {string} [encoding] 编码（如 'utf-8'）
+     * @returns {Promise<Buffer|string>}
+     */
+    _fsReadFile(filePath, encoding) {
+        return new Promise(function(resolve, reject) {
+            if (fs && fs.readFileSync) {
+                try {
+                    resolve(fs.readFileSync(filePath, encoding || null));
+                } catch (err) {
+                    reject(err);
+                }
+            } else {
+                fetch('/api/file/getFile', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: filePath }),
+                    credentials: 'include'
+                }).then(function(resp) {
+                    if (resp.status === 200) {
+                        if (encoding) {
+                            resp.text().then(resolve).catch(reject);
+                        } else {
+                            // 浏览器环境直接返回 ArrayBuffer，不使用 Buffer
+                            resp.arrayBuffer().then(resolve).catch(reject);
+                        }
+                    } else {
+                        reject(new Error('getFile failed: ' + resp.status));
+                    }
+                }).catch(reject);
+            }
+        });
+    }
+
+    /**
+     * 获取当前文件系统模式
+     * @returns {string} 'node' 或 'api'
+     */
+    _fsMode() {
+        return (fs && fs.readdirSync) ? 'node' : 'api';
+    }
+
+    /**
+     * 判断是否为 Docker 浏览器模式
+     * Docker 浏览器模式下：
+     * - file:/// 链接被浏览器安全策略拦截，无法打开
+     * - 插入链接和链接修复都无意义，应跳过
+     * 鸿蒙 PC 虽然也是 API 模式，但作为原生应用可以打开 file:/// 链接
+     * @returns {boolean}
+     */
+    _isDockerBrowser() {
+        if (this._fsMode() !== 'api') return false;
+        try {
+            var sys = window.siyuan && window.siyuan.config && window.siyuan.config.system;
+            if (sys) {
+                var container = String(sys.Container || sys.container || '').toLowerCase();
+                // Docker 容器环境，浏览器无法打开 file:/// 链接
+                if (container === 'docker') return true;
+            }
+        } catch (e) { /* ignore */ }
+        // API 模式但非 Docker（鸿蒙 PC 等）：不是浏览器，可以打开链接
+        return false;
+    }
+
+    /**
+     * API 模式下扫描 Linux 挂载点（/mnt/ /media/ 等）
+     * 用于 Docker/鸿蒙版 detectDrives 的 fallback
+     */
+    _apiScanLinuxMounts(callback) {
+        var that = this;
+        var mountDrives = [];
+        var pending = 0;
+
+        function checkDone() {
+            if (pending <= 0) {
+                callback(mountDrives);
+            }
+        }
+
+        // 扫描 /mnt/
+        pending++;
+        that._fsReaddir('/mnt/').then(function(entries) {
+            for (var i = 0; i < entries.length; i++) {
+                var e = entries[i];
+                var isDir = typeof e.isDirectory === 'function' ? e.isDirectory() : e.isDir;
+                if (e.name.charAt(0) !== '.' && isDir) {
+                    mountDrives.push({value: '/mnt/' + e.name, label: '📁 ' + e.name, isDefault: false});
+                }
+            }
+        }).catch(function() {}).finally(function() {
+            pending--;
+            // 扫描 /media/
+            pending++;
+            that._fsReaddir('/media/').then(function(entries) {
+                var subPromises = [];
+                for (var i = 0; i < entries.length; i++) {
+                    var e = entries[i];
+                    var isDir = typeof e.isDirectory === 'function' ? e.isDirectory() : e.isDir;
+                    if (e.name.charAt(0) !== '.' && isDir) {
+                        mountDrives.push({value: '/media/' + e.name, label: '📁 ' + e.name, isDefault: false});
+                        // 扫描用户子目录
+                        (function(userPath) {
+                            pending++;
+                            that._fsReaddir(userPath).then(function(subs) {
+                                for (var j = 0; j < subs.length; j++) {
+                                    var s = subs[j];
+                                    var sIsDir = typeof s.isDirectory === 'function' ? s.isDirectory() : s.isDir;
+                                    if (s.name.charAt(0) !== '.' && sIsDir) {
+                                        mountDrives.push({value: userPath + '/' + s.name, label: '🔌 ' + s.name, isDefault: false});
+                                    }
+                                }
+                            }).catch(function() {}).finally(function() { pending--; checkDone(); });
+                        })('/media/' + e.name);
+                    }
+                }
+            }).catch(function() {}).finally(function() { pending--; checkDone(); });
+        });
+    }
+
+    /**
+     * 获取当前设备在本平台配置的同步文件夹路径
+     * 新格式: syncRoots[platform] = { "DESKTOP-ABC": "D:\\path", "LAPTOP-XYZ": "E:\\path" }
+     * 旧格式兼容: syncRoots[platform] = "D:\\path" (字符串)
+     */
+    _getMySyncRoot() {
+        var platformRoots = this.syncRoots[this.platform];
+        if (!platformRoots) return '';
+        if (typeof platformRoots === 'string') return platformRoots;  // 旧格式兼容
+        var deviceId = this._getDeviceId();
+        var result = platformRoots[deviceId] || '';
+        if (result) return result;
+
+        // Fallback: deviceId 可能变更（如首次加载时为 'unknown'，后续变为真实主机名）
+        // 在当前平台下查找其他 deviceId 的条目，如果只有一条且路径存在，则自动迁移
+        var keys = Object.keys(platformRoots);
+        if (keys.length === 1 && keys[0] !== deviceId && keys[0] !== '_legacy') {
+            var candidate = platformRoots[keys[0]];
+            if (candidate && typeof candidate === 'string') {
+                // 规范化路径：去除连续斜杠
+                var normalizedCandidate = candidate;
+                if (!this.isWindows) {
+                    normalizedCandidate = normalizedCandidate.replace(/\/+/g, '/');
+                } else {
+                    normalizedCandidate = normalizedCandidate.replace(/\\+/g, '\\');
+                }
+                var pathExists = false;
+                if (fs && fs.existsSync) {
+                    try { pathExists = fs.existsSync(normalizedCandidate); } catch(e) {}
+                }
+                if (pathExists) {
+                    console.log('[LocalBrowse] _getMySyncRoot: deviceId mismatch detected, migrating from "' + keys[0] + '" to "' + deviceId + '"');
+                    platformRoots[deviceId] = normalizedCandidate;
+                    delete platformRoots[keys[0]];
+                    this.saveSyncRoots();
+                    return normalizedCandidate;
+                }
+            }
+        }
+        return '';
+    }
+
+    /**
+     * 设置当前设备的同步文件夹路径
+     */
+    _setMySyncRoot(pathVal) {
+        var platformRoots = this.syncRoots[this.platform];
+        // 如果旧格式（字符串），先转换为对象
+        if (!platformRoots || typeof platformRoots === 'string') {
+            this.syncRoots[this.platform] = {};
+        }
+        var deviceId = this._getDeviceId();
+        // 清理可能遗留的 _legacy 键
+        delete this.syncRoots[this.platform]['_legacy'];
+        // 规范化路径：去除连续斜杠（macOS 上 /Users/mac//Downloads → /Users/mac/Downloads）
+        var normalized = pathVal;
+        if (!this.isWindows) {
+            normalized = normalized.replace(/\/+/g, '/');
+        } else {
+            // Windows: 反斜杠连续也规范化，但不影响盘符后的单个反斜杠
+            normalized = normalized.replace(/\\+/g, '\\');
+        }
+        // 去除末尾分隔符
+        if (normalized.length > 1) {
+            normalized = normalized.replace(/[\\/]+$/, '');
+        }
+        this.syncRoots[this.platform][deviceId] = normalized;
+    }
+
+    /**
+     * 清除当前设备的同步文件夹路径
+     */
+    _clearMySyncRoot() {
+        var platformRoots = this.syncRoots[this.platform];
+        if (!platformRoots || typeof platformRoots === 'string') {
+            delete this.syncRoots[this.platform];
+            return;
+        }
+        var deviceId = this._getDeviceId();
+        delete platformRoots[deviceId];
+        // 如果该平台下已无任何设备，清理空对象
+        if (Object.keys(platformRoots).length === 0) {
+            delete this.syncRoots[this.platform];
+        }
+    }
+
+    /**
+     * 获取所有设备的同步文件夹路径（用于 _isInSyncFolder 前缀匹配）
+     * 返回: [{ platform, deviceId, path }]
+     */
+    _getAllSyncRoots() {
+        var result = [];
+        var platforms = ['win32', 'darwin', 'linux'];
+        for (var i = 0; i < platforms.length; i++) {
+            var p = platforms[i];
+            var platformRoots = this.syncRoots[p];
+            if (!platformRoots) continue;
+            if (typeof platformRoots === 'string') {
+                // 旧格式兼容
+                result.push({ platform: p, deviceId: '_legacy', path: platformRoots });
+            } else {
+                var keys = Object.keys(platformRoots);
+                for (var j = 0; j < keys.length; j++) {
+                    result.push({ platform: p, deviceId: keys[j], path: platformRoots[keys[j]] });
+                }
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 获取除当前设备外所有其他设备的同步文件夹路径（用于 _crossSyncRepair 跨端修复）
+     * 返回: [{ platform, deviceId, path }]
+     */
+    _getOtherSyncRoots() {
+        var result = [];
+        var deviceId = this._getDeviceId();
+        var all = this._getAllSyncRoots();
+        for (var i = 0; i < all.length; i++) {
+            // 跳过当前设备（同平台同主机名）
+            if (all[i].platform === this.platform && all[i].deviceId === deviceId) continue;
+            result.push(all[i]);
+        }
+        return result;
+    }
+
+    /**
+     * 将旧格式 syncRoots 迁移为新格式（支持多设备）
+     * 旧格式: { win32: "D:\\path", darwin: "/Users/x/path" }
+     * 新格式: { win32: { "DESKTOP-ABC": "D:\\path" }, darwin: { "_legacy": "/Users/x/path" } }
+     * 当前平台的旧值分配给本机主机名，其他平台用 _legacy 占位（待对应设备升级后迁移）
+     */
+    _migrateSyncRoots() {
+        var deviceId = this._getDeviceId();
+        var platforms = ['win32', 'darwin', 'linux'];
+        var migrated = false;
+        for (var i = 0; i < platforms.length; i++) {
+            var p = platforms[i];
+            var val = this.syncRoots[p];
+            if (typeof val === 'string') {
+                // 旧格式 → 新格式
+                if (p === this.platform) {
+                    // 当前平台：验证路径在当前设备上存在才迁移到本机名下
+                    var pathExists = false;
+                    if (fs && fs.existsSync) {
+                        pathExists = fs.existsSync(val);
+                    }
+                    this.syncRoots[p] = {};
+                    if (pathExists) {
+                        this.syncRoots[p][deviceId] = val;
+                    }
+                } else {
+                    this.syncRoots[p] = { '_legacy': val };
+                }
+                migrated = true;
+            }
+        }
+        // 检查当前平台下是否有 _legacy 遗留键，迁移到本机主机名下
+        var currentRoots = this.syncRoots[this.platform];
+        if (currentRoots && typeof currentRoots === 'object' && currentRoots['_legacy'] && !currentRoots[deviceId]) {
+            // 验证 _legacy 路径在当前设备上存在才迁移
+            var legacyVal = currentRoots['_legacy'];
+            var legacyExists = false;
+            if (fs && fs.existsSync) {
+                legacyExists = fs.existsSync(legacyVal);
+            }
+            if (legacyExists) {
+                currentRoots[deviceId] = legacyVal;
+            }
+            delete currentRoots['_legacy'];
+            migrated = true;
+        }
+        // 检查当前平台下是否有旧 deviceId 的条目需要迁移到本机名下
+        // 场景：首次加载时 _getDeviceId() 返回 'unknown'，后续 config 就绪后返回真实主机名
+        if (currentRoots && typeof currentRoots === 'object' && !currentRoots[deviceId]) {
+            var otherKeys = Object.keys(currentRoots).filter(function(k) { return k !== '_legacy' && k !== deviceId; });
+            if (otherKeys.length === 1) {
+                // 当前平台下只有一个旧 deviceId 条目且不等于当前 deviceId
+                var oldKey = otherKeys[0];
+                var oldVal = currentRoots[oldKey];
+                if (oldVal && typeof oldVal === 'string') {
+                    var oldPathExists = false;
+                    if (fs && fs.existsSync) {
+                        try { oldPathExists = fs.existsSync(oldVal); } catch(e) {}
+                    }
+                    if (oldPathExists) {
+                        console.log('[LocalBrowse] _migrateSyncRoots: migrating deviceId "' + oldKey + '" → "' + deviceId + '" for platform ' + this.platform);
+                        currentRoots[deviceId] = oldVal;
+                        delete currentRoots[oldKey];
+                        migrated = true;
+                    }
+                }
+            }
+        }
+        // 迁移后自动保存
+        if (migrated) {
+            this.saveSyncRoots();
+        }
+    }
+
+    /**
+     * 加载跨端同步文件夹配置（使用 saveData/loadData 实现跨端共享）
+     */
+    loadSyncRoots() {
+        var that = this;
+        try {
+            if (typeof this.loadData === 'function') {
+                this.loadData('syncRoots').then(function(data) {
+                    console.log('[LocalBrowse] loadSyncRoots completed: data=' + JSON.stringify(data) + ', dockPanel=' + !!that.dockPanel + ', currentPath=' + that.currentPath);
+                    if (data && typeof data === 'object') {
+                        that.syncRoots = data;
+                        that._migrateSyncRoots();  // 旧格式迁移为新格式（多设备）
+                        // DOM 已就绪时更新 UI
+                        that.renderFavorites();
+                        that._updateSyncPill();
+                    }
+                    that._syncRootsLoaded = true;
+                    // 默认导航到跨端同步文件夹（syncRoots 异步加载完成后补偿）
+                    that._navigateToSyncRootOnLoad();
+                }).catch(function(err) {
+                    // 忽略加载失败，使用默认值
+                    console.log('[LocalBrowse] loadSyncRoots failed:', err);
+                    that._syncRootsLoaded = true;
+                });
+            } else {
+                var saved = localStorage.getItem('cd_sync_roots');
+                if (saved) {
+                    var parsed = JSON.parse(saved);
+                    if (parsed && typeof parsed === 'object') {
+                        this.syncRoots = parsed;
+                    }
+                }
+                this._migrateSyncRoots();  // 旧格式迁移为新格式（多设备）
+                this._syncRootsLoaded = true;
+                // localStorage 模式同步完成后也尝试导航（renderFileTree 初始加载时可能还没拿到数据）
+                this._navigateToSyncRootOnLoad();
+            }
+        } catch (e) {
+            // 忽略错误
+        }
+    }
+
+    /**
+     * 启动时导航到跨端同步文件夹根目录
+     * 在 loadSyncRoots 完成后调用，确保 syncRoots 数据已就绪
+     * 仅在初始加载时生效（仅从 loadSyncRoots 调用，用户手动导航后不会触发）
+     * 
+     * 注意：不能用 this.currentPath === syncRoot 判断是否已在同步文件夹，
+     * 因为 loadPathSettings() 可能在 renderFileTree() 之后异步完成并设置了
+     * this.currentPath = syncRoot，但此时显示的仍然是 C:\（renderFileTree 的加载结果）。
+     * 用 _loadSeq 版本号机制可以安全地丢弃旧的 C:\ 回调。
+     */
+    _navigateToSyncRootOnLoad() {
+        var syncRoot = this._getMySyncRoot();
+        console.log('[LocalBrowse] _navigateToSyncRootOnLoad: syncRoot=' + syncRoot + ', currentPath=' + this.currentPath + ', dockPanel=' + !!this.dockPanel + ', _loadSeq=' + this._loadSeq);
+        if (!syncRoot) return;
+        // 校验路径是否适合当前平台
+        if (this.isWindows) {
+            if (!/^[A-Za-z]:/.test(syncRoot)) {
+                console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - platform mismatch');
+                return;
+            }
+        } else {
+            if (syncRoot.charAt(0) !== '/') {
+                console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - platform mismatch');
+                return;
+            }
+        }
+        // 校验路径在当前设备上实际存在
+        if (fs && fs.existsSync && !fs.existsSync(syncRoot)) {
+            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - path not exists');
+            return;
+        }
+        // Dock 面板已就绪时，导航到同步文件夹根目录
+        // 即使 this.currentPath 已等于 syncRoot（loadPathSettings 异步设置），
+        // 也要调用 loadDirectory，因为显示内容可能仍是 C:\ 的加载结果
+        if (this.dockPanel && this.dockPanel.element) {
+            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: navigating to ' + syncRoot);
+            this.currentPath = syncRoot;
+            this._syncDriveLetterFromPath(syncRoot);
+            this.loadDirectory(syncRoot);
+        } else {
+            console.log('[LocalBrowse] _navigateToSyncRootOnLoad: skip - dockPanel not ready');
+        }
+    }
+
+    /**
+     * 保存跨端同步文件夹配置（使用 saveData/loadData 实现跨端共享）
+     */
+    saveSyncRoots() {
+        try {
+            // 清理空的平台对象（所有设备都被删除的平台）
+            var platforms = ['win32', 'darwin', 'linux'];
+            for (var i = 0; i < platforms.length; i++) {
+                var p = platforms[i];
+                var val = this.syncRoots[p];
+                if (val && typeof val === 'object' && Object.keys(val).length === 0) {
+                    delete this.syncRoots[p];
+                }
+            }
+            if (typeof this.saveData === 'function') {
+                if (Object.keys(this.syncRoots).length > 0) {
+                    this.saveData('syncRoots', this.syncRoots).catch(function(e) {
+                        console.error('[LocalBrowse] save sync roots failed:', e);
+                    });
+                } else {
+                    this.saveData('syncRoots', {}).catch(function(e) {
+                        console.error('[LocalBrowse] save sync roots failed:', e);
+                    });
+                }
+            } else {
+                if (Object.keys(this.syncRoots).length > 0) {
+                    localStorage.setItem('cd_sync_roots', JSON.stringify(this.syncRoots));
+                } else {
+                    localStorage.removeItem('cd_sync_roots');
+                }
+            }
+        } catch (e) {
+            console.error('[LocalBrowse] save sync roots error:', e);
+        }
+    }
+
+    /**
+     * 更新同步文件夹 pill 按钮的文字（已配置显示文件夹名，未配置显示默认值）
+     */
+    _updateSyncPill() {
+        var pill = document.getElementById('cd-syncroot-pill');
+        if (!pill) return;
+        var sp = this._getMySyncRoot();
+        var isDocker = this._isDockerBrowser();
+        if (sp) {
+            var trimmed = sp.replace(/[\\/]+$/, '');
+            var name = trimmed.replace(/\\/g, '/').split('/').pop() || sp;
+            pill.textContent = '🔄 ' + name;
+            if (isDocker) {
+                // Docker 下即使有配置也不支持跨端同步，显示灰色
+                pill.title = 'Docker浏览器环境不支持跨端同步';
+                pill.style.color = '#888';
+                pill.style.borderColor = '#ccc';
+            } else {
+                pill.title = '打开同步文件夹';
+                pill.style.color = '#4caf50';
+                pill.style.borderColor = '#4caf50';
+            }
+        } else {
+            pill.textContent = '🔄 跨端同步文件夹';
+            if (isDocker) {
+                // Docker 浏览器环境不支持跨端同步，显示灰色
+                pill.title = 'Docker浏览器环境不支持跨端同步';
+                pill.style.color = '#888';
+                pill.style.borderColor = '#ccc';
+            } else {
+                pill.title = '右键添加同步文件夹';
+                pill.style.color = '#e53935';
+                pill.style.borderColor = '#e53935';
+            }
+        }
+    }
+
+    /**
+     * 渲染其他设备/平台的同步文件夹配置（参考信息，只读）
+     * 同平台可能有多台设备（如两台 Windows），分别显示主机名
+     */
+    _renderSyncRootOther(el) {
+        var otherEl = el.querySelector('#cd-syncroot-other');
+        if (!otherEl) return;
+        var platforms = ['win32', 'darwin', 'linux'];
+        var names = { win32: 'Windows', darwin: 'macOS', linux: 'Linux' };
+        var deviceId = this._getDeviceId();
+        var html = '';
+        for (var i = 0; i < platforms.length; i++) {
+            var p = platforms[i];
+            var pRoots = this.syncRoots[p];
+            if (!pRoots) {
+                // 未配置：灰色提示
+                html += '<div style="display:flex;align-items:center;gap:4px;margin-bottom:3px">' +
+                    '<span style="flex-shrink:0;font-size:10px;font-weight:500;color:var(--b3-theme-on-background,#333);min-width:52px">' + names[p] + '</span>' +
+                    '<span style="font-size:10px;color:var(--b3-theme-secondary,#bbb);font-style:italic">未配置</span>' +
+                    '</div>';
+                continue;
+            }
+            // 旧格式兼容（字符串值）
+            if (typeof pRoots === 'string') {
+                if (p !== this.platform) {
+                    html += '<div style="display:flex;align-items:center;gap:4px;margin-bottom:3px">' +
+                        '<span style="flex-shrink:0;font-size:10px;font-weight:500;color:var(--b3-theme-on-background,#333);min-width:52px">' + names[p] + '</span>' +
+                        '<input type="text" value="' + pRoots.replace(/"/g, '&quot;') + '" readonly style="flex:1;min-width:0;padding:2px 6px;font-size:10px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-surface,#f5f5f5);color:var(--b3-theme-on-background,#555);outline:none;cursor:default;opacity:0.8" title="' + pRoots.replace(/"/g, '&quot;') + '">' +
+                        '</div>';
+                }
+                continue;
+            }
+            // 新格式：对象（多设备）
+            var keys = Object.keys(pRoots);
+            for (var j = 0; j < keys.length; j++) {
+                var devId = keys[j];
+                var pPath = pRoots[devId];
+                // 跳过当前设备（已在上方输入框中显示）
+                if (p === this.platform && devId === deviceId) continue;
+                // 设备标识：显示主机名，_legacy 显示为"旧配置"
+                var devLabel = devId === '_legacy' ? '旧配置' : devId;
+                var label = names[p] + (keys.length > 1 || p === this.platform ? ' (' + devLabel + ')' : '');
+                html += '<div style="display:flex;align-items:center;gap:4px;margin-bottom:3px">' +
+                    '<span style="flex-shrink:0;font-size:10px;font-weight:500;color:var(--b3-theme-on-background,#333);min-width:52px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="' + label.replace(/"/g, '&quot;') + '">' + label + '</span>' +
+                    '<input type="text" value="' + pPath.replace(/"/g, '&quot;') + '" readonly style="flex:1;min-width:0;padding:2px 6px;font-size:10px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-surface,#f5f5f5);color:var(--b3-theme-on-background,#555);outline:none;cursor:default;opacity:0.8" title="' + pPath.replace(/"/g, '&quot;') + '">' +
+                    '</div>';
+            }
+        }
+        otherEl.innerHTML = html;
+    }
+
+    /**
+     * 浏览选择同步文件夹（使用当前目录导航方式）
+     * @param {HTMLElement} el - 设置面板元素
+     * @param {Function} onSelect - 选择后的回调（可选）
+     */
+    _browseSyncFolder(el, onSelect) {
+        var that = this;
+        var pathInput = el.querySelector('#cd-syncroot-path');
+        var startPath = (pathInput && pathInput.value && pathInput.value.trim()) || this.currentPath || this.getRootPath();
+
+        // 统一回调：把选中的目录路径传给 onSelect，由调用方决定是否拼接 LocalBrowseSync
+        function done(selectedDir) {
+            if (selectedDir && typeof onSelect === 'function') {
+                onSelect(selectedDir);
+            }
+        }
+
+        // macOS / API模式：直接使用内置目录选择器（osascript 在沙盒环境下经常静默失败）
+        if (this.platform === 'darwin' || this._fsMode() === 'api') {
+            that.pickDirectory(startPath, function(selectedDir) {
+                done(selectedDir);
+            });
+            return;
+        }
+
+        // Windows / Linux: 使用 Node.js child_process 调用系统原生文件夹选择对话框
+        try {
+            var child = require('child_process');
+            if (this.isWindows) {
+                // Windows: 写临时 ps1 脚本执行，避免命令行引号转义问题
+                var tmpFile = path.join(os.tmpdir(), 'lb_browse_' + Date.now() + '.ps1');
+                var psScript = 'Add-Type -AssemblyName System.Windows.Forms\r\n' +
+                    '$dlg = New-Object System.Windows.Forms.FolderBrowserDialog\r\n' +
+                    "$dlg.Description = 'Select sync folder'\r\n" +
+                    '$dlg.ShowNewFolderButton = $false\r\n' +
+                    (startPath ? ("$dlg.SelectedPath = '" + startPath.replace(/'/g, "''") + "'\r\n") : '') +
+                    "if ($dlg.ShowDialog() -eq 'OK') { Write-Output $dlg.SelectedPath }\r\n";
+                fs.writeFileSync(tmpFile, '\ufeff' + psScript, 'utf8');
+                console.log('[LocalBrowse] browse ps1:', tmpFile);
+                child.exec('powershell -NoProfile -ExecutionPolicy Bypass -File "' + tmpFile + '"', { encoding: 'utf8', timeout: 60000 }, function(err, stdout, stderr) {
+                    console.log('[LocalBrowse] browse result err:', err ? err.message : null, 'stdout:', stdout ? stdout.trim() : null);
+                    if (err) {
+                        console.error('[LocalBrowse] ps1 err:', err.message);
+                        // PowerShell 失败，回退到内置目录选择器
+                        that.pickDirectory(startPath, done);
+                    } else {
+                        var sel = stdout ? stdout.trim() : '';
+                        if (sel && sel.length > 0 && sel.indexOf('Exception') === -1) {
+                            done(sel);
+                        } else {
+                            // 无结果，回退到内置目录选择器
+                            that.pickDirectory(startPath, done);
+                        }
+                    }
+                    // 清理临时文件
+                    try { fs.unlinkSync(tmpFile); } catch(e) {}
+                });
+                return;
+            } else {
+                // Linux: zenity
+                child.exec('zenity --file-selection --directory --title="Select sync folder"', { encoding: 'utf8', timeout: 60000 }, function(err, stdout) {
+                    if (err) {
+                        console.error('[LocalBrowse] zenity error:', err.message);
+                        that.pickDirectory(startPath, done);
+                        return;
+                    }
+                    var sel = stdout ? stdout.trim() : '';
+                    if (sel && sel.length > 0) {
+                        done(sel);
+                    } else {
+                        that.pickDirectory(startPath, done);
+                    }
+                });
+                return;
+            }
+        } catch (e) {
+            console.error('[LocalBrowse] browse folder error:', e);
+        }
+        // 最终回退：内置目录选择器
+        that.pickDirectory(startPath, done);
+    }
+
+    /**
+     * 容器路径 → 宿主机路径转换
+     */
+    containerToHost(containerPath) {
+        if (!this.pathMap) return containerPath;
+        var normalized = containerPath.replace(/\\/g, '/');
+        var containerRoot = this.pathMap.container.replace(/\\/g, '/').replace(/\/+$/, '');
+        // 保留 host 原始格式，根据其特征判断使用哪种分隔符
+        var hostRoot = this.pathMap.host.replace(/[\\/]+$/, '');
+        var hostUsesBackslash = hostRoot.indexOf('\\') >= 0 || /^[A-Za-z]:/.test(hostRoot);
+        if (normalized.indexOf(containerRoot) === 0) {
+            var relative = normalized.substring(containerRoot.length);
+            if (relative.charAt(0) === '/') relative = relative.substring(1);
+            if (hostUsesBackslash) {
+                return hostRoot + '\\' + relative.replace(/\//g, '\\');
+            } else {
+                return hostRoot + '/' + relative;
+            }
+        }
+        return containerPath;
+    }
+
+    /**
+     * 宿主机路径 → 容器路径转换（用于失效链接修复搜索）
+     */
+    hostToContainer(hostPath) {
+        if (!this.pathMap) return hostPath;
+        var normalizedHost = hostPath.replace(/\\/g, '/').toLowerCase();
+        var hostRootNorm = this.pathMap.host.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+        if (normalizedHost.indexOf(hostRootNorm) === 0) {
+            var relative = normalizedHost.substring(hostRootNorm.length);
+            if (relative.charAt(0) === '/') relative = relative.substring(1);
+            return this.pathMap.container.replace(/\/+$/, '') + '/' + relative;
+        }
+        return hostPath;
+    }
+
+    /**
+     * 判断一个本地路径是否属于当前平台的链接格式
+     * Windows: 盘符开头（如 C:\, D:/）
+     * macOS: /Users/ 或 /Volumes/ 开头
+     * Linux: /home/ 或 /mnt/ 或 /media/ 开头
+     * 路径以 / 开头但不在上述列表中 → 归为当前平台（Unix 类通用）
+     */
+    _isCurrentPlatformLink(localPath) {
+        if (!localPath) return false;
+        var p = localPath.replace(/\\/g, '/');
+        if (this.isWindows) {
+            // Windows: 盘符格式 X: 或 X:/
+            return /^[A-Za-z]:/.test(p);
+        } else if (this.platform === 'darwin') {
+            // macOS: /Users/ 或 /Volumes/ 开头
+            if (p.indexOf('/Users/') === 0 || p.indexOf('/Volumes/') === 0) return true;
+            // 其他以 / 开头的路径：排除 Linux 特征路径 + Windows 路径（如 /D:/...）
+            if (p.charAt(0) === '/' && p.indexOf('/home/') !== 0 && p.indexOf('/mnt/') !== 0 && p.indexOf('/media/') !== 0 && !/^\/[A-Za-z]:/.test(p)) return true;
+            return false;
+        } else {
+            // Linux: /home/ 或 /mnt/ 或 /media/ 开头
+            if (p.indexOf('/home/') === 0 || p.indexOf('/mnt/') === 0 || p.indexOf('/media/') === 0) return true;
+            // 其他以 / 开头的路径：排除 macOS 特征路径 + Windows 路径（如 /D:/...）
+            if (p.charAt(0) === '/' && p.indexOf('/Users/') !== 0 && p.indexOf('/Volumes/') !== 0 && !/^\/[A-Za-z]:/.test(p)) return true;
+            return false;
+        }
+    }
+
+    /**
+     * 从 syncRoots 中提取同步文件夹名称（三端路径的最后一个路径段）
+     * 如 D:\BaiduSyncdisk → BaiduSyncdisk
+     * 如 /Users/sqalei/BaiduSyncdisk → BaiduSyncdisk
+     * 未配置则返回空字符串
+     */
+    _getSyncFolderName() {
+        var myRoot = this._getMySyncRoot();
+        if (!myRoot) return '';
+        var normalized = myRoot.replace(/\\/g, '/').replace(/\/+$/, '');
+        var lastSlash = normalized.lastIndexOf('/');
+        if (lastSlash >= 0 && lastSlash < normalized.length - 1) {
+            return normalized.substring(lastSlash + 1);
+        }
+        return normalized;  // 无分隔符时整个就是名称
+    }
+
+    /**
+     * 判断路径是否属于任何设备的同步文件夹
+     * 使用精确前缀匹配，遍历所有设备的 syncRoot 路径
+     */
+    _isInSyncFolder(localPath) {
+        if (!localPath || !this.syncRoots) return false;
+        var normalized = localPath.replace(/\\/g, '/').replace(/\/+/g, '/');
+        var allRoots = this._getAllSyncRoots();
+        for (var i = 0; i < allRoots.length; i++) {
+            var rootNorm = allRoots[i].path.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+            if (normalized.indexOf(rootNorm) === 0) {
+                // 精确前缀匹配：确保匹配到的是完整路径段（后面紧跟 / 或到末尾）
+                var nextChar = normalized.charAt(rootNorm.length);
+                if (nextChar === '' || nextChar === '/') return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 跨端同步文件夹修复通道
+     * 将其他平台的路径转换为当前平台的路径
+     * @param {string} localPath - 失效链接的本地路径（其他平台格式）
+     * @param {string} fileName - 文件名
+     * @returns {object|null} - { newPath: string, syncSearchRoot: string|null } 或 null（无法修复）
+     *   newPath: 前缀替换后的新路径（可能存在也可能不存在）
+     *   syncSearchRoot: 当前平台的同步文件夹路径（供后续搜索用）
+     */
+    _crossSyncRepair(localPath, fileName) {
+        if (!localPath || !this.syncRoots) return null;
+        var myRoot = this._getMySyncRoot();
+        if (!myRoot) {
+            console.log('[LocalBrowse] _crossSyncRepair: myRoot is empty! platform=' + this.platform + ', deviceId=' + this._getDeviceId() + ', syncRoots=' + JSON.stringify(this.syncRoots));
+            return null;
+        }
+
+        var normalized = localPath.replace(/\\/g, '/').replace(/\/+/g, '/');
+        var myRootNorm = myRoot.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+        var otherRoots = this._getOtherSyncRoots();
+
+        // 遍历所有其他设备的 syncRoot，找到原路径属于哪个设备
+        for (var i = 0; i < otherRoots.length; i++) {
+            var pRoot = otherRoots[i].path;
+            var pRootNorm = pRoot.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+            if (normalized.indexOf(pRootNorm) === 0) {
+                // 精确前缀匹配：确保匹配到的是完整路径段（后面紧跟 / 或到末尾）
+                var nextChar = normalized.charAt(pRootNorm.length);
+                if (nextChar !== '' && nextChar !== '/') continue;
+
+                // 匹配到其他设备的 syncRoot，提取相对路径
+                var relative = normalized.substring(pRootNorm.length);
+                if (relative.charAt(0) === '/') relative = relative.substring(1);
+
+                // 用当前设备的 syncRoot 拼接新路径（myRootNorm 已在循环外计算，含去连续斜杠）
+                var newPath = relative ? (myRootNorm + '/' + relative) : myRootNorm;
+
+                // Windows 路径使用反斜杠
+                if (this.isWindows) {
+                    newPath = newPath.replace(/\//g, '\\');
+                }
+
+                return {
+                    newPath: newPath,
+                    syncSearchRoot: myRoot,
+                    exists: fs && fs.existsSync && fs.existsSync(newPath)
+                };
+            }
+        }
+        console.log('[LocalBrowse] _crossSyncRepair: no matching otherRoot found for localPath=' + localPath + ', otherRoots=' + JSON.stringify(otherRoots.map(function(r) { return r.path; })));
+        return null;
+    }
+
+    /**
+     * 获取根路径（跨平台兼容）
+     * Windows: C:\ (driveLetter 存盘符字母)
+     * macOS/Linux: / 或 /Volumes/xxx (driveLetter 存完整路径)
+     */
+    getRootPath() {
+        if (this.isWindows) return this.driveLetter + ':\\';
+        // macOS/Linux: driveLetter 存的已是完整路径（如 '/' 或 '/Volumes/Data'）
+        return this.driveLetter || '/';
+    }
+
+    /**
+     * 从路径同步 driveLetter 和下拉框（跨平台）
+     * Windows: 从路径提取盘符字母（如 C:\ → 'C'）
+     * macOS: 从路径匹配 /Volumes/xxx 或 /
+     * Linux: 从路径匹配 /mnt/xxx 或 /
+     * @param {string} filePath - 当前路径
+     * @param {boolean} updateSelect - 是否同步更新下拉框
+     */
+    _syncDriveLetterFromPath(filePath, updateSelect) {
+        var newDrive = this.driveLetter;
+        if (this.isWindows) {
+            var driveMatch = filePath.match(/^([A-Za-z]):/);
+            if (driveMatch) {
+                newDrive = driveMatch[1].toUpperCase();
+            }
+        } else if (this.platform === 'darwin') {
+            // macOS: 匹配 /Volumes/xxx 或 /
+            if (filePath.indexOf('/Volumes/') === 0) {
+                var volEnd = filePath.indexOf('/', 9);  // /Volumes/ 后第一个 /
+                newDrive = volEnd > 0 ? filePath.substring(0, volEnd) : filePath;
+            } else if (filePath.charAt(0) === '/') {
+                newDrive = '/';
+            }
+        } else {
+            // Linux: 匹配 /mnt/xxx 或 /media/xxx 或 /
+            if (filePath.indexOf('/mnt/') === 0) {
+                var mntEnd = filePath.indexOf('/', 6);
+                newDrive = mntEnd > 0 ? filePath.substring(0, mntEnd) : filePath;
+            } else if (filePath.indexOf('/media/') === 0) {
+                // /media/user/device → 取到 /media/user/device
+                var parts = filePath.split('/');
+                if (parts.length >= 4) {
+                    newDrive = '/' + parts[1] + '/' + parts[2] + '/' + parts[3];
+                } else if (parts.length >= 3) {
+                    newDrive = '/' + parts[1] + '/' + parts[2];
+                } else {
+                    newDrive = filePath;
+                }
+            } else if (filePath.indexOf('/home/') === 0) {
+                var homeEnd = filePath.indexOf('/', 6);
+                newDrive = homeEnd > 0 ? filePath.substring(0, homeEnd) : filePath;
+            } else if (filePath.charAt(0) === '/') {
+                newDrive = '/';
+            }
+        }
+        if (newDrive !== this.driveLetter) {
+            this.driveLetter = newDrive;
+        }
+        if (updateSelect) {
+            var driveSelect = document.getElementById('cd-drive-select');
+            if (driveSelect) {
+                driveSelect.value = newDrive;
+            }
         }
     }
 
@@ -3660,17 +5493,16 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 从 data.json 加载收藏夹
+     * 从 data.json 加载收藏夹（按平台隔离）
+     * 存储格式: { "win32": [...], "darwin": [...], "linux": [...] }
      */
     loadFavorites() {
         var that = this;
         try {
             if (typeof this.loadData === 'function') {
                 this.loadData('favorites').then(function(data) {
-                    if (Array.isArray(data)) {
-                        that.favorites = data;
-                        that.renderFavorites();
-                    }
+                    that.favorites = that._extractPlatformFavorites(data);
+                    that.renderFavorites();
                 }).catch(function() {
                     that.favorites = [];
                 });
@@ -3678,7 +5510,8 @@ class LocalBrowsePlugin extends Plugin {
                 var saved = localStorage.getItem('cd_favorites');
                 if (saved) {
                     try {
-                        that.favorites = JSON.parse(saved);
+                        var parsed = JSON.parse(saved);
+                        that.favorites = that._extractPlatformFavorites(parsed);
                     } catch (e) {
                         that.favorites = [];
                     }
@@ -3691,22 +5524,80 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 保存收藏夹到 data.json
+     * 从存储数据中解析当前平台的收藏夹（兼容旧格式纯数组）
+     */
+    _extractPlatformFavorites(data) {
+        // 旧格式兼容：纯数组 → 归到当前平台
+        if (Array.isArray(data)) {
+            return data;
+        }
+        // 新格式：按平台分组的字典
+        if (data && typeof data === 'object' && Array.isArray(data[this.platform])) {
+            return data[this.platform];
+        }
+        return [];
+    }
+
+    /**
+     * 保存收藏夹到 data.json（按平台隔离）
      */
     saveFavorites() {
         var that = this;
         try {
-            if (typeof this.saveData === 'function') {
-                this.saveData('favorites', this.favorites).catch(function(e) {
+            // 先读取现有数据，更新当前平台部分，保留其他平台
+            var fullData = {};
+            if (typeof this.loadData === 'function') {
+                // 异步读取 → 合并 → 保存
+                this.loadData('favorites').then(function(existing) {
+                    fullData = that._mergePlatformFavorites(existing, that.favorites);
+                    return that.saveData('favorites', fullData);
+                }).catch(function() {
+                    // 读取失败时直接构造新数据
+                    fullData[that.platform] = that.favorites;
+                    return that.saveData('favorites', fullData);
+                }).catch(function(e) {
                     console.error('[LocalBrowse] save favorites failed:', e);
                 });
             } else {
-                localStorage.setItem('cd_favorites', JSON.stringify(this.favorites));
+                var saved = localStorage.getItem('cd_favorites');
+                if (saved) {
+                    try {
+                        fullData = that._mergePlatformFavorites(JSON.parse(saved), that.favorites);
+                    } catch (e) {
+                        fullData = {};
+                        fullData[that.platform] = that.favorites;
+                    }
+                } else {
+                    fullData[that.platform] = that.favorites;
+                }
+                localStorage.setItem('cd_favorites', JSON.stringify(fullData));
             }
         } catch (e) {
             console.error('[LocalBrowse] save favorites error:', e);
         }
         this.renderFavorites();
+    }
+
+    /**
+     * 将当前平台收藏合并到完整数据中，保留其他平台不变
+     */
+    _mergePlatformFavorites(existing, currentFavs) {
+        var fullData = {};
+        if (Array.isArray(existing)) {
+            // 旧格式迁移：纯数组归到当前平台
+            fullData[this.platform] = existing;
+        } else if (existing && typeof existing === 'object') {
+            // 新格式：复制现有各平台数据
+            var platforms = ['win32', 'darwin', 'linux'];
+            for (var i = 0; i < platforms.length; i++) {
+                var p = platforms[i];
+                if (Array.isArray(existing[p])) {
+                    fullData[p] = existing[p];
+                }
+            }
+        }
+        fullData[this.platform] = currentFavs;
+        return fullData;
     }
 
     /**
@@ -3745,9 +5636,7 @@ class LocalBrowsePlugin extends Plugin {
                 btnEl.addEventListener('contextmenu', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (confirm('确定要移除收藏 "' + favName + '" 吗？')) {
-                        that.removeFavorite(favPath);
-                    }
+                    that.removeFavorite(favPath);
                 });
 
                 // 拖拽排序
@@ -3756,86 +5645,90 @@ class LocalBrowsePlugin extends Plugin {
                     e.dataTransfer.effectAllowed = 'move';
                     e.dataTransfer.setData('text/plain', favPath);
                     that._dragFavIndex = parseInt(this.dataset.favIndex, 10);
+                    that._dragSrcBtn = this;
                 });
                 btnEl.addEventListener('dragend', function(e) {
                     this.style.opacity = '';
                     that._dragFavIndex = null;
-                    // 清除所有高亮
+                    that._dragSrcBtn = null;
+                    that._dragOverTarget = null;
+                    // 清除所有视觉指示器
                     var allBtns = list.querySelectorAll('[data-fav-index]');
                     for (var k = 0; k < allBtns.length; k++) {
-                        allBtns[k].style.borderLeft = '';
-                        allBtns[k].style.borderRight = '';
+                        allBtns[k].classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
                     }
                 });
                 btnEl.addEventListener('dragover', function(e) {
                     e.preventDefault();
                     e.dataTransfer.dropEffect = 'move';
-                    // 高亮拖拽目标位置
+                    if (that._dragFavIndex === null || !that._dragSrcBtn || that._dragSrcBtn === this) return;
+                    // 节流：如果目标没变，不做任何操作
+                    if (that._dragOverTarget === this) return;
+                    that._dragOverTarget = this;
                     var targetIndex = parseInt(this.dataset.favIndex, 10);
-                    if (that._dragFavIndex !== null && that._dragFavIndex !== targetIndex) {
-                        if (targetIndex < that._dragFavIndex) {
-                            this.style.borderLeft = '2px solid var(--b3-theme-primary,#4285f4)';
-                            this.style.borderRight = '';
-                        } else {
-                            this.style.borderRight = '2px solid var(--b3-theme-primary,#4285f4)';
-                            this.style.borderLeft = '';
-                        }
+                    var srcIndex = parseInt(that._dragSrcBtn.dataset.favIndex, 10);
+                    // 清除所有视觉指示器
+                    var allBtns = list.querySelectorAll('[data-fav-index]');
+                    for (var k = 0; k < allBtns.length; k++) {
+                        allBtns[k].classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
+                    }
+                    // 只添加视觉指示器，不移动 DOM（避免频繁布局抖动）
+                    if (targetIndex < srcIndex) {
+                        this.classList.add('cd-fav-drag-before');
+                    } else {
+                        this.classList.add('cd-fav-drag-after');
                     }
                 });
                 btnEl.addEventListener('dragleave', function(e) {
-                    this.style.borderLeft = '';
-                    this.style.borderRight = '';
+                    // 延迟清除，避免鼠标在按钮内部微动时频繁闪烁
+                    var btn = this;
+                    setTimeout(function() {
+                        if (that._dragOverTarget !== btn) {
+                            btn.classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
+                        }
+                    }, 50);
                 });
                 btnEl.addEventListener('drop', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
-                    this.style.borderLeft = '';
-                    this.style.borderRight = '';
-                    var fromIndex = that._dragFavIndex;
-                    var toIndex = parseInt(this.dataset.favIndex, 10);
-                    if (fromIndex !== null && fromIndex !== toIndex) {
-                        // 移动数组元素
-                        var moved = that.favorites.splice(fromIndex, 1)[0];
-                        that.favorites.splice(toIndex, 0, moved);
+                    var targetIndex = parseInt(this.dataset.favIndex, 10);
+                    var srcIndex = parseInt(that._dragSrcBtn.dataset.favIndex, 10);
+                    // 清除视觉指示器
+                    this.classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
+                    that._dragOverTarget = null;
+                    if (srcIndex === targetIndex) return;
+                    // 移动 DOM 元素
+                    var listEl = document.getElementById('cd-favorites-list');
+                    if (targetIndex < srcIndex) {
+                        listEl.insertBefore(that._dragSrcBtn, this);
+                    } else {
+                        listEl.insertBefore(that._dragSrcBtn, this.nextSibling);
+                    }
+                    // 按 DOM 顺序的 title 路径匹配重建 favorites 数组
+                    var allBtns = listEl.querySelectorAll('[data-fav-index]');
+                    var orderedFavs = [];
+                    for (var n = 0; n < allBtns.length; n++) {
+                        var btnPath = allBtns[n].title;
+                        for (var p = 0; p < that.favorites.length; p++) {
+                            if (that.favorites[p].path === btnPath) {
+                                orderedFavs.push(that.favorites[p]);
+                                break;
+                            }
+                        }
+                    }
+                    if (orderedFavs.length === that.favorites.length) {
+                        that.favorites = orderedFavs;
                         that.saveFavorites();
-                        // 只交换 DOM 位置，避免清空重建导致闪烁
-                        that._swapFavButtons(fromIndex, toIndex);
+                    }
+                    // 更新 data-fav-index 为新顺序
+                    var finalBtns = listEl.querySelectorAll('[data-fav-index]');
+                    for (var q = 0; q < finalBtns.length; q++) {
+                        finalBtns[q].dataset.favIndex = q;
                     }
                 });
             })(fav.path, fav.name, btn);
 
             list.appendChild(btn);
-        }
-    }
-
-    /**
-     * 交换收藏夹按钮的 DOM 位置（避免 renderFavorites 清空重建导致闪烁）
-     */
-    _swapFavButtons(fromIndex, toIndex) {
-        var list = document.getElementById('cd-favorites-list');
-        if (!list) return;
-        var btns = list.querySelectorAll('[data-fav-index]');
-        if (fromIndex < 0 || fromIndex >= btns.length || toIndex < 0 || toIndex >= btns.length) {
-            // 索引越界，回退到全量重建
-            this.renderFavorites();
-            return;
-        }
-        var fromBtn = btns[fromIndex];
-        var toBtn = btns[toIndex];
-        if (!fromBtn || !toBtn) {
-            this.renderFavorites();
-            return;
-        }
-        // 交换 DOM 位置
-        if (fromIndex < toIndex) {
-            toBtn.parentNode.insertBefore(fromBtn, toBtn.nextSibling);
-        } else {
-            toBtn.parentNode.insertBefore(fromBtn, toBtn);
-        }
-        // 更新所有按钮的 data-fav-index
-        var allBtns = list.querySelectorAll('[data-fav-index]');
-        for (var i = 0; i < allBtns.length; i++) {
-            allBtns[i].dataset.favIndex = i;
         }
     }
 
@@ -3882,10 +5775,11 @@ class LocalBrowsePlugin extends Plugin {
             'pdf': '📕', 'doc': '📄', 'docx': '📄', 'xls': '📊', 'xlsx': '📊',
             'ppt': '📊', 'pptx': '📊', 'txt': '📝', 'md': '📝',
             'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'webp': '🖼️', 'svg': '🖼️', 'bmp': '🖼️', 'heic': '🖼️', 'heif': '🖼️', 'livp': '📷',
-            'mp3': '🎵', 'wav': '🎵', 'flac': '🎵',
+            'mp3': '🎵', 'wav': '🎵', 'flac': '🎵', 'aac': '🎵',
             'mp4': '🎬', 'avi': '🎬', 'mkv': '🎬', 'mov': '🎬',
             'zip': '📦', 'rar': '📦', '7z': '📦', 'tar': '📦', 'gz': '📦',
-            'exe': '⚙️', 'dll': '⚙️', 'msi': '⚙️'
+            'exe': '⚙️', 'dll': '⚙️', 'msi': '⚙️',
+            'epub': '📖'
         };
         return icons[ext] || '📄';
     }
@@ -4413,6 +6307,11 @@ class LocalBrowsePlugin extends Plugin {
      */
     async _autoCheckLinks() {
         var that = this;
+        // Docker 浏览器模式下无法访问本地文件，链接修复无意义，跳过
+        if (that._isDockerBrowser()) {
+            that._updateLinkIndicator('none');
+            return;
+        }
         if (that._autoCheckRunning) return;  // 防止并发执行
         if (!document.getElementById('cd-relink-btn')) return;
         var docId = that.getCurrentDocId();
@@ -4424,6 +6323,10 @@ class LocalBrowsePlugin extends Plugin {
 
         if (docId === that._lastCheckedDocId && that._linkStatus !== 'none' && that._linkStatus !== 'checking') return;
         console.log('[LocalBrowse] autoCheckLinks - checking doc:', docId);
+        // 切换文档时重置跨端修复循环计数器
+        if (docId !== that._lastCheckedDocId && that._crossSyncFixCount) {
+            delete that._crossSyncFixCount[that._lastCheckedDocId];
+        }
         that._lastCheckedDocId = docId;
         that._autoCheckRunning = true;
 
@@ -4438,7 +6341,29 @@ class LocalBrowsePlugin extends Plugin {
                 return;
             }
             if (!result.broken || result.broken.length === 0) {
-                // 有本地链接但都有效，显示绿灯
+                // 有本地链接但都有效，先处理跨端同步直接修复
+                if (result.crossSyncFixed && result.crossSyncFixed.length > 0) {
+                    // 防止无限循环：如果同一文档连续跨端修复超过2次，说明 replaceLink 没生效，不再重试
+                    if (!that._crossSyncFixCount) that._crossSyncFixCount = {};
+                    if (!that._crossSyncFixCount[docId]) that._crossSyncFixCount[docId] = 0;
+                    that._crossSyncFixCount[docId]++;
+                    if (that._crossSyncFixCount[docId] <= 2) {
+                        for (var csf0 = 0; csf0 < result.crossSyncFixed.length; csf0++) {
+                            var csf0Item = result.crossSyncFixed[csf0];
+                            try {
+                                await that.replaceLink(docId, csf0Item.oldUrl, csf0Item.newPath, csf0, { silent: true });
+                                console.log('[LocalBrowse] autoCheckLinks - cross-sync fixed:', csf0Item.oldUrl, '→', csf0Item.newPath);
+                            } catch(e) {
+                                console.error('[LocalBrowse] autoCheckLinks - cross-sync fix failed:', csf0Item.oldUrl, e);
+                            }
+                        }
+                        // 跨端修复可能改变了文档内容，重置检查状态
+                        that._lastCheckedDocId = '';
+                    } else {
+                        console.log('[LocalBrowse] autoCheckLinks - cross-sync fix loop detected for doc', docId, '(count=' + that._crossSyncFixCount[docId] + '), skipping re-check');
+                    }
+                }
+                // 显示绿灯
                 that._updateLinkIndicator('green');
                 return;
             }
@@ -4451,6 +6376,27 @@ class LocalBrowsePlugin extends Plugin {
             // 保存未自动修复的链接及其搜索结果，供点击指示灯时复用
             var pendingItems = [];
 
+            // 跨端同步前缀替换直接修复的链接
+            if (result.crossSyncFixed && result.crossSyncFixed.length > 0) {
+                if (!that._crossSyncFixCount) that._crossSyncFixCount = {};
+                if (!that._crossSyncFixCount[docId]) that._crossSyncFixCount[docId] = 0;
+                that._crossSyncFixCount[docId]++;
+                if (that._crossSyncFixCount[docId] <= 2) {
+                    for (var csf = 0; csf < result.crossSyncFixed.length; csf++) {
+                        var csfItem = result.crossSyncFixed[csf];
+                        try {
+                            await that.replaceLink(docId, csfItem.oldUrl, csfItem.newPath, csf, { silent: true });
+                            autoFixed++;
+                            console.log('[LocalBrowse] autoCheckLinks - cross-sync fixed:', csfItem.oldUrl, '→', csfItem.newPath);
+                        } catch(e) {
+                            console.error('[LocalBrowse] autoCheckLinks - cross-sync fix failed:', csfItem.oldUrl, e);
+                        }
+                    }
+                } else {
+                    console.log('[LocalBrowse] autoCheckLinks - cross-sync fix loop detected (broken branch) for doc', docId, '(count=' + that._crossSyncFixCount[docId] + ')');
+                }
+            }
+
             for (var i = 0; i < result.broken.length; i++) {
                 var item = result.broken[i];
                 console.log('[LocalBrowse] autoCheckLinks - fixing:', item.fileName, 'from', item.localPath);
@@ -4459,32 +6405,51 @@ class LocalBrowsePlugin extends Plugin {
                 var lastSep = Math.max(item.localPath.lastIndexOf('\\'), item.localPath.lastIndexOf('/'));
                 if (lastSep > 0) parentDir = item.localPath.substring(0, lastSep);
 
-                // R1: 旧路径附近
-                if (parentDir && fs.existsSync(parentDir)) {
-                    var r1 = await that.searchFileByName(item.fileName, parentDir, {
-                        maxDepth: 2, maxResults: 10, maxDirs: 50, timeoutMs: 2000
+                // 跨端同步文件夹：搜索范围改为 syncRoot
+                var isCrossSync = !!item._isCrossSync;
+                var syncSearchRoot = item._syncSearchRoot || '';
+
+                // R1: 旧路径附近（跨端同步则在 syncRoot 下搜索）
+                var r1SearchDir = isCrossSync ? syncSearchRoot : parentDir;
+                if (parentDir && !isCrossSync && !(await that._fsExists(parentDir))) {
+                    // Docker: 宿主机路径不存在时尝试容器路径
+                    var c1 = that.hostToContainer(parentDir);
+                    if (c1 !== parentDir && (await that._fsExists(c1))) r1SearchDir = c1;
+                }
+                if (r1SearchDir && (await that._fsExists(r1SearchDir))) {
+                    var r1 = await that.searchFileByName(item.fileName, r1SearchDir, {
+                        maxDepth: isCrossSync ? 20 : 2, maxResults: 10, maxDirs: isCrossSync ? 99999 : 50, timeoutMs: isCrossSync ? 60000 : 2000
                     });
                     var r1Exact = r1.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
                     if (r1Exact.length > 0) candidates = r1Exact;
                 }
 
-                // R2: 上级目录
-                if (candidates.length === 0 && parentDir) {
+                // R2: 上级目录（跨端同步时跳过，因为已在 syncRoot 下搜索过）
+                if (candidates.length === 0 && parentDir && !isCrossSync) {
                     var grandParent = '';
                     var gpSep = Math.max(parentDir.lastIndexOf('\\'), parentDir.lastIndexOf('/'));
                     if (gpSep > 2) grandParent = parentDir.substring(0, gpSep);
-                    if (grandParent && grandParent.length > 3 && fs.existsSync(grandParent)) {
-                        var r2 = await that.searchFileByName(item.fileName, grandParent, {
-                            maxDepth: 3, maxResults: 10, maxDirs: 80, timeoutMs: 2000
-                        });
-                        var r2Exact = r2.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
-                        if (r2Exact.length > 0) candidates = r2Exact;
+                    if (grandParent && grandParent.length > 3) {
+                        var r2SearchDir = grandParent;
+                        if (!(await that._fsExists(grandParent))) {
+                            var c2 = that.hostToContainer(grandParent);
+                            if (c2 !== grandParent && (await that._fsExists(c2))) r2SearchDir = c2;
+                        }
+                        if (await that._fsExists(r2SearchDir)) {
+                            var r2 = await that.searchFileByName(item.fileName, r2SearchDir, {
+                                maxDepth: 3, maxResults: 10, maxDirs: 80, timeoutMs: 2000
+                            });
+                            var r2Exact = r2.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
+                            if (r2Exact.length > 0) candidates = r2Exact;
+                        }
                     }
                 }
 
-                // R3: 盘符根目录全盘搜索
-                if (candidates.length === 0) {
-                    var driveRoot = (item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\';
+                // R3: 根目录全盘搜索（跨端同步链接不再全盘搜索，R1 已在同步文件夹内搜索过）
+                if (candidates.length === 0 && !isCrossSync) {
+                    var driveRoot = that.isWindows
+                        ? ((item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\')
+                        : '/';
                     var r3All = [];
                     await new Promise(function(resolve) {
                         that.deepSearch(driveRoot, item.fileName, function(partial, scanned, matched) {}, function(allResults) {
@@ -4773,27 +6738,44 @@ class LocalBrowsePlugin extends Plugin {
                         parentDir = item.localPath.substring(0, lastSep);
                     }
 
-                    // 第一轮：旧路径父目录，深度2
+                    // 跨端同步文件夹：搜索范围改为 syncRoot
+                    var isCrossSync = !!item._isCrossSync;
+                    var syncSearchRoot = item._syncSearchRoot || '';
+
+                    // 第一轮：旧路径父目录，深度2（跨端同步时搜索 syncRoot）
                     var r1Candidates = [];
-                    if (parentDir && fs.existsSync(parentDir)) {
-                        r1Candidates = await that.searchFileByName(item.fileName, parentDir, {
-                            maxDepth: 2, maxResults: 5, maxDirs: 100, timeoutMs: 2000,
-                            onProgress: function(info) {
-                                if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R1 已扫 ' + info.dirsScanned + ' 目录</span>';
-                            }
-                        });
+                    var r1SearchDir = isCrossSync ? syncSearchRoot : parentDir;
+                    if (r1SearchDir) {
+                        if (!isCrossSync && !(await that._fsExists(r1SearchDir))) {
+                            var d1 = that.hostToContainer(r1SearchDir);
+                            if (d1 !== r1SearchDir && (await that._fsExists(d1))) r1SearchDir = d1;
+                        }
+                        if (await that._fsExists(r1SearchDir)) {
+                            r1Candidates = await that.searchFileByName(item.fileName, r1SearchDir, {
+                                maxDepth: isCrossSync ? 5 : 2, maxResults: 5, maxDirs: isCrossSync ? 200 : 100, timeoutMs: isCrossSync ? 5000 : 2000,
+                                onProgress: function(info) {
+                                    if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 ' + (isCrossSync ? '跨端' : 'R1') + ' 已扫 ' + info.dirsScanned + ' 目录</span>';
+                                }
+                            });
+                        }
                     }
                     var r1Exact = r1Candidates.filter(function(c) { return c.matchType === 'exact' || c.matchType === 'case-insensitive'; });
                     if (r1Exact.length > 0) candidates = r1Exact;
 
-                    // 第二轮：父目录的上级，深度3
-                    if (candidates.length === 0 && parentDir) {
+                    // 第二轮：父目录的上级，深度3（跨端同步时跳过，R1 已覆盖 syncRoot）
+                    if (candidates.length === 0 && parentDir && !isCrossSync) {
                         var grandParent = '';
                         var gpSep = Math.max(parentDir.lastIndexOf('\\'), parentDir.lastIndexOf('/'));
                         if (gpSep > 2) grandParent = parentDir.substring(0, gpSep);
-                        if (grandParent && grandParent.length > 3 && fs.existsSync(grandParent)) {
+                        if (grandParent && grandParent.length > 3) {
+                            var r2SearchDir = grandParent;
+                            if (!(await that._fsExists(grandParent))) {
+                                var d2 = that.hostToContainer(grandParent);
+                                if (d2 !== grandParent && (await that._fsExists(d2))) r2SearchDir = d2;
+                            }
+                            if (await that._fsExists(r2SearchDir)) {
                             if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R2 搜索中...</span>';
-                            var r2Candidates = await that.searchFileByName(item.fileName, grandParent, {
+                            var r2Candidates = await that.searchFileByName(item.fileName, r2SearchDir, {
                                 maxDepth: 3, maxResults: 5, maxDirs: 150, timeoutMs: 2000,
                                 onProgress: function(info) {
                                     if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">🔍 R2 已扫 ' + info.dirsScanned + ' 目录</span>';
@@ -4803,15 +6785,18 @@ class LocalBrowsePlugin extends Plugin {
                             if (r2Exact.length > 0) candidates = r2Exact;
                         }
                     }
+                    }
 
-                    // 第三轮：全盘深度搜索
+                    // 第三轮：全盘深度搜索（跨端同步时搜索范围为 syncRoot）
                     if (candidates.length === 0) {
-                        var driveRoot = (item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\';
+                        var driveRoot = isCrossSync ? syncSearchRoot : (that.isWindows
+                            ? ((item.localPath && item.localPath.charAt(0)) ? (item.localPath.charAt(0) + ':\\') : 'C:\\')
+                            : '/');
                         var r3AllCandidates = [];
                         var r3TotalSearched = 0;
                         var r3TotalMatched = 0;
 
-                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">R3 全盘深度搜索...</span>';
+                        if (candidateArea) candidateArea.innerHTML = '<span style="font-size:11px;color:var(--b3-theme-secondary,#999)">' + (isCrossSync ? '跨端' : 'R3') + ' 深度搜索...</span>';
 
                         await new Promise(function(resolve) {
                             that.deepSearch(driveRoot, item.fileName, function(partialResults, dirsScanned, matchedFiles) {
@@ -4838,13 +6823,13 @@ class LocalBrowsePlugin extends Plugin {
                         // 网盘兼容：枚举根目录子目录分别搜索
                         if (r3AllCandidates.length === 0) {
                             try {
-                                var rootEntries = fs.readdirSync(driveRoot, { withFileTypes: true });
+                                var rootEntries = await that._fsReaddir(driveRoot);
                                 var subDirs = [];
                                 for (var ei = 0; ei < rootEntries.length; ei++) {
                                     var e = rootEntries[ei];
-                                    var isDir = e.isDirectory();
-                                    if (!isDir && !e.isFile()) {
-                                        try { isDir = fs.statSync(driveRoot + e.name).isDirectory(); } catch(err) {}
+                                    var isDir = typeof e.isDirectory === 'function' ? e.isDirectory() : e.isDir;
+                                    if (!isDir) {
+                                        try { var est = await that._fsStat(driveRoot + e.name).catch(function(){}); if (est && est.isDirectory()) isDir = true; } catch(err) {}
                                     }
                                     if (isDir) subDirs.push(driveRoot + e.name);
                                 }
@@ -5085,7 +7070,6 @@ class LocalBrowsePlugin extends Plugin {
                         if (protyleEl) {
                             var titleEl = protyleEl.querySelector('.protyle-title');
                             if (titleEl && titleEl.dataset && titleEl.dataset.nodeId) {
-                                console.log('[LocalBrowse] getCurrentDocId - method1 (layout API):', titleEl.dataset.nodeId);
                                 return titleEl.dataset.nodeId;
                             }
                         }
@@ -5101,7 +7085,6 @@ class LocalBrowsePlugin extends Plugin {
             if (activeProtyl) {
                 var titleEl2 = activeProtyl.querySelector('.protyle-title');
                 if (titleEl2 && titleEl2.dataset && titleEl2.dataset.nodeId) {
-                    console.log('[LocalBrowse] getCurrentDocId - method2 (DOM title):', titleEl2.dataset.nodeId);
                     return titleEl2.dataset.nodeId;
                 }
             }
@@ -5133,6 +7116,11 @@ class LocalBrowsePlugin extends Plugin {
     async scanBrokenLinks(docId) {
         var that = this;
 
+        // Docker 浏览器模式下无法访问本地文件，链接修复无意义，跳过
+        if (that._isDockerBrowser()) {
+            return null;
+        }
+
         // 获取文档 Kramdown 内容
         var resp = await fetch('/api/block/getBlockKramdown', {
             method: 'POST',
@@ -5151,6 +7139,7 @@ class LocalBrowsePlugin extends Plugin {
         var total = 0;
         var valid = 0;
         var seen = {}; // 去重
+        var crossSyncFixed = null; // 跨端同步前缀替换直接修复的链接列表
 
         // 用更可靠的方式：找到所有 file:/// 出现的位置，然后向前找匹配的 )
         var fileUrlRegex = /file:\/\/\//g;
@@ -5214,28 +7203,107 @@ class LocalBrowsePlugin extends Plugin {
             var localPath = that.fileUrlToLocalPath(fullUrl);
 
             // 检测文件是否存在
-            if (fs && fs.existsSync && fs.existsSync(localPath)) {
+            var localExists = await that._fsExists(localPath);
+            if (localExists) {
                 valid++;
             } else {
-                // 提取文件名（去掉 ? 后面的 URL 参数，如 ?t=0:05）
-                var fileName = localPath.split('\\').pop().split('/').pop().split('?')[0];
-                broken.push({
-                    oldUrl: fullUrl,
-                    localPath: localPath,
-                    fileName: fileName,
-                    displayText: displayText,
-                    fileFingerprint: fileFingerprint  // 保存文件指纹，用于搜索时精确匹配
-                });
+                // Docker 路径映射：宿主机路径不存在时，尝试容器路径
+                var mappedCheckPath = that.hostToContainer(localPath);
+                if (mappedCheckPath !== localPath && (await that._fsExists(mappedCheckPath))) {
+                    valid++;
+                } else {
+                    // 提取文件名（去掉 ? 后面的 URL 参数，如 ?t=0:05）
+                    var fileName = localPath.split('\\').pop().split('/').pop().split('?')[0];
+
+                    // 跨端同步文件夹判断
+                    if (!that._isCurrentPlatformLink(localPath)) {
+                        // 不是当前平台的链接格式
+                        var inSync = that._isInSyncFolder(localPath);
+                        console.log('[LocalBrowse] cross-platform link: ' + localPath + ', isInSync=' + inSync + ', mySyncRoot=' + that._getMySyncRoot());
+                        if (inSync) {
+                            // 在同步文件夹内 → 尝试跨端修复
+                            var crossResult = that._crossSyncRepair(localPath, fileName);
+                            console.log('[LocalBrowse] crossSyncRepair result: ' + (crossResult ? ('newPath=' + crossResult.newPath + ', exists=' + crossResult.exists) : 'null'));
+                            if (crossResult && crossResult.exists) {
+                                // 前缀替换后文件存在 → 直接修复，不加入 broken
+                                if (!crossSyncFixed) crossSyncFixed = [];
+                                crossSyncFixed.push({
+                                    oldUrl: fullUrl,
+                                    newPath: crossResult.newPath
+                                });
+                                valid++;  // 算作有效链接
+                                continue;  // 不加入 broken
+                            } else if (crossResult) {
+                                // 前缀替换后文件不存在 → 加入 broken，标记为跨端
+                                broken.push({
+                                    oldUrl: fullUrl,
+                                    localPath: crossResult.newPath,  // 使用替换后的路径（搜索用）
+                                    fileName: fileName,
+                                    displayText: displayText,
+                                    fileFingerprint: fileFingerprint,
+                                    _isCrossSync: true,
+                                    _syncSearchRoot: crossResult.syncSearchRoot,
+                                    _originalLocalPath: localPath  // 保留原始路径供 replaceLink 用
+                                });
+                                continue;
+                            }
+                            // crossResult 为 null（无法匹配任何平台的 syncRoot）→ 忽略
+                            console.log('[LocalBrowse] cross-platform link SILENTLY IGNORED (crossResult=null): ' + localPath + ' — likely _getMySyncRoot() returned empty on this device');
+                        }
+                        // 不是当前平台格式且不在同步文件夹内 → 忽略（不加入 broken，不修复）
+                        continue;
+                    }
+
+                    // 当前平台格式的链接：先检查是否属于其他设备的同步文件夹（同平台跨设备场景）
+                    // 例：A 电脑 D:\BaiduSyncdisk → B 电脑 E:\BaiduSyncdisk，链接格式相同但盘符不同
+                    if (that._isInSyncFolder(localPath)) {
+                        var crossResult2 = that._crossSyncRepair(localPath, fileName);
+                        if (crossResult2 && crossResult2.exists) {
+                            // 前缀替换后文件存在 → 直接修复
+                            if (!crossSyncFixed) crossSyncFixed = [];
+                            crossSyncFixed.push({
+                                oldUrl: fullUrl,
+                                newPath: crossResult2.newPath
+                            });
+                            valid++;  // 算作有效链接
+                            continue;
+                        } else if (crossResult2) {
+                            // 前缀替换后文件不存在 → 加入 broken，标记为跨端
+                            broken.push({
+                                oldUrl: fullUrl,
+                                localPath: crossResult2.newPath,
+                                fileName: fileName,
+                                displayText: displayText,
+                                fileFingerprint: fileFingerprint,
+                                _isCrossSync: true,
+                                _syncSearchRoot: crossResult2.syncSearchRoot,
+                                _originalLocalPath: localPath
+                            });
+                            continue;
+                        }
+                        // 在同步文件夹内但无法匹配其他设备 → 走普通修复
+                    }
+
+                    // 当前平台格式的链接 → 正常加入 broken，走 R1-R2-R3
+                    broken.push({
+                        oldUrl: fullUrl,
+                        localPath: localPath,
+                        fileName: fileName,
+                        displayText: displayText,
+                        fileFingerprint: fileFingerprint  // 保存文件指纹，用于搜索时精确匹配
+                    });
+                }
             }
         }
 
-        return { broken: broken, total: total, valid: valid };
+        return { broken: broken, total: total, valid: valid, crossSyncFixed: crossSyncFixed };
     }
 
     /**
      * file:/// URL 转本地路径
      */
     fileUrlToLocalPath(url) {
+        var that = this;
         // 先去掉 URL fragment（#size=xxx&mtime=xxx），避免误判文件不存在
         var urlWithoutFragment = url.split('#')[0];
         var decoded;
@@ -5245,8 +7313,16 @@ class LocalBrowsePlugin extends Plugin {
             // 非法编码序列，使用原始字符串
             decoded = urlWithoutFragment;
         }
-        // file:///D:/docs/file.pdf → D:\docs\file.pdf
-        var local = decoded.replace(/^file:\/\/\//, '').replace(/\//g, '\\');
+        // file:///D:/docs/file.pdf → D:\docs\file.pdf (Windows) 或 D:/docs/file.pdf (macOS/Linux 跨端)
+        // file:///Users/mac/docs → /Users/mac/docs (Unix，保留前导 / 用于跨端匹配)
+        var local = decoded.replace(/^file:\/\//, '');
+        // Windows 盘符路径 (file:///D:/...): 去掉前导 /，统一为 D:/ 或 D:\ 格式
+        if (/^\/[A-Za-z]:/.test(local)) {
+            local = local.substring(1);
+            if (that.isWindows) {
+                local = local.replace(/\//g, '\\');
+            }
+        }
         return local;
     }
 
@@ -5256,10 +7332,14 @@ class LocalBrowsePlugin extends Plugin {
     localPathToFileUrl(localPath) {
         // D:\腾讯电脑管家截图文件\局部截取_20250918_131642.png
         // → file:///D:/%E8%85%BE%E8%AE%AF.../局部截取_20250918_131642.png
-        var normalized = localPath.replace(/\\/g, '/');
+        var normalized = localPath.replace(/\\/g, '/').replace(/\/+/g, '/');  // 统一斜杠 + 去连续斜杠
         // 只对路径中的每个段做编码，不编码 / 和 :
-        var segments = normalized.split('/');
-        var encodedSegments = segments.map(function(s) {
+        // 修复：Unix 绝对路径以 / 开头，split 后第一个为空字符串，join 后仍是 /xxx
+        // 再加 file:/// 会变成 file:////xxx（4个斜杠）。去掉开头 / 再 split
+        var segments = normalized.replace(/^\//, '').split('/');
+        var encodedSegments = segments.map(function(s, idx) {
+            // 空段保留
+            if (s === '') return s;
             // 如果段包含 :（如 D:），不编码
             if (/^[a-zA-Z]:$/.test(s)) return s;
             // 否则对段内字符编码，但保留 / 和 :
@@ -5275,8 +7355,11 @@ class LocalBrowsePlugin extends Plugin {
     localPathToFileUrlRaw(localPath) {
         // D:\腾讯电脑管家截图文件\局部截取_20250918_131642.png
         // → file:///D:/腾讯电脑管家截图文件/局部截取_20250918_131642.png
-        var normalized = localPath.replace(/\\/g, '/');
-        return 'file:///' + normalized;
+        var normalized = localPath.replace(/\\/g, '/').replace(/\/+/g, '/');  // 统一斜杠 + 去连续斜杠
+        // 修复：Unix 绝对路径 /Users/mac/... 直接加 file:/// 会变成 file:////Users/...（4个斜杠）
+        // 去掉开头 / 再加，得到 file:///Users/...（3个斜杠）
+        var withoutLeadingSlash = normalized.replace(/^\//, '');
+        return 'file:///' + withoutLeadingSlash;
     }
 
     /**
@@ -5645,16 +7728,16 @@ class LocalBrowsePlugin extends Plugin {
         var subdirsDiv = picker.querySelector('#cd-pick-subdirs');
         var currentBrowsePath = initialDir;
 
-        // 加载盘符
+        // 加载存储列表（跨平台）
         that.detectDrives(function(drives) {
             if (driveSelect) {
                 driveSelect.innerHTML = '';
                 for (var d = 0; d < drives.length; d++) {
                     var opt = document.createElement('option');
-                    opt.value = drives[d];
-                    opt.textContent = drives[d] + ':';
-                    // 根据初始路径选盘符
-                    if (initialDir && initialDir.charAt(0).toUpperCase() === drives[d]) {
+                    opt.value = drives[d].value;
+                    opt.textContent = drives[d].label;
+                    // 根据初始路径匹配存储项
+                    if (initialDir && initialDir.indexOf(drives[d].value) === 0) {
                         opt.selected = true;
                     }
                     driveSelect.appendChild(opt);
@@ -5662,13 +7745,20 @@ class LocalBrowsePlugin extends Plugin {
             }
         });
 
-        // 盘符切换
+        // 存储切换（跨平台）
         if (driveSelect) {
             driveSelect.addEventListener('change', function() {
-                var newDrive = this.value + ':\\';
-                pathInput.value = newDrive;
-                currentBrowsePath = newDrive;
-                that.loadPickerSubdirs(subdirsDiv, newDrive, pathInput);
+                var selectedValue = this.value;
+                var newPath;
+                if (that.isWindows) {
+                    newPath = selectedValue + ':\\';
+                } else {
+                    // macOS/Linux: value 已经是完整路径
+                    newPath = selectedValue.endsWith('/') ? selectedValue : selectedValue + '/';
+                }
+                pathInput.value = newPath;
+                currentBrowsePath = newPath;
+                that.loadPickerSubdirs(subdirsDiv, newPath, pathInput);
             });
         }
 
@@ -5705,8 +7795,9 @@ class LocalBrowsePlugin extends Plugin {
             });
         }
 
-        // 点击遮罩关闭（等同取消）
+        // 点击遮罩关闭（等同取消）— stopPropagation 防止冒泡到 document 关闭同步面板
         picker.addEventListener('click', function(e) {
+            e.stopPropagation();
             if (e.target === picker) {
                 if (picker.parentNode) document.body.removeChild(picker);
                 if (callback) callback(null);
@@ -5719,16 +7810,21 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadPickerSubdirs(container, dirPath, pathInput) {
         var that = this;
-        if (!fs || !fs.existsSync(dirPath)) {
-            container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">目录不存在</div>';
-            return;
-        }
+        container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">加载中...</div>';
 
-        try {
-            var entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        that._fsExists(dirPath, true).then(function(exists) {
+            if (!exists) {
+                container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-secondary,#999);text-align:center">目录不存在</div>';
+                return;
+            }
+
+            return that._fsReaddir(dirPath);
+        }).then(function(entries) {
+            if (!entries) return;
             var dirs = [];
             for (var i = 0; i < entries.length; i++) {
-                if (entries[i].isDirectory()) {
+                var isDir = typeof entries[i].isDirectory === 'function' ? entries[i].isDirectory() : entries[i].isDir;
+                if (isDir) {
                     dirs.push(entries[i].name);
                 }
             }
@@ -5740,18 +7836,16 @@ class LocalBrowsePlugin extends Plugin {
             }
 
             var html = '';
-            // 添加"返回上级"选项
             var parentDir = path.dirname(dirPath);
             if (parentDir && parentDir !== dirPath) {
                 html += '<div class="cd-pick-dir-item" data-dir="' + that.escapeHtml(parentDir) + '" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f5f5f5);color:var(--b3-theme-secondary,#999)">📁 ..</div>';
             }
             for (var d = 0; d < dirs.length; d++) {
-                var fullPath = dirPath + '\\' + dirs[d];
+                var fullPath = dirPath + that._sep + dirs[d];
                 html += '<div class="cd-pick-dir-item" data-dir="' + that.escapeHtml(fullPath) + '" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f5f5f5)">📁 ' + that.escapeHtml(dirs[d]) + '</div>';
             }
             container.innerHTML = html;
 
-            // 绑定点击进入子目录
             var dirItems = container.querySelectorAll('.cd-pick-dir-item');
             for (var j = 0; j < dirItems.length; j++) {
                 (function(item) {
@@ -5768,9 +7862,9 @@ class LocalBrowsePlugin extends Plugin {
                     });
                 })(dirItems[j]);
             }
-        } catch (e) {
+        }).catch(function(e) {
             container.innerHTML = '<div style="padding:8px;color:var(--b3-theme-error,#e74c3c);text-align:center">无法读取目录</div>';
-        }
+        });
     }
 
     /**
@@ -5822,8 +7916,11 @@ class LocalBrowsePlugin extends Plugin {
         var fuzzyThreshold = opts.fuzzyThreshold || 0.6;
         var onProgress = opts.onProgress || null;
         var fileNameLower = fileName.toLowerCase();
+        var useApi = that._fsMode() === 'api';
 
-        if (!fs || !fs.existsSync(searchDir)) {
+        // 检查搜索目录是否存在
+        var dirExists = await that._fsExists(searchDir, true);
+        if (!dirExists) {
             return exactResults;
         }
 
@@ -5844,15 +7941,18 @@ class LocalBrowsePlugin extends Plugin {
             if (item.depth > maxDepth) continue;
 
             try {
-                var entries = fs.readdirSync(item.dir, { withFileTypes: true });
+                var entries = await that._fsReaddir(item.dir);
                 for (var i = 0; i < entries.length; i++) {
                     if ((exactResults.length + fuzzyResults.length) >= maxResults) break;
                     var entry = entries[i];
+                    var isDir = typeof entry.isDirectory === 'function' ? entry.isDirectory() : entry.isDir;
+                    var isFile = !isDir;
+                    var isSymlink = typeof entry.isSymlink === 'function' ? entry.isSymlink() : entry.isSymlink;
                     try {
-                        if (entry.isFile()) {
+                        if (isFile) {
                             var matchType = null;
 
-                            // 精确匹配（原逻辑）
+                            // 精确匹配
                             if (entry.name === fileName) {
                                 matchType = 'exact';
                             }
@@ -5860,18 +7960,18 @@ class LocalBrowsePlugin extends Plugin {
                             else if (entry.name.toLowerCase() === fileNameLower) {
                                 matchType = 'case-insensitive';
                             }
-                            // 模糊匹配：相似度超过阈值
+                            // 模糊匹配
                             else if (enableFuzzy && that.stringSimilarity(entry.name, fileName) >= fuzzyThreshold) {
                                 matchType = 'fuzzy';
                             }
 
                             if (matchType) {
                                 var fullPath = path.join(item.dir, entry.name);
-                                var stat = fs.statSync(fullPath);
+                                var stat = await that._fsStat(fullPath).catch(function() { return null; });
                                 var result = {
                                     fullPath: fullPath,
-                                    size: stat.size,
-                                    mtime: stat.mtime ? stat.mtime.getTime() : 0,
+                                    size: stat ? stat.size : 0,
+                                    mtime: stat && stat.mtime ? stat.mtime.getTime() : 0,
                                     matchType: matchType,
                                     similarity: matchType === 'exact' ? 1 : (matchType === 'case-insensitive' ? 0.95 : that.stringSimilarity(entry.name, fileName))
                                 };
@@ -5881,14 +7981,14 @@ class LocalBrowsePlugin extends Plugin {
                                     fuzzyResults.push(result);
                                 }
                             }
-                        } else if (entry.isDirectory()) {
+                        } else if (isDir) {
                             if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
                             queue.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
-                        } else if (!entry.isFile()) {
-                            // OTHER 类型（symlink/junction/挂载点等），通过 statSync 判断
+                        } else if (isSymlink) {
+                            // 符号链接，尝试判断是否为目录
                             try {
-                                var st = fs.statSync(path.join(item.dir, entry.name));
-                                if (st.isDirectory()) {
+                                var st = await that._fsStat(path.join(item.dir, entry.name)).catch(function() { return null; });
+                                if (st && st.isDirectory()) {
                                     queue.push({ dir: path.join(item.dir, entry.name), depth: item.depth + 1 });
                                 }
                             } catch(e) {}
@@ -5918,10 +8018,9 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
 
-        // 排序：精确匹配在前，然后按修改时间降序（最近的排前面）
+        // 排序：精确匹配在前，然后按修改时间降序
         exactResults.sort(function(a, b) { return b.mtime - a.mtime; });
         fuzzyResults.sort(function(a, b) {
-            // 模糊匹配先按相似度降序，再按修改时间降序
             if (b.similarity !== a.similarity) return b.similarity - a.similarity;
             return b.mtime - a.mtime;
         });
@@ -6025,7 +8124,7 @@ class LocalBrowsePlugin extends Plugin {
             if (exactResults.length >= maxResults) return;
 
             var normalizedPath = currentDir;
-            if (!normalizedPath.endsWith('\\')) normalizedPath += '\\';
+            if (!normalizedPath.endsWith(that._sep)) normalizedPath += that._sep;
 
             taskStarted();
             schedule(function() {
@@ -6138,7 +8237,7 @@ class LocalBrowsePlugin extends Plugin {
                 });
                 for (var fi = 0; fi < fallbackResults.length && exactResults.length < maxResults; fi++) {
                     var fr = fallbackResults[fi];
-                    var frName = fr.name || (fr.path ? fr.path.split('\\').pop() : '');
+                    var frName = fr.name || (fr.path ? fr.path.replace(/\\/g, '/').split('/').pop() : '');
                     if (frName === fileName || frName.toLowerCase() === fileNameLower) {
                         try {
                             var fst = fr.path ? fs.statSync(fr.path) : null;
@@ -6179,26 +8278,30 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 替换文档中的链接
-     * 修复v4：找到包含链接的具体子块，只更新那个子块，避免重建整个文档
-     * 新链接会附加 #size=xxx&mtime=xxx fragment，用于未来精确匹配
+     * 修复v5：直接修改 block.markdown（思源真正的存储格式），用 dataType:'markdown' 更新
+     * 旧版用 dataType:'dom' + DOM字符串替换，但思源内部用 Markdown 存储，
+     * DOM 替换后内核从 Markdown 重新渲染会覆盖修改，导致替换不持久
      */
     async replaceLink(docId, oldUrl, newLocalPath, itemIndex, context) {
         var that = this;
+        var isSilent = context && context.silent;
 
         // 为新链接生成文件指纹 title
         var newFingerprintTitle = '';
         try {
-            var newStat = fs.statSync(newLocalPath);
+            var newStat = fs && fs.statSync ? fs.statSync(newLocalPath) : null;
             if (newStat) {
                 newFingerprintTitle = 'size=' + newStat.size + '&mtime=' + (newStat.mtime ? newStat.mtime.getTime() : 0);
             }
-        } catch(e) {}
+        } catch(e) {
+            console.log('[LocalBrowse] replaceLink: fs.statSync failed for', newLocalPath, e.message);
+        }
 
-        var newUrl = that.localPathToFileUrl(newLocalPath);
-        var newUrlRaw = that.localPathToFileUrlRaw(newLocalPath);  // 不编码版本，用于 DOM 替换
+        // 修复：改用 toFileUrl（不编码中文），和 insertLocalFileLink 保持一致，避免中文显示为 % 编码乱码
+        var newUrl = that.toFileUrl(newLocalPath);
         var newUrlWithTitle = newFingerprintTitle ? (newUrl + ' "' + newFingerprintTitle + '"') : newUrl;
-        var newUrlRawWithTitle = newFingerprintTitle ? (newUrlRaw + ' "' + newFingerprintTitle + '"') : newUrlRaw;
-        var isSilent = context && context.silent;
+
+        console.log('[LocalBrowse] replaceLink: docId=' + docId + ', oldUrl=' + oldUrl + ', newUrl=' + newUrl);
 
         try {
 
@@ -6210,6 +8313,7 @@ class LocalBrowsePlugin extends Plugin {
             });
             var childData = await childResp.json();
             if (childData.code !== 0 || !childData.data) {
+                console.log('[LocalBrowse] replaceLink: step1 failed - getChildBlocks returned code=' + childData.code);
                 if (!isSilent) that.showToastMsg('获取子块失败');
                 return;
             }
@@ -6220,10 +8324,7 @@ class LocalBrowsePlugin extends Plugin {
             var targetMatchUrl = null;  // 记录实际匹配到的 URL 格式
 
             // 准备多种可能的 URL 格式用于匹配
-            // oldUrl 已在 scanBrokenLinks 中去掉了 fragment，但 markdown 中可能仍保留 fragment
             var oldUrlVariants = [oldUrl];
-            // 带可能 fragment 的版本（旧链接可能包含 #size=xxx&mtime=xxx）
-            // 在 oldUrl 后面添加通配 fragment 匹配：搜索时先试不含 fragment 的，再试含 fragment 的
             // 编码版本（空格→%20，中文→UTF-8）
             oldUrlVariants.push(that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/')));
             // 只编码空格版本（思源有时只编码空格）
@@ -6234,16 +8335,6 @@ class LocalBrowsePlugin extends Plugin {
             oldUrlVariants.push(oldUrl.replace('file:///', ''));
             // 去掉 file:/// 前缀且斜杠替换为反斜杠
             oldUrlVariants.push(oldUrl.replace('file:///', '').replace(/\//g, '\\'));
-
-            // 如果旧链接可能带有 fragment（size/mtime），也添加带 fragment 的变体
-            // 这里用 startswith 匹配：如果 markdown 中包含 oldUrl 的开头部分就能匹配
-            // 但 indexOf 是精确匹配，所以需要额外加入带 #size 的变体
-            // 由于 fragment 的具体值不确定，使用子串搜索方式：在匹配时先搜索 oldUrl 前缀
-            // 这里不需要添加带 fragment 的变体，因为不含 fragment 的 oldUrl 是含 fragment 的前缀
-            // block.markdown.indexOf(oldUrl) 在 markdown 中如果 URL 是 "file:///D:/xxx.png#size=123"
-            // 而 oldUrl 是 "file:///D:/xxx.png"，那么 indexOf 仍然能匹配到！
-            // 因为 "file:///D:/xxx.png" 是 "file:///D:/xxx.png#size=123" 的子串
-
 
             for (var i = 0; i < childBlocks.length; i++) {
                 var block = childBlocks[i];
@@ -6260,126 +8351,104 @@ class LocalBrowsePlugin extends Plugin {
             }
 
             if (!targetBlock) {
-                // 打印所有子块的 markdown 前200字符用于调试
+                console.log('[LocalBrowse] replaceLink: step2 failed - no block contains oldUrl, tried variants:', oldUrlVariants);
                 for (var i = 0; i < Math.min(childBlocks.length, 5); i++) {
                     var md = childBlocks[i].markdown || '';
+                    console.log('[LocalBrowse] replaceLink: block[' + i + '] md(0..200):', md.substring(0, 200));
                 }
                 if (!isSilent) that.showToastMsg('未找到包含该链接的块');
                 return;
             }
+            console.log('[LocalBrowse] replaceLink: step2 found block', targetBlock.id, 'matchUrl=', targetMatchUrl);
 
-            // === 步骤3：获取该子块的 DOM ===
-            var domResp = await fetch('/api/block/getBlockDOM', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ id: targetBlock.id })
-            });
-            var domData = await domResp.json();
-            if (domData.code !== 0 || !domData.data || !domData.data.dom) {
-                if (!isSilent) that.showToastMsg('获取块 DOM 失败');
-                return;
-            }
-            var blockDom = domData.data.dom;
-
-            // === 步骤4：在 DOM 中替换链接 ===
-            // DOM 中的链接可能是未编码的中文，也可能有编码
-            // 可能包含旧的 fragment（#size=xxx&mtime=xxx），需要一并替换
-            // 策略：用正则匹配旧 URL（含可能的 fragment），替换为新 URL（含新 fragment）
-            var newDom = blockDom;
+            // === 步骤3：在 markdown 中替换链接 ===
+            // 直接修改 block.markdown（思源的真正存储格式），然后用 dataType:'markdown' 更新
+            var oldMarkdown = targetBlock.markdown;
+            var newMarkdown = oldMarkdown;
             var replaced = false;
 
-            // 构建匹配旧 URL 的正则，同时捕获可能存在的 fragment
-            // oldUrl 是不含 fragment 的纯 URL
             function escapeRegex(str) {
                 return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
             }
 
+            // 策略：在 markdown 中找到旧 URL（含可能的 fragment 或 title），整体替换为新 URL（含新 title）
+            // Markdown 中的 file:/// 链接格式：![alt](file:///path) 或 [text](file:///path "title")
+            // 匹配模式：URL + 可选的 #fragment + 可选的空格+引号+title+引号
+
             // 方式1：用 targetMatchUrl（实际在 markdown 中匹配到的格式）替换
-            if (targetMatchUrl && newDom.indexOf(targetMatchUrl) !== -1) {
-                var isEncoded = targetMatchUrl !== oldUrl && targetMatchUrl.indexOf('%') !== -1;
-                var replacementUrl = isEncoded ? newUrl : newUrlRaw;
-                // targetMatchUrl 可能不包含 fragment（因为是子串匹配），需要检查并去掉 DOM 中旧的 fragment
+            if (targetMatchUrl) {
                 var escapedTarget = escapeRegex(targetMatchUrl);
-                var regex1 = new RegExp(escapedTarget + '(#[^"\\s<>]*)?');
-                newDom = newDom.replace(regex1, replacementUrl);
-                replaced = true;
+                var regex1 = new RegExp(escapedTarget + '(#[^)"\\s]*)?(\\s+"[^"]*")?');
+                newMarkdown = newMarkdown.replace(regex1, function(match, fragment, title) {
+                    return newUrlWithTitle;
+                });
+                if (newMarkdown !== oldMarkdown) {
+                    replaced = true;
+                } else {
+                    // targetMatchUrl 没匹配到（可能 markdown 中 URL 格式略有不同），恢复尝试其他方式
+                    newMarkdown = oldMarkdown;
+                }
             }
-            // 方式2：直接替换旧 URL（未编码），用未编码的新 URL 替换
-            if (!replaced && newDom.indexOf(oldUrl) !== -1) {
-                var escapedOld = escapeRegex(oldUrl);
-                var regex2 = new RegExp(escapedOld + '(#[^"\\s<>]*)?');
-                newDom = newDom.replace(regex2, newUrlRaw);
-                replaced = true;
-            }
-            // 方式3：旧 URL 编码版本，用编码的新 URL 替换
+
+            // 方式2：直接替换旧 URL（原始格式）
             if (!replaced) {
-                var oldEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/'));
-                if (newDom.indexOf(oldEncoded) !== -1) {
-                    var escapedEncoded = escapeRegex(oldEncoded);
-                    var regex3 = new RegExp(escapedEncoded + '(#[^"\\s<>]*)?');
-                    newDom = newDom.replace(regex3, newUrl);
+                var escapedOld = escapeRegex(oldUrl);
+                var regex2 = new RegExp(escapedOld + '(#[^)"\\s]*)?(\\s+"[^"]*")?');
+                var testReplace = oldMarkdown.replace(regex2, newUrlWithTitle);
+                if (testReplace !== oldMarkdown) {
+                    newMarkdown = testReplace;
                     replaced = true;
                 }
             }
+
+            // 方式3：编码版本替换
+            if (!replaced) {
+                var oldEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/'));
+                var escapedEncoded = escapeRegex(oldEncoded);
+                var regex3 = new RegExp(escapedEncoded + '(#[^)"\\s]*)?(\\s+"[^"]*")?');
+                var testReplace3 = oldMarkdown.replace(regex3, newUrlWithTitle);
+                if (testReplace3 !== oldMarkdown) {
+                    newMarkdown = testReplace3;
+                    replaced = true;
+                }
+            }
+
             // 方式4：只编码空格版本
             if (!replaced) {
                 var oldSpaceEncoded = oldUrl.replace(/ /g, '%20');
-                if (newDom.indexOf(oldSpaceEncoded) !== -1) {
-                    var newSpaceEncoded = newUrlRaw.replace(/ /g, '%20');
-                    var escapedSpace = escapeRegex(oldSpaceEncoded);
-                    var regex4 = new RegExp(escapedSpace + '(#[^"\\s<>]*)?');
-                    newDom = newDom.replace(regex4, newSpaceEncoded);
-                    replaced = true;
-                }
-            }
-            // 方式5：部分匹配 - 去掉 file:/// 前缀
-            if (!replaced) {
-                var oldPathPart = oldUrl.replace('file:///', '');
-                var oldPathEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/')).replace('file:///', '');
-                var newPathPartRaw = newUrlRaw.replace('file:///', '');
-                var newPathPartEncoded = newUrl.replace('file:///', '');
-
-                if (newDom.indexOf(oldPathPart) !== -1) {
-                    var escapedPath = escapeRegex(oldPathPart);
-                    var regex5a = new RegExp(escapedPath + '(#[^"\\s<>]*)?');
-                    newDom = newDom.replace(regex5a, newPathPartRaw);
-                    replaced = true;
-                } else if (newDom.indexOf(oldPathEncoded) !== -1) {
-                    var escapedPathEnc = escapeRegex(oldPathEncoded);
-                    var regex5b = new RegExp(escapedPathEnc + '(#[^"\\s<>]*)?');
-                    newDom = newDom.replace(regex5b, newPathPartEncoded);
+                var escapedSpace = escapeRegex(oldSpaceEncoded);
+                var regex4 = new RegExp(escapedSpace + '(#[^)"\\s]*)?(\\s+"[^"]*")?');
+                var testReplace4 = oldMarkdown.replace(regex4, newUrlWithTitle);
+                if (testReplace4 !== oldMarkdown) {
+                    newMarkdown = testReplace4;
                     replaced = true;
                 }
             }
 
             if (!replaced) {
+                console.log('[LocalBrowse] replaceLink: step3 failed - no markdown replacement matched');
                 if (!isSilent) that.showToastMsg('未找到需要替换的链接');
                 return;
             }
+            console.log('[LocalBrowse] replaceLink: step3 markdown replacement succeeded');
 
-            // 更新 DOM 中的文件指纹 title（修复后新链接需要携带新指纹，用于未来精确定位）
-            // 注意：只替换目标链接附近的 title，避免误伤同一块中的其他链接
-            if (newFingerprintTitle && replaced) {
-                // 在已替换的链接附近查找并替换 title（只替换第一次匹配，对应刚替换的那个链接）
-                var titleRegex = /title="size=\d+&(?:amp;)?mtime=\d+"/;
-                newDom = newDom.replace(titleRegex, 'title="' + newFingerprintTitle + '"');
-            }
-
-            // === 步骤5：用 dataType: 'dom' 更新该子块 ===
+            // === 步骤4：用 dataType: 'markdown' 更新该子块 ===
             var updateResp = await fetch('/api/block/updateBlock', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     id: targetBlock.id,
-                    dataType: 'dom',
-                    data: newDom
+                    dataType: 'markdown',
+                    data: newMarkdown
                 })
             });
             var updateData = await updateResp.json();
             if (updateData.code !== 0) {
+                console.log('[LocalBrowse] replaceLink: step4 updateBlock failed - code=' + updateData.code + ', msg=' + (updateData.msg || ''));
                 if (!isSilent) that.showToastMsg('替换链接失败：' + (updateData.msg || '未知错误'));
                 return;
             }
+            console.log('[LocalBrowse] replaceLink: step4 updateBlock (markdown) succeeded, blockId=' + targetBlock.id);
 
             // 替换成功，更新 UI
             if (context && context.dialog) {

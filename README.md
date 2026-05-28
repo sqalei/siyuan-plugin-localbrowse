@@ -1,314 +1,272 @@
-## 前言
+## Introduction
 
-思源笔记软件非常优秀，适合 all-in-one，但感觉太重了，所以我就想着把本地文件（视频、图片、文档、压缩包等）以链接的形式插入到笔记中，既减轻思源笔记的重量，又实现了 all-in-one。但每次都要手动打开资源管理器、找到文件、再回到笔记里手写链接，操作繁琐且容易出错。尤其是我习惯把网盘通过工具挂载为本地盘，想要快速浏览和插入其中的文件更是麻烦。
-
-于是我开发了 **LocalBrowse** 这个插件，把本地文件浏览器直接嵌入到思源笔记的 Dock 面板里，不用离开思源就能浏览、搜索、插入本地文件链接或者本地文件（我是把网盘挂载为本地盘，每台电脑都挂载统一盘符，或者通过同步盘同步到本地，只要是文件的路径一样就行，这样即使跨电脑，插入到思源笔记里的本地链接也是可以使用的）。
+SiYuan Note is great, but handling local files (videos, images, documents, archives, etc.) is cumbersome — either importing everything increases storage, or manually finding files and writing links is tedious. **LocalBrowse** embeds a local file browser right into SiYuan's Dock panel, letting you browse, search, and insert local files without leaving SiYuan. *After inserting links, you'll inevitably need to reorganize local files — moving them around, which breaks the links in your notes.* The core of this plugin: **when local files are moved, broken links are automatically repaired**, with cross-platform and cross-device sync support. All data is stored locally, no cloud dependency, no note-taking.
 
 ---
 
-## 插件简介
+## Overview
 
-**LocalBrowse**（本地文件浏览器）是一个思源笔记桌面端插件，在右侧 Dock 面板中提供轻量级的本地文件浏览器，支持浏览本地驱动器、搜索文件、一键将文件复制到 `assets` 目录并插入到当前笔记中。
+**LocalBrowse** is a SiYuan Note desktop plugin that provides a local file browser in the right Dock panel. It supports browsing, searching, bookmarking, one-click file link insertion, automatic broken link repair, and cross-device sync folder functionality.
 
-- **插件名称**：LocalBrowse / 本地文件浏览器
-- **适用平台**：Windows 桌面版思源笔记（v3.0.0+）
-- **开源协议**：GPL-3.0
-- **GitHub 仓库**：https://github.com/sqalei/siyuan-plugin-localbrowse
-
----
-
-## 核心功能
-
-### 📁 浏览本地驱动器
-
-插件启动后自动检测所有可用盘符（C:、D:、E:……），通过左上角的下拉框即可快速切换。无论你是浏览本地磁盘，还是通过工具挂载的网盘、同步盘，都能直接访问。
-
-- **面包屑导航**：单击文件夹进入，点击面包屑路径中的任意层级快速返回上级
-- **Backspace 快捷键**：在文件列表区域按 Backspace 键快速返回上级目录
-- **状态栏**：底部实时显示当前目录的文件数量和总大小
-
-### ✨ 一键插入文件/文件夹链接
-
-**双击文件**，插件自动将**本地文件链接**插入到当前文档中：
-
-
-| 文件类型                                    | 插入方式                    | 效果                           |
-| ------------------------------------------- | --------------------------- | ------------------------------ |
-| 图片（jpg/png/gif/webp/bmp/svg 等）         | `![文件名](file:///路径)`   | 思源内联显示图片               |
-| 视频（mp4/webm/ogg/mov/mkv/flv/avi/wmv 等） | `[🎬 文件名](file:///路径)` | 可点击的链接，附带视频图标     |
-| 其他文件（PDF/Word/Excel/压缩包等）         | `[📄 文件名](file:///路径)` | 可点击的链接，附带文件类型图标 |
-
-**双击文件夹**，插入**文件夹链接**：
-
-
-| 类型   | 插入方式                      | 效果               |
-| ------ | ----------------------------- | ------------------ |
-| 文件夹 | `[📂 文件夹名](file:///路径)` | 可点击的文件夹链接 |
-
-> 💡 **右键菜单**提供更多选项：
->
-> - **复制到 assets 并插入**：将文件本体复制到思源 `assets` 目录后插入（推荐，跨设备可用）
-> - **插入本地链接**：插入 `file:///` 格式的本地绝对路径链接（仅本机可用）
-> - **打开文件/文件夹**：用系统默认程序打开
-> - **在资源管理器中显示**：打开文件/文件夹所在位置
-> - **复制路径**：复制完整路径到剪贴板
-
-### 🔍 实时搜索 & 深度搜索
-
-- **实时搜索**：在搜索框输入关键词，即时过滤当前目录的文件（支持多关键词空格分隔 AND 匹配）
-- **深度搜索**：按 Enter 键或点击 🔍 按钮，递归搜索所有子目录，结果渐进式返回，实时显示搜索进度
-- 搜索完成后可点击"返回"按钮或清空搜索框回到正常浏览模式
-
-### ⭐ 收藏夹
-
-右键点击任意文件夹 → "添加收藏"，收藏的文件夹以标签形式显示在顶部工具栏，点击即可一键跳转。常去的文件夹不再需要逐层点进去。
-
-- 收藏夹支持**拖拽排序**，自由调整标签顺序
-- 右键已收藏的文件夹可选择"取消收藏"
-- 收藏数据自动持久化保存
-
-### 📊 排序功能
-
-按 **名称 / 大小 / 修改时间** 排序，支持升序和降序切换。排序偏好自动保存，下次打开时保持上次的排序方式。
-
-### 🖼️ 列表视图 & 图标视图
-
-- **列表视图**：紧凑排列，显示文件名、大小和修改时间，适合快速浏览大量文件
-- **图标视图**：缩略图网格，图片文件鼠标悬停显示大图预览，适合浏览图片库
-
-两种视图一键切换，偏好自动保存。
-
-### 🔗 失效链接修复（红黄绿三灯 + 无感修复）
-
-插件在工具栏提供**链接状态指示灯**，自动检测当前文档中的本地链接状态：
-
-
-| 指示灯 | 状态 | 含义                                            |
-| ------ | ---- | ----------------------------------------------- |
-| ⚪     | 白灯 | 当前文档没有本地文件链接                        |
-| ⏳     | 转圈 | 正在后台检测并修复链接...                       |
-| 🟢     | 绿灯 | 所有本地链接均有效 ✅                           |
-| 🟡     | 黄灯 | 有重名文件链接需要手动选择候选文件 ⚠️         |
-| 🔴     | 红灯 | 文件删除或者文件名修改的失效链接无法自动修复 🔗 |
-
-**无感自动修复**：打开文档时，插件自动在后台扫描并尝试修复失效链接：
-
-- **单结果自动修复**：如果搜索到唯一匹配文件，自动替换链接，无需任何操作
-- **多结果黄灯提示**：如果搜索到多个候选文件，黄灯亮起，点击指示灯手动选择
-- **无结果红灯提示**：如果完全找不到文件，红灯亮起，提示手动处理
-
-**点击指示灯手动修复**：
-
-- 弹出修复对话框，显示每个失效链接的修复状态
-- **三级搜索策略**：
-  - **R1**：在原目录附近搜索同名文件
-  - **R2**：向上级目录扩大搜索范围
-  - **R3**：全盘深度搜索（覆盖网盘挂载盘）
-- **指纹匹配**：通过文件大小 + 修改时间精确识别同名文件
-- **批量并行**：多个失效链接同时处理，对话框实时显示进度和结果
-
-### 💾 状态持久化
-
-插件会自动记住你上次选择的盘符、浏览的文件夹、视图模式和排序方式，下次打开时直接回到上次的位置，无需重新导航。
-
-### 🌗 暗色模式适配
-
-样式自动适配思源笔记主题，暗色模式下同样舒适可用。
-
+- **Platforms**: Windows / macOS / Linux desktop SiYuan Note (v3.0.0+)
+- **License**: GPL-3.0
+- **GitHub**: https://github.com/sqalei/siyuan-plugin-localbrowse
 
 ---
 
-## 安装方法
+## Quick Start
 
-### 方式一：从集市安装（推荐）
+### 1. Open File Browser
 
-1. 打开思源笔记 → 设置 → 集市
-2. 搜索 "LocalBrowse" 或 "本地文件浏览器"
-3. 点击安装并启用
+After installation, a 📂 icon appears in the right Dock panel. Click to open.
 
-### 方式二：手动导入
+### 2. Browse Files
 
-1. 前往 [GitHub Releases](https://github.com/sqalei/siyuan-plugin-localbrowse) 下载最新版 ZIP 安装包
-2. 思源笔记 → 设置 → 集市 → 下载 → 导入
-3. 选择下载的 ZIP 文件并安装
-4. 在插件列表中启用插件
+- Select storage from the top-left dropdown (Windows drive letters / macOS volumes / Linux mount points)
+- Click a folder to enter, click breadcrumbs to go back
+- Press **Backspace** to go up one level
 
----
+### 3. Configure Cross-Device Sync Folder (Recommended if you use multiple devices)
 
-## 快速上手
+Right-click the sync folder button on the toolbar to open the configuration window. Configure your sync folder, e.g., PC A: `D:\BaiduSyncdisk\LocalBrowseSync`, PC B: `E:\BaiduSyncdisk\LocalBrowseSync`.
 
-### 第一步：打开文件浏览器
+Note: `LocalBrowseSync` is fixed. Select the parent folder of your sync disk (e.g., Baidu Netdisk sync folder), and the plugin will automatically create `LocalBrowseSync` inside it. All devices must use `LocalBrowseSync` as the sync folder name.
 
-安装启用后，右侧 Dock 面板会出现 **文件夹图标** 📂，点击图标打开文件浏览器。
+### 4. Insert File Links
 
-### 第二步：浏览文件
+- **Double-click a file** → Insert a local file link (supports file reorganization — if you move files, links auto-repair to the new path)
+- **Right-click a folder** → Insert a folder link (📂 icon)
 
-- 左上角下拉框选择盘符
-- 单击文件夹进入下级目录
-- 点击面包屑导航返回上级
-- 按 **Backspace** 键快速返回上级
+### 5. Bookmark Folders
 
-### 第三步：插入文件/文件夹链接
+Right-click a folder → "Add Bookmark". Click the bookmark tag at the top for one-click navigation.
 
-找到目标后，**双击**即可插入到当前笔记中：
+### 6. Broken Link Auto-Repair
 
-- **双击文件** → 插入本地文件链接（图片内联显示，其他文件显示为带图标的链接）
-- **双击文件夹** → 插入文件夹链接（显示为 📂 图标链接）
+The indicator light shows link status when switching documents:
 
-### 第四步：收藏常用文件夹
-
-右键点击常用文件夹 → "添加收藏"，以后直接点击顶部收藏标签一键跳转。
-
-### 第五步：失效链接自动修复
-
-切换文档时，插件自动在后台检测并尝试修复失效链接：
-
-- 🟢 绿灯 = 一切正常
-- 🟡 黄灯 = 需要手动选择候选文件（点击指示灯打开对话框）
-- 🔴 红灯 = 有链接无法修复，需要手动处理
+- 🟢 Green = All links valid
+- 🟡 Yellow = Multiple candidates, click indicator to choose
+- 🔴 Red = Unrepairable links
 
 ---
 
-## 详细教程
+## Features
 
-### 文件/文件夹插入方式对比
+### 📁 Browse Local File System
 
+Automatically detects all available storage. Switch quickly via the top-left dropdown. Supports local disks, mounted cloud drives, and sync folders.
 
-| 方式                     | 操作         | 链接类型              | 跨设备可用性 | 适用场景           |
-| ------------------------ | ------------ | --------------------- | ------------ | ------------------ |
-| **双击文件**             | 双击文件     | `file:///` 本地链接   | ❌ 仅本机    | 快速引用本地文件   |
-| **双击文件夹**           | 双击文件夹   | `file:///` 文件夹链接 | ❌ 仅本机    | 快速引用本地文件夹 |
-| **右键 → 插入本地文件** | 右键菜单选择 | `assets/文件名`       | ✅ 可用      | 跨设备同步推荐     |
-| **右键 → 插入本地链接** | 右键菜单选择 | `file:///` 本地链接   | ❌ 仅本机    | 临时引用大文件     |
+- Breadcrumb navigation: click any level to go back
+- Backspace shortcut: go up one level
+- Status bar: shows file count and total size of current directory
 
-> 💡 **推荐**：日常快速引用用**双击插入本地链接**；需要跨设备同步时用**右键 →插入本地文件**。
+### ✨ Insert File/Folder Links
 
-### 搜索技巧
+**Double-click a file** to insert a link. Different file types have different effects:
 
-- **实时过滤**：输入关键词即时过滤当前目录，支持多关键词空格分隔（AND 匹配）
-- **深度搜索**：输入关键词后按 **Enter** 键，递归搜索所有子目录
-- **取消搜索**：点击搜索框右侧的 × 按钮，或清空搜索框内容
-- **搜索进度**：深度搜索时状态栏会实时显示已扫描的目录数
+| File Type | Format | Effect |
+|-----------|--------|--------|
+| Images (jpg/png/gif/webp/bmp/svg etc.) | `![filename](file:///path)` | Inline display in SiYuan |
+| Videos (mp4/webm/ogg/mov/mkv/flv/avi/wmv etc.) | `[🎬 filename](file:///path)` | Clickable link with video icon |
+| Other files (PDF/Word/Excel/archives etc.) | `[📄 filename](file:///path)` | Clickable link with file type icon |
 
-### 收藏夹管理
+**Right-click a folder** to insert a folder link: `[📂 foldername](file:///path)`
 
-- **添加收藏**：右键点击文件夹 → "添加收藏"
-- **取消收藏**：右键点击已收藏的文件夹 → "取消收藏"
-- **调整顺序**：拖拽收藏标签可自由调整顺序
-- **快速跳转**：点击收藏标签直接跳转到对应文件夹
+**Right-click menu** provides more options:
 
-### 视图切换
+| Menu Item | Description | Cross-Device |
+|-----------|-------------|--------------|
+| Insert Local File | Copy file to SiYuan `assets` directory and insert | ✅ Accessible on any device |
+| Insert Local Link | Insert `file:///` absolute path link | ⚠️ Current device only (works with cross-device sync) |
+| Open File/Folder | Open with system default app | — |
+| Show in File Manager | Open file/folder location | — |
+| Copy Path | Copy full path to clipboard | — |
 
-- 点击工具栏的 ☰ / ⊞ 按钮切换列表视图和图标视图
-- 列表视图适合快速浏览大量文件
-- 图标视图适合浏览图片，支持鼠标悬停预览大图
+**Which insertion method to use?**
 
-### 排序方式
+| Scenario | Recommended Method |
+|----------|-------------------|
+| Files in sync folder, used on multiple computers | Double-click + configure cross-device sync folder |
+| Files used on one computer only | Double-click |
+| Need access on all devices (including mobile) | Right-click → Insert Local File (stored in assets) |
 
-点击工具栏的 "⇅ 名称" 按钮，可选择：
+### 🔍 Search Files
 
-- 按名称排序（字母顺序）
-- 按大小排序
-- 按修改时间排序
+- **Real-time Filter**: Type keywords in the search box to instantly filter the current directory (supports multiple keywords with space-separated AND matching)
+- **Deep Search**: Press **Enter** or click 🔍 to recursively search all subdirectories with live progress
+- **Cancel Search**: Click the × button or clear the search box
 
-再次点击可切换升序 / 降序。
+### ⭐ Bookmarks
 
-### 失效链接修复流程
+- **Add Bookmark**: Right-click a folder → "Add Bookmark"
+- **Remove Bookmark**: Right-click a bookmarked folder → "Remove Bookmark"
+- **Reorder**: Drag bookmark tags
+- **Quick Navigation**: Click a bookmark tag to jump directly
 
-**自动修复（无感）**：
+### 📊 Sorting
 
-1. 打开包含本地链接的文档
-2. 插件自动在后台扫描文档中的 `file:///` 链接
-3. 如果某失效链接搜索到**唯一匹配文件**，自动替换，无需任何操作
-4. 指示灯自动更新状态
+Click the "⇅ Name" button on the toolbar to sort by **name/size/modification time**. Click again to toggle ascending/descending. Sort preference is saved automatically.
 
-**手动修复（黄灯/红灯时）**：
+### 🖼️ View Toggle
 
-1. 点击工具栏的 🟡 或 🔴 指示灯
-2. 弹出修复对话框，显示每个失效链接的状态：
-   - ✅ 已自动修复：单结果已自动替换
-   - 🔗 失效：文件已不存在，无法修复
-   - ⚠️ 未找到同名文件：提供候选文件供选择
-3. 对于多候选结果，点击选择正确的文件
-4. 点击"应用修复"完成替换
+Click the ☰ / ⊞ button on the toolbar to switch:
 
----
+- **List View**: Compact layout showing filename, size, and modification time
+- **Icon View**: Thumbnail grid with hover-to-preview for images
 
-## 常见问题
-
-**Q：提示"无法访问目录"怎么办？**
-A：请确认对应的驱动器已正确挂载且可访问。如果使用的是网盘挂载工具，确保挂载服务正在运行。
-
-**Q：文件没有插入到笔记中？**
-A：请确保双击文件前编辑器已聚焦（点击一下编辑区域）。如果自动插入失败，Markdown 链接会自动复制到剪贴板，直接 Ctrl+V 粘贴即可。
-
-**Q：插入的链接在其他电脑上打不开？**
-A：双击插入的是 `file:///` 本地链接，仅在当前电脑有效。如需跨设备使用，请右键选择"复制到 assets 并插入"，文件会存入思源 `assets` 目录，同步后任意设备均可访问。
-
-**Q：支持 macOS / Linux 吗？**
-A：目前仅支持 Windows 桌面版，因为插件依赖 Node.js 的文件系统接口和 Windows 盘符体系。其他平台的支持在后续计划中。
-
-**Q：网盘挂载的文件路径在不同电脑上不一致怎么办？**
-A：建议使用同步盘（如坚果云、OneDrive）将文件同步到本地统一路径，或者在各电脑上挂载网盘为相同的盘符。
-
-**Q：失效链接修复找不到文件？**
-A：请确保文件确实存在于某个可访问的磁盘上。如果文件在网盘挂载盘中，确保网盘已正确挂载。R3 全盘搜索会覆盖所有盘符，包括挂载盘。
+Preference is saved automatically.
 
 ---
 
-## 更新日志
+### 🔗 Broken Link Repair
+
+The plugin automatically detects `file:///` local links in the current document. The toolbar indicator light shows status:
+
+| Indicator | Status | Meaning |
+|-----------|--------|---------|
+| ⚪ | White | No local file links in current document |
+| ⏳ | Spinning | Detecting and repairing links... |
+| 🟢 | Green | All local links valid ✅ |
+| 🟡 | Yellow | Multiple candidates need manual selection ⚠️ |
+| 🔴 | Red | File deleted or renamed, cannot auto-repair 🔗 |
+
+**Auto-Repair (Seamless)**: When opening a document, the plugin automatically scans and repairs broken links in the background — single matches are replaced automatically with no user action needed.
+
+**Manual Repair (Yellow/Red light)**:
+
+1. Click the 🟡 or 🔴 indicator on the toolbar
+2. A repair dialog shows each broken link's status
+3. For multiple candidates, click to select the correct file
+4. Click "Apply Repair"
+
+---
+
+### 🔄 Cross-Device Sync Folder
+
+When using sync disks (Baidu Netdisk, Nutstore, iCloud Drive, OneDrive, etc.) across multiple computers, the same file has different paths on each device. After configuring the cross-device sync folder, the plugin automatically repairs broken links caused by path differences.
+
+**Supported scenarios**:
+
+- **Cross-platform**: Windows ↔ macOS ↔ Linux
+- **Same-platform cross-device**: Two Windows PCs with different drive letters (e.g., `D:\` ↔ `E:\`)
+
+#### Configuration Steps
+
+**Perform once on each computer**:
+
+1. **Right-click** the 🔄 button on the toolbar to open the settings panel
+2. The panel title shows the current platform tag (🪟 Windows / 🍎 macOS / 🐧 Linux)
+3. Click the 📂 browse button to select the **parent folder** of your sync disk
+   - The plugin automatically creates a `LocalBrowseSync` subfolder, which your sync disk will sync automatically
+4. Click **Save**
+5. Configuration is automatically synced to other devices via SiYuan Cloud
+
+**Example**: Using Baidu Netdisk sync, three devices configured as follows:
+
+| Device | Platform | Selected Parent Folder | Actual Sync Folder Path |
+|--------|----------|----------------------|------------------------|
+| Office Desktop | Windows | `D:\BaiduSyncdisk` | `D:\BaiduSyncdisk\LocalBrowseSync` |
+| Home Laptop | Windows | `E:\BaiduSyncdisk` | `E:\BaiduSyncdisk\LocalBrowseSync` |
+| MacBook | macOS | `/Users/sqalei/BaiduSyncdisk` | `/Users/sqalei/BaiduSyncdisk/LocalBrowseSync` |
+
+**After configuration**:
+
+- 🔄 button shows **🔄 LocalBrowseSync** (green, indicating configured)
+- Click 🔄 button to open the sync folder directly
+- Right-click 🔄 button to modify or clear configuration
+
+#### Cross-Device Repair Effect
+
+After inserting a file link from the sync folder on Computer A, when you open the same note on Computer B, the plugin automatically repairs the path to Computer B's correct path — no manual action needed.
+
+Repair flow for links within the sync folder:
+
+1. Replace path prefix → File exists → **Repaired directly** ✅
+2. Replace path prefix → File not found → **Deep search** within sync folder → Repair if found
+3. Still not found after search → Report failure, no full-disk search
+
+> 💡 Links outside the sync folder are not affected by cross-device repair: current-platform links go through R1→R2→R3 full disk search, other-platform links are ignored (not repaired).
+
+---
+
+## FAQ
+
+**Q: "Cannot access directory" error?**
+A: Confirm the storage path is properly mounted and accessible. For cloud drive mounting tools, ensure the mounting service is running.
+
+**Q: File not inserted into the note?**
+A: Make sure the editor is focused (click the editing area) before double-clicking. If auto-insert fails, the link is copied to the clipboard — just Ctrl+V to paste.
+
+**Q: Inserted links don't work on other computers?**
+A: Double-click inserts a `file:///` local link, valid only on the current computer. Solutions for cross-device use:
+- **Option 1**: Right-click → "Insert Local File" — file is stored in SiYuan `assets` directory, accessible on any device after sync
+- **Option 2**: If the file is in a sync disk, configure cross-device sync folder for automatic repair
+
+**Q: Does it support macOS / Linux?**
+A: ✅ Full support for all three platforms. macOS auto-detects `/Volumes/` mount volumes, Linux auto-detects `/mnt/` and `/media/` mount points.
+
+**Q: Two Windows PCs with different drive letters?**
+A: ✅ Fully supported! But you need to use the cross-device sync folder feature. Configure the sync folder, e.g., PC A: `D:\BaiduSyncdisk\LocalBrowseSync`, PC B: `E:\BaiduSyncdisk\LocalBrowseSync` — the plugin automatically replaces the drive letter prefix.
+
+**Q: Must the sync folder name be identical?**
+A: The plugin automatically unifies it to `LocalBrowseSync`. Just select the parent folder — no need to worry about name inconsistency. However, the **parent folder name** (e.g., `BaiduSyncdisk`) must be the same across all devices.
+
+**Q: Can I configure multiple sync folders?**
+A: Currently only one group is supported. If you use multiple sync disks, put them under the same parent folder.
+
+**Q: Broken link repair can't find a file?**
+A: Ensure the file exists on accessible storage. For mounted cloud drives, confirm they're properly mounted. R3 full disk search covers all storage including mounted volumes.
+
+---
+
+## Changelog
+
+### v0.6.0
+
+**Cross-platform support + cross-device sync folder upgrade**
+
+- Windows / macOS / Linux platform-specific adaptation
+- Cross-device sync folder supports same-platform multi-device (stored by hostname, no overwriting)
+- Full path prefix matching — no false positives from same-name folders
+- Unified sync folder name to `LocalBrowseSync`
+- Opens sync folder by default on startup
+- macOS cloud drive shortcuts
+- Docker / API dual-mode support
+- 20+ bug fixes
 
 ### v0.5.6
 
-- 失效链接修复升级为红黄绿三灯指示，支持无感自动修复
-- 双击文件夹支持插入文件夹链接
-- 优化指示灯状态描述（黄灯=重名文件需手动选择，红灯=文件删除或重命名无法修复）
-- 更新插件文档说明
+- Broken link repair upgraded to red/yellow/green indicator + seamless auto-repair
+- Double-click folder to insert folder link
 
 ### v0.5.5
 
-- 修复视频插入位置和持久化问题（支持 NodeVideo 块）
-- 优化非图片/视频文件的插入显示（保留原文件名 + 文件类型图标）
-- 优化收藏夹拖拽排序（DOM 交换替代重建，消除闪烁）
-- 优化失效链接修复对话框的图标和文字显示
-- 首次展开文件夹去掉"加载中..."闪烁
-- 全面 bug 审查：修复 parseInt 缺 radix、decodeURIComponent 异常、candidateArea null 访问、localStorage JSON.parse 异常等问题
-
-### v0.5.0
-
-- 新增失效链接修复功能（三级搜索 + 指纹匹配）
-- 新增链接状态指示灯（自动检测文档中的失效链接）
-- 新增文件链接点击拦截器（修复 fragment 导致打不开文件的问题）
+- New broken link repair feature (3-level search + fingerprint matching)
+- New link status indicator
+- New file link click interceptor
 
 ### v0.4.0
 
-- 新增收藏夹功能（添加/取消收藏、拖拽排序）
-- 新增排序功能（名称/大小/修改时间，升序/降序）
-- 新增列表视图和图标视图切换
-- 新增图片悬停预览
+- New bookmarks, sorting, list/icon views, image hover preview
 
 ### v0.3.0
 
-- 新增深度搜索功能（递归搜索子目录）
-- 新增实时搜索过滤（多关键词 AND 匹配）
-- 新增右键菜单（打开文件、在资源管理器中显示、复制路径等）
+- New deep search, real-time search filter, right-click menu
 
 ### v0.2.0
 
-- 新增状态持久化（记住盘符、路径、视图、排序）
-- 新增面包屑导航
-- 优化暗色模式适配
+- New state persistence, breadcrumb navigation, dark mode adaptation
 
 ### v0.1.0
 
-- 初始版本：本地文件浏览器、双击插入文件、盘符切换
+- Initial release: local file browser, double-click to insert files, storage switching
 
 ---
 
-## 反馈与建议
+## Feedback
 
-如果你在使用过程中遇到任何问题，或有功能建议，欢迎通过以下方式反馈：
+- **GitHub Issues**: https://github.com/sqalei/siyuan-plugin-localbrowse/issues
+- Email: sqalei@qq.com
 
-- **GitHub Issues**：https://github.com/sqalei/siyuan-plugin-localbrowse/issues
-
-如果你感觉本插件对你有用，请帮我点亮 🌟，我会持续改进和完善这个插件，感谢大家的支持和反馈！🙏
+If you find this plugin useful, please give it a 🌟. Thank you for your support! 🙏

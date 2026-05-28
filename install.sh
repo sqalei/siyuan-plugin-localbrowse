@@ -1,10 +1,10 @@
 #!/bin/bash
-# Install script for siyuan-plugin-clouddrive
+# Install script for siyuan-plugin-localbrowse
 # This script copies the plugin to the SiYuan plugins directory
 
-PLUGIN_DIR="$HOME/.siyuan/data/plugins/siyuan-plugin-clouddrive"
+PLUGIN_DIR="$HOME/.siyuan/data/plugins/siyuan-plugin-localbrowse"
 
-echo "Installing siyuan-plugin-clouddrive..."
+echo "Installing siyuan-plugin-localbrowse..."
 
 # Create plugin directory if not exists
 mkdir -p "$PLUGIN_DIR"
