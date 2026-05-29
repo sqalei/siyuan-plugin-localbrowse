@@ -173,3 +173,55 @@
 #cd-favorites-list::-webkit-scrollbar {
     display: none;
 }
+
+/* Audio control buttons */
+.cd-audio-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.1);
+    color: var(--b3-theme-on-background, #333);
+    cursor: pointer;
+    flex-shrink: 0;
+    transition: background 0.2s, opacity 0.2s, transform 0.15s ease-out;
+    user-select: none;
+    overflow: hidden;
+}
+.cd-audio-btn:hover {
+    background: rgba(128, 128, 128, 0.2);
+}
+.cd-audio-btn:active {
+    transform: scale(0.96);
+}
+
+/* Play button: larger, primary color */
+.cd-audio-btn-play {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    background: var(--b3-theme-primary, #4285f4);
+    color: #fff;
+}
+.cd-audio-btn-play:hover {
+    background: var(--b3-theme-primary-light, #5c9aff);
+}
+
+/* Ensure SVG icons never overflow button */
+.cd-audio-btn svg {
+    display: block;
+    max-width: 100%;
+    max-height: 100%;
+    flex-shrink: 0;
+}
+
+/* Loading spinner animation */
+@keyframes cd-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+.cd-audio-btn.cd-loading svg {
+    animation: cd-spin 1s linear infinite;
+}

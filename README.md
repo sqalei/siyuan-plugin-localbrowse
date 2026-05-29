@@ -190,6 +190,19 @@ Repair flow for links within the sync folder:
 
 ---
 
+
+### 🎵 Music Player
+
+Double-click any audio file to play. Built-in music player features:
+
+- **Playback Controls**: Play/pause, previous/next track, seekable progress bar
+- **Volume Control**: Adjustable volume slider with persistent settings
+- **Real-time Lyrics**: Auto-searches for .lrc lyric files, synchronized highlighting, click to seek
+- **Cover Art**: Auto-extracts MP3 embedded cover art, preloads covers during browsing
+- **Immersive Experience**: Blurred cover art as lyrics background with crossfade transition animations
+- **Playlist**: Auto-detects all audio files in the current directory, continuous folder playback
+- **Preload Optimization**: Preloads next track audio and cover art for instant switching
+
 ## FAQ
 
 **Q: "Cannot access directory" error?**
@@ -221,6 +234,16 @@ A: Ensure the file exists on accessible storage. For mounted cloud drives, confi
 ---
 
 ## Changelog
+
+### v0.6.2
+
+**Music player + performance optimizations**
+
+- 🎵 Music player: play/pause, prev/next, seek, volume, LRC lyrics sync, cover art, immersive lyrics background
+- Cover/lyrics crossfade transition animations
+- Next track audio and cover art preloading, instant switching
+- Canvas pre-generated blur thumbnails, lyrics background delay fully eliminated
+- 8 bug fixes (cover not updating, lyrics flickering, async race conditions, etc.)
 
 ### v0.6.0
 

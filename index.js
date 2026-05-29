@@ -74,6 +74,30 @@ class LocalBrowsePlugin extends Plugin {
         this.platformName = this.platform === 'darwin' ? 'macOS' : (this.platform === 'linux' ? 'Linux' : 'Windows');
         this._sep = (path && path.sep) || (this.isWindows ? '\\' : '/');  // 跨平台路径分隔符
         this.debug = localStorage.getItem('cd_debug') === 'true';  // 调试日志开关，默认关闭
+        this._audioEl = null;      // 音频播放器
+        this._audioPlaylist = [];  // 当前目录音频列表
+        this._audioIndex = -1;     // 当前播放索引
+        this._audioCurrentPath = null;  // 当前播放音频的本地路径
+        this._audioCurrentName = null;  // 当前播放音频的文件名（单独存储，避免从路径中二次提取）
+        this._audioEventsBound = false;  // 防止重复绑定
+        this._lrcLines = [];       // 解析后的歌词行 [{time, text}, ...]
+        this._lrcActiveIndex = -1; // 当前高亮歌词行索引
+        this._lrcExpanded = false; // 歌词面板是否展开
+        this._lastAudioHighlight = null; // 文件列表中上次高亮的音频项
+        this._audioPlayerClosed = false; // 用户是否手动关闭了播放器（关闭后下次启动不再恢复）
+        this._audioPlayMode = parseInt(localStorage.getItem('cd_audio_mode') || '0', 10) || 0; // 播放模式：0=随机播放，1=列表循环，2=单曲循环
+        this._audioShouldAutoPlay = false; // 设置 src 后 canplay 时是否自动播放（恢复状态时不自动播放）
+        this._audioLoadTimer = null; // loading 状态延迟显示定时器（避免本地文件快速切换时闪烁）
+        this._savedVolume = parseFloat(localStorage.getItem('cd_audio_volume'));
+        if (isNaN(this._savedVolume) || this._savedVolume < 0 || this._savedVolume > 1) {
+            this._savedVolume = 0.8; // 默认音量
+        }
+        // 预加载缓存：提前准备下一首的封面、歌词，切歌时瞬间切换
+        this._preloadData = null; // {path, coverUrl, coverIsBlob, coverBlurUrl, lrcLines, lrcTitle, lrcArtist}
+        this._pendingCoverBlobRevoke = null; // crossfade 完成后待释放的旧封面 blob URL
+        this._pendingBlurBlobRevoke = null; // crossfade 完成后待释放的旧模糊缩略图 blob URL
+        this._coverFadeEpoch = 0; // crossfade 世代计数器，快速切歌时旧 cleanup 自动失效
+        this._lrcBgFadeEpoch = 0; // 歌词背景 crossfade 世代计数器
     }
 
     /**
@@ -277,6 +301,67 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 清理 Dock 面板引用，避免内存泄漏
         this.dockPanel = null;
+        // 保存音频播放器状态（如果用户没有手动关闭）
+        if (this._audioEl && this._audioCurrentPath && !this._audioPlayerClosed) {
+            // 优先使用单独存储的文件名，避免从路径提取时分隔符不匹配
+            var fileName = this._audioCurrentName;
+            if (!fileName) {
+                var sep = this._sep;
+                var lastSep = this._audioCurrentPath.lastIndexOf(sep);
+                if (lastSep < 0) {
+                    var altSep = (sep === '\\' || sep === '\\\\') ? '/' : '\\';
+                    var altIdx = this._audioCurrentPath.lastIndexOf(altSep);
+                    if (altIdx > lastSep) lastSep = altIdx;
+                }
+                fileName = lastSep >= 0 ? this._audioCurrentPath.substring(lastSep + 1) : this._audioCurrentPath;
+            }
+            this._saveAudioState(this._audioCurrentPath, fileName);
+        }
+        // 清理音频播放器
+        if (this._audioEl) {
+            this._audioEl.pause();
+            this._audioEl.src = '';
+            this._audioEl = null;
+        }
+        // 清理 loading 延迟定时器
+        if (this._audioLoadTimer) {
+            clearTimeout(this._audioLoadTimer);
+            this._audioLoadTimer = null;
+        }
+        // 清理预加载数据
+        if (this._preloadData) {
+            if (this._preloadData.coverIsBlob && this._preloadData.coverUrl) {
+                URL.revokeObjectURL(this._preloadData.coverUrl);
+            }
+            if (this._preloadData.coverBlurUrl) {
+                URL.revokeObjectURL(this._preloadData.coverBlurUrl);
+            }
+            this._preloadData = null;
+        }
+        // 清理封面 ObjectURL
+        function revokeBlobBg(elId) {
+            var el = document.getElementById(elId);
+            if (el && el.style.backgroundImage) {
+                var bgUrl = el.style.backgroundImage;
+                if (bgUrl.indexOf('blob:') !== -1) {
+                    URL.revokeObjectURL(bgUrl.replace(/^url\(["']?/, '').replace(/["']?\)$/, ''));
+                }
+            }
+        }
+        revokeBlobBg('cd-audio-cover');
+        revokeBlobBg('cd-audio-lrc-bg');
+        // 清理 crossfade 待释放的 blob URL（可能在 crossfade 过渡中被延迟释放）
+        if (this._pendingCoverBlobRevoke) {
+            try { URL.revokeObjectURL(this._pendingCoverBlobRevoke); } catch(x) {}
+            this._pendingCoverBlobRevoke = null;
+        }
+        if (this._pendingBlurBlobRevoke) {
+            try { URL.revokeObjectURL(this._pendingBlurBlobRevoke); } catch(x) {}
+            this._pendingBlurBlobRevoke = null;
+        }
+        this._lrcLines = [];
+        this._lrcActiveIndex = -1;
+        this._lrcExpanded = false;
     }
 
     uninstall() {
@@ -384,11 +469,14 @@ class LocalBrowsePlugin extends Plugin {
         // 导致平台被错误检测为 win32。Dock 面板渲染时重新检测并修正。
         this._correctPlatformIfNeeded();
 
+        // DOM 重建后需要重新绑定事件
+        this._audioEventsBound = false;
+
         var that = this;
         var el = this.dockPanel.element;
         
         var isDocker = that._isDockerBrowser();
-        el.innerHTML = '<div class="cd-container" style="height:100%;display:flex;flex-direction:column;padding:4px;box-sizing:border-box;font-size:13px;overflow:hidden">' +
+        el.innerHTML = '<div class="cd-container" style="height:100%;display:flex;flex-direction:column;padding:4px;box-sizing:border-box;font-size:13px;overflow:hidden;position:relative">' +
             '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px">' +
                 '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
                 '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
@@ -421,9 +509,36 @@ class LocalBrowsePlugin extends Plugin {
             '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
                 '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
             '</div>' +
-            '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px">' +
-                '<span id="cd-stats-text">📊 加载中...</span>' +
-                '<span id="cd-platform-badge" title="' + this.platformName + '" style="font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
+            '<div id="cd-audio-lrc-panel" style="display:none;position:absolute;bottom:36px;left:4px;right:4px;height:160px;overflow:hidden;font-size:11px;border:1px solid var(--b3-border,#eee);border-radius:8px 8px 0 0;z-index:10;box-shadow:0 -4px 16px rgba(0,0,0,0.12);scrollbar-width:none;-ms-overflow-style:none">' +
+                '<div id="cd-audio-lrc-bg" style="position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px 8px 0 0;opacity:0.38;background-size:cover;background-position:center;pointer-events:none"></div>' +
+                '<div style="position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px 8px 0 0;background:rgba(255,255,255,0.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);pointer-events:none"></div>' +
+                '<div style="position:relative;display:flex;height:100%;padding:10px;box-sizing:border-box">' +
+                    '<div id="cd-audio-cover" style="width:140px;height:140px;min-width:140px;margin-right:10px;border-radius:8px;background:var(--b3-theme-surface,#f0f0f0);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0;font-size:48px;background-size:cover;background-position:center;position:relative">🎵</div>' +
+                    '<div style="flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden">' +
+                        '<div id="cd-audio-lrc-content" style="flex:1;overflow-y:auto;overflow-x:hidden;padding:10px 8px 8px 8px;margin:4px 4px 4px 0;line-height:1.8;color:var(--b3-theme-secondary,#333);text-align:center;border-radius:6px;text-shadow:0 1px 3px rgba(255,255,255,0.7)">暂无歌词</div>' +
+                    '</div>' +
+                '</div>' +
+            '</div>' +
+            '<div id="cd-audio-bar" style="display:none;padding:4px 10px;flex-shrink:0;border-top:1px solid var(--b3-border,#eee);background:var(--b3-theme-background,#fff);flex-direction:column;gap:3px">' +
+                '<div style="display:flex;align-items:center;gap:8px">' +
+                    '<span id="cd-audio-prev" class="cd-audio-btn" title="上一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="17,5 8,12 17,19" fill="currentColor"/><rect x="5" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-play" class="cd-audio-btn cd-audio-btn-play" title="播放"><svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-next" class="cd-audio-btn" title="下一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="7,5 16,12 7,19" fill="currentColor"/><rect x="16" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-mode" class="cd-audio-btn" title="随机播放"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-name" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333);cursor:pointer" title="打开所在文件夹">未播放</span>' +
+                    '<span id="cd-audio-lrc-toggle" class="cd-audio-lrc-btn" style="cursor:pointer;font-size:11px;opacity:0.35;flex-shrink:0;transition:opacity 0.2s,color 0.2s" title="歌词">词</span>' +
+                    '<span id="cd-audio-time" style="font-size:10px;color:var(--b3-theme-secondary,#999);flex-shrink:0;white-space:nowrap">0:00/0:00</span>' +
+                    '<span id="cd-audio-vol-icon" style="cursor:pointer;font-size:12px;flex-shrink:0" title="静音">🔊</span>' +
+                    '<input id="cd-audio-vol" type="range" min="0" max="100" value="80" style="width:50px;height:3px;flex-shrink:0;cursor:pointer;accent-color:var(--b3-theme-primary,#4285f4)">' +
+                    '<span id="cd-audio-close" style="cursor:pointer;font-size:12px;opacity:0.5;flex-shrink:0" title="关闭">✕</span>' +
+                '</div>' +
+                '<div id="cd-audio-progress-wrap" style="width:100%;height:4px;background:var(--b3-border,#e0e0e0);border-radius:2px;cursor:pointer;position:relative">' +
+                    '<div id="cd-audio-progress" style="height:100%;background:var(--b3-theme-primary,#4285f4);border-radius:2px;width:0%;transition:width 0.1s linear;pointer-events:none"></div>' +
+                '</div>' +
+            '</div>' +
+            '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
+                '<span id="cd-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📊 加载中...</span>' +
+                '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
             '</div>' +
             '<div id="cd-context-menu" style="display:none;position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);min-width:160px;padding:4px 0;font-size:13px;user-select:none">' +
             '</div>' +
@@ -787,6 +902,12 @@ class LocalBrowsePlugin extends Plugin {
         }
         that._log('renderFileTree: initPath=' + initPath);
         this.loadDirectory(initPath);
+
+        // 绑定音频播放器事件（DOM 已就绪）
+        this._bindAudioEvents();
+
+        // 恢复上次音频播放器状态（如果用户没有手动关闭）
+        this._restoreAudioState();
 
         // 渲染收藏夹（DOM 已就绪）
         this.renderFavorites();
@@ -1341,6 +1462,8 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     renderFiles(files, currentPath) {
+        // 过滤不应显示的文件
+        files = files.filter(function(f) { return !this._shouldHideFile(f); }.bind(this));
         // 保存缓存用于搜索过滤
         this.cachedFiles = files.slice();
         this.cachedPath = currentPath;
@@ -1349,6 +1472,40 @@ class LocalBrowsePlugin extends Plugin {
         this.doRender(files, currentPath);
         // 更新底部统计栏
         this.updateFileStats();
+        // 检查是否有待定位的文件（跨文件夹导航后自动定位）
+        var that = this;
+        if (this._pendingLocateFileName) {
+            var locateName = this._pendingLocateFileName;
+            this._pendingLocateFileName = null;
+            // 延迟一帧，等 DOM 渲染完成
+            setTimeout(function() {
+                that._doLocateFile(locateName);
+            }, 100);
+        }
+    }
+
+    /**
+     * 判断文件是否应在 UI 中隐藏
+     * 1. 隐藏文件/目录（.开头）
+     * 2. 系统目录（$RECYCLE.BIN、System Volume Information）
+     * 3. 随机哈希名 DLL（如 a1b2c3d4e5f6.dll，文件名全为十六进制字符且较长）
+     */
+    _shouldHideFile(f) {
+        var name = f.name;
+        if (!name) return true;
+        // 隐藏文件
+        if (name.charAt(0) === '.') return true;
+        // 系统目录
+        if (name === '$RECYCLE.BIN' || name === 'System Volume Information') return true;
+        // 系统配置文件后缀 + 歌词文件（播放器自动加载，无需在列表中显示）
+        var ext = name.split('.').pop().toLowerCase();
+        if (ext === 'ini' || ext === 'sys' || ext === 'drv' || ext === 'lrc') return true;
+        // 随机哈希名 DLL（30位以上字母数字混合 + .dll 后缀）
+        if (name.length > 34 && name.toLowerCase().endsWith('.dll')) {
+            var stem = name.substring(0, name.length - 4);
+            if (/^[0-9a-zA-Z]{30,}$/.test(stem)) return true;
+        }
+        return false;
     }
 
     /**
@@ -2119,11 +2276,13 @@ class LocalBrowsePlugin extends Plugin {
 
         // 双模式：fs 优先，API 兜底
         this._fsReaddir(dirPath).then(function(entries) {
-            // 过滤隐藏文件和系统目录
+            // 过滤隐藏文件、系统目录和歌词文件
             entries = entries.filter(function(entry) {
+                var ext = entry.name.split('.').pop().toLowerCase();
                 return entry.name.charAt(0) !== '.' &&
                        entry.name !== '$RECYCLE.BIN' &&
-                       entry.name !== 'System Volume Information';
+                       entry.name !== 'System Volume Information' &&
+                       ext !== 'lrc';
             });
             entries.sort(function(a, b) {
                 if (a.isDir && !b.isDir) return -1;
@@ -2160,7 +2319,34 @@ class LocalBrowsePlugin extends Plugin {
             }
         }).catch(function(err) {
             console.warn('[LocalBrowse] renderListChildren error:', err);
-            containerEl.innerHTML = '<div style="padding:8px 12px;font-size:12px;color:var(--b3-theme-secondary,#999)">无法读取</div>';
+            var isENOENT = err && err.code === 'ENOENT';
+            if (!isENOENT && err && err.message) {
+                var m = err.message;
+                isENOENT = m.indexOf('ENOENT') !== -1 || m.indexOf('no such file') !== -1;
+            }
+            // ENOENT：静默处理——箭头消失、文件夹变淡、不提示
+            if (isENOENT) {
+                containerEl.innerHTML = '';
+                containerEl.style.display = 'none';
+                delete containerEl.dataset.loading;
+                var parentItem = containerEl.previousElementSibling;
+                if (parentItem && parentItem.classList.contains('cd-item')) {
+                    that._removeExpandArrow(parentItem);
+                    parentItem.style.opacity = '0.45';
+                }
+                return;
+            }
+            // 其他错误：显示提示
+            var errMsg = '无法读取';
+            if (err && (err.code === 'EACCES' || err.code === 'EPERM')) {
+                errMsg = '🔒 无访问权限';
+            } else if (err && err.message) {
+                var m2 = err.message;
+                if (m2.indexOf('EACCES') !== -1 || m2.indexOf('EPERM') !== -1 || m2.indexOf('permission') !== -1) {
+                    errMsg = '🔒 无访问权限';
+                }
+            }
+            containerEl.innerHTML = '<div style="padding:8px 12px;font-size:12px;color:var(--b3-theme-error,#e74c3c)">' + errMsg + '</div>';
             delete containerEl.dataset.loading;
         });
     }
@@ -2447,7 +2633,12 @@ class LocalBrowsePlugin extends Plugin {
                     var name = item.dataset.name;
 
                     if (!isDir) {
-                        that.handleFileClick(itemPath, name);
+                        // 音频文件双击播放，其他文件插入链接
+                        if (that.isAudioFile(name)) {
+                            that.playAudio(itemPath, name);
+                        } else {
+                            that.handleFileClick(itemPath, name);
+                        }
                     }
                 });
 
@@ -3500,6 +3691,10 @@ class LocalBrowsePlugin extends Plugin {
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         } else {
+            // 音频文件：优先显示播放选项
+            if (that.isAudioFile(fileName)) {
+                items.push({ icon: '🎵', label: '播放', action: function() { that.playAudio(filePath, fileName); } });
+            }
             items.push({ icon: '📂', label: '打开文件', action: isDocker ? null : function() { that.openFile(filePath); }, disabled: isDocker });
             items.push({ icon: '📁', label: '打开所在文件夹', action: isDocker ? null : function() { that.openContainingFolder(filePath); }, disabled: isDocker });
             items.push({ type: 'divider' });
@@ -3883,6 +4078,1612 @@ class LocalBrowsePlugin extends Plugin {
         var ext = fileName.split('.').pop().toLowerCase();
         var videoExts = {'mp4':1,'avi':1,'mkv':1,'mov':1,'wmv':1,'flv':1,'webm':1,'m4v':1,'mpg':1,'mpeg':1,'ts':1,'m2ts':1,'3gp':1};
         return !!videoExts[ext];
+    }
+
+    /**
+     * 判断是否为音频文件
+     */
+    isAudioFile(fileName) {
+        var ext = fileName.split('.').pop().toLowerCase();
+        var audioExts = {'mp3':1,'wav':1,'flac':1,'aac':1,'ogg':1,'wma':1,'m4a':1,'ape':1,'opus':1,'aiff':1,'alac':1};
+        return !!audioExts[ext];
+    }
+
+    /**
+     * 播放音频文件
+     * @param {string} filePath - 本地文件路径
+     * @param {string} fileName - 文件名
+     */
+    playAudio(filePath, fileName) {
+        var that = this;
+        var audioBar = document.getElementById('cd-audio-bar');
+        if (!audioBar) return;
+
+        // 构建 file:// URL
+        var fileUrl = that.toFileUrl(filePath);
+
+        // 如果没有 audio 元素则创建
+        if (!that._audioEl) {
+            that._audioEl = new Audio();
+            that._audioEl.volume = that._savedVolume;
+            that._audioPlaylist = [];  // 当前目录的音频文件列表
+            that._audioIndex = -1;     // 当前播放索引
+        }
+
+        // 更新播放列表（从当前目录的缓存文件中筛选音频文件）
+        var cachedFiles = that.cachedFiles || [];
+        var audioFiles = [];
+        var curPath = that.cachedPath;
+        var sep = that._sep;
+        if (curPath && !curPath.endsWith(sep)) curPath += sep;
+        for (var i = 0; i < cachedFiles.length; i++) {
+            if (!cachedFiles[i].isDir && that.isAudioFile(cachedFiles[i].name)) {
+                audioFiles.push({
+                    name: cachedFiles[i].name,
+                    isDir: false,
+                    path: curPath + cachedFiles[i].name
+                });
+            }
+        }
+        that._audioPlaylist = audioFiles;
+
+        // 找到当前文件在播放列表中的索引
+        var idx = -1;
+        for (var j = 0; j < audioFiles.length; j++) {
+            if (audioFiles[j].name === fileName) {
+                idx = j;
+                break;
+            }
+        }
+        that._audioIndex = idx >= 0 ? idx : 0;
+        that._audioCurrentPath = filePath;
+        that._audioCurrentName = fileName;  // 单独存储文件名
+
+        // 设置预加载策略：仅加载元数据，避免网盘大文件阻塞 UI
+        that._audioEl.preload = 'metadata';
+        that._audioShouldAutoPlay = true;
+
+        // 先更新 UI，避免设置 src 后网盘文件加载阻塞界面
+        audioBar.style.display = 'flex';
+        var nameEl = document.getElementById('cd-audio-name');
+        if (nameEl) nameEl.textContent = '🎵 ' + fileName;
+        // 延迟显示 loading：本地文件 canplay 很快，不需要 loading；只有加载卡顿超过 80ms 才显示
+        if (that._audioLoadTimer) clearTimeout(that._audioLoadTimer);
+        that._audioLoadTimer = setTimeout(function() {
+            that._updateAudioPlayBtn('loading');
+        }, 80);
+
+        // 延迟设置 src：让 UI 渲染先完成，再触发音频加载
+        setTimeout(function() {
+            if (!that._audioEl) return;
+            that._audioEl.src = fileUrl;
+        }, 0);
+
+        // 为文件列表添加底部内边距，避免最后一个条目紧贴播放器栏
+        var fileListEl = document.getElementById('cd-file-list');
+        if (fileListEl) fileListEl.style.paddingBottom = '44px';
+
+        // 加载歌词和封面：清理可能存在的旧预加载数据
+        if (that._preloadData) {
+            if (that._preloadData.coverIsBlob && that._preloadData.coverUrl) {
+                URL.revokeObjectURL(that._preloadData.coverUrl);
+            }
+            if (that._preloadData.coverBlurUrl) {
+                URL.revokeObjectURL(that._preloadData.coverBlurUrl);
+            }
+            that._preloadData = null;
+        }
+        that._loadLrc(filePath);
+
+        // 首次播放后延迟触发预加载
+        setTimeout(function() {
+            that._preloadNext();
+        }, 500);
+
+        // 保存播放器状态（下次打开插件时恢复）
+        that._audioPlayerClosed = false;
+        that._saveAudioState(filePath, fileName);
+    }
+
+    /**
+     * 更新播放/暂停按钮状态
+     */
+    _updateAudioPlayBtn(isPlaying) {
+        var playBtn = document.getElementById('cd-audio-play');
+        if (!playBtn) return;
+
+        // 避免频繁切换同一状态导致 DOM 抖动（网盘缓冲时 waiting/canplay 可能交替触发）
+        var stateMap = { true: 'playing', false: 'paused' };
+        var newState = isPlaying === 'loading' ? 'loading' : stateMap[isPlaying];
+        if (playBtn.getAttribute('data-play-state') === newState) return;
+        playBtn.setAttribute('data-play-state', newState);
+
+        var svgPlay = '<svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg>';
+        var svgPause = '<svg viewBox="0 0 24 24" width="14" height="14"><rect x="7" y="5" width="4" height="14" rx="1.5" fill="currentColor"/><rect x="13" y="5" width="4" height="14" rx="1.5" fill="currentColor"/></svg>';
+        var svgLoading = '<svg viewBox="0 0 24 24" width="14" height="14"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="8 4" stroke-linecap="round"/></svg>';
+        if (isPlaying === 'loading') {
+            playBtn.innerHTML = svgLoading;
+            playBtn.title = '加载中...';
+            playBtn.classList.add('cd-loading');
+        } else if (isPlaying) {
+            playBtn.innerHTML = svgPause;
+            playBtn.title = '暂停';
+            playBtn.classList.remove('cd-loading');
+        } else {
+            playBtn.innerHTML = svgPlay;
+            playBtn.title = '播放';
+            playBtn.classList.remove('cd-loading');
+        }
+    }
+
+    /**
+     * 更新播放模式按钮的图标和提示
+     * 模式：0=随机播放 🎲，1=列表循环 🔁，2=单曲循环 🔂
+     */
+    _updateModeBtn(btn) {
+        var svgs = [
+            '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" fill="currentColor"/></svg>',
+            '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" fill="currentColor"/></svg>',
+            '<svg viewBox="0 0 24 24" width="12" height="12"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4zm-4-5H9v2h4v-2z" fill="currentColor"/></svg>'
+        ];
+        var titles = ['随机播放', '列表循环', '单曲循环'];
+        var mode = this._audioPlayMode || 0;
+        if (btn) {
+            btn.innerHTML = svgs[mode];
+            btn.title = titles[mode];
+            // 随机模式稍淡，循环模式高亮
+            btn.style.opacity = mode === 0 ? '0.6' : '1';
+        }
+    }
+
+    /**
+     * 格式化秒数为 m:ss
+     */
+    _formatAudioTime(sec) {
+        if (!sec || !isFinite(sec)) return '0:00';
+        var m = Math.floor(sec / 60);
+        var s = Math.floor(sec % 60);
+        return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    /**
+     * 根据播放模式计算下一首索引（不修改当前索引）
+     * @param {number} direction - -1 上一首，1 下一首
+     * @param {boolean} fromEnded - 是否由 ended 事件触发
+     * @returns {number} 下一首索引
+     */
+    _getNextAudioIndex(direction, fromEnded) {
+        var that = this;
+        if (!that._audioPlaylist || that._audioPlaylist.length === 0) return -1;
+        var len = that._audioPlaylist.length;
+        var curIdx = that._audioIndex;
+
+        // 单曲循环（mode=2）：歌曲结束时仍然是当前
+        if (fromEnded && that._audioPlayMode === 2) {
+            return curIdx;
+        }
+
+        // 随机播放（mode=0）且自动结束：随机选一首（避免重复当前，仅1首时顺序循环）
+        if (fromEnded && that._audioPlayMode === 0 && len > 1) {
+            var newIdx;
+            do { newIdx = Math.floor(Math.random() * len); } while (newIdx === curIdx);
+            return newIdx;
+        }
+
+        // 列表循环(1) 或 手动切歌（任何模式）：顺序切换
+        return (curIdx + direction + len) % len;
+    }
+
+    /**
+     * 预加载下一首的封面和歌词（在当前歌曲播放时后台准备）
+     */
+    _preloadNext() {
+        var that = this;
+        if (!that._audioPlaylist || that._audioPlaylist.length <= 1) return;
+
+        var nextIdx = that._getNextAudioIndex(1, false);
+        if (nextIdx < 0 || nextIdx === that._audioIndex) return;
+        var f = that._audioPlaylist[nextIdx];
+        var audioPath = f.path;
+
+        // 如果已经预加载了这首，跳过
+        if (that._preloadData && that._preloadData.path === audioPath) return;
+
+        // 清理旧的预加载 blob URL
+        if (that._preloadData && that._preloadData.coverIsBlob && that._preloadData.coverUrl) {
+            URL.revokeObjectURL(that._preloadData.coverUrl);
+        }
+        if (that._preloadData && that._preloadData.coverBlurUrl) {
+            URL.revokeObjectURL(that._preloadData.coverBlurUrl);
+        }
+        that._preloadData = { path: audioPath, coverUrl: null, coverIsBlob: false, coverBlurUrl: null, lrcLines: null };
+
+        // 预加载歌词
+        var lrcPath = audioPath.replace(/\.[^.]+$/, '.lrc');
+        that._fsReadFile(lrcPath, 'utf-8').then(function(content) {
+            if (content && that._preloadData && that._preloadData.path === audioPath) {
+                that._preloadData.lrcLines = that._parseLrc(content);
+            }
+        }).catch(function() {
+            // 无歌词文件，lrcLines 保持 null
+        });
+
+        // 预加载封面（目录封面）
+        var lastSep = audioPath.replace(/\\/g, '/').lastIndexOf('/');
+        var dir = lastSep >= 0 ? audioPath.substring(0, lastSep) : '';
+        var coverNames = ['cover.jpg', 'cover.png', 'folder.jpg', 'folder.png',
+            'album.jpg', 'album.png', 'front.jpg', 'front.png',
+            'Cover.jpg', 'Cover.png', 'Folder.jpg', 'Folder.png'];
+        var tryIndex = 0;
+        function tryNextCover() {
+            if (tryIndex >= coverNames.length) {
+                // 目录封面没找到，尝试 MP3 内嵌封面
+                that._preloadMp3Cover(audioPath);
+                return;
+            }
+            var coverPath = dir + that._sep + coverNames[tryIndex];
+            var coverFileName = coverNames[tryIndex]; // 闭包捕获文件名用于判断 MIME
+            tryIndex++;
+            that._fsExists(coverPath).then(function(exists) {
+                if (exists && that._preloadData && that._preloadData.path === audioPath) {
+                    // 读取封面文件并转为 blob URL，确保切歌时图片数据已在内存中
+                    that._fsReadFile(coverPath, null).then(function(buf) {
+                        if (!buf || !that._preloadData || that._preloadData.path !== audioPath) return;
+                        var mime = coverFileName.toLowerCase().endsWith('.png') ? 'image/png' : 'image/jpeg';
+                        var blob = new Blob([buf], { type: mime });
+                        var url = URL.createObjectURL(blob);
+                        that._preloadData.coverUrl = url;
+                        that._preloadData.coverIsBlob = true;
+                        // 预生成模糊背景缩略图（小尺寸+高斯模糊，避免浏览器实时 blur 大图导致延迟）
+                        that._createBlurThumb(url).then(function(blurUrl) {
+                            if (blurUrl && that._preloadData && that._preloadData.path === audioPath) {
+                                that._preloadData.coverBlurUrl = blurUrl;
+                            }
+                        });
+                    }).catch(function() {
+                        // 读取失败，降级为 file:// URL
+                        if (that._preloadData && that._preloadData.path === audioPath) {
+                            that._preloadData.coverUrl = that.toFileUrl(coverPath);
+                            that._preloadData.coverIsBlob = false;
+                        }
+                    });
+                } else {
+                    tryNextCover();
+                }
+            }).catch(function() {
+                tryNextCover();
+            });
+        }
+        tryNextCover();
+    }
+
+    /**
+     * 预加载 MP3 内嵌封面（仅读取前 256KB，避免网盘大文件阻塞）
+     */
+    _preloadMp3Cover(filePath) {
+        var that = this;
+        var ext = filePath.split('.').pop().toLowerCase();
+        if (ext !== 'mp3') return;
+        if (!that._preloadData) return;
+        var targetPath = that._preloadData.path;
+
+        // 使用范围读取：只读前 256KB（ID3v2 标签通常在文件头部）
+        that._fsReadFile(filePath, null, 262144).then(function(buf) {
+            if (!buf || !that._preloadData || that._preloadData.path !== targetPath) return;
+            var bytes;
+            if (buf instanceof ArrayBuffer) {
+                bytes = new Uint8Array(buf);
+            } else if (buf.length !== undefined) {
+                bytes = new Uint8Array(buf);
+            } else return;
+
+            if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) return;
+
+            var tagSize = ((bytes[6] & 0x7F) << 21) | ((bytes[7] & 0x7F) << 14) | ((bytes[8] & 0x7F) << 7) | (bytes[9] & 0x7F);
+            var pos = 10;
+            while (pos < Math.min(tagSize + 10, bytes.length) - 10) {
+                if (pos + 10 > bytes.length) break;
+                var frameId = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+                var frameSize = (bytes[pos + 4] << 24) | (bytes[pos + 5] << 16) | (bytes[pos + 6] << 8) | bytes[pos + 7];
+                if (frameSize <= 0 || pos + 10 + frameSize > bytes.length) break;
+                if (frameId === 'APIC') {
+                    var frameData = bytes.subarray(pos + 10, pos + 10 + frameSize);
+                    var encoding = frameData[0];
+                    var mimeEnd = 1;
+                    while (mimeEnd < frameData.length && frameData[mimeEnd] !== 0) mimeEnd++;
+                    var mime = '';
+                    for (var m = 1; m < mimeEnd; m++) mime += String.fromCharCode(frameData[m]);
+                    var descStart = mimeEnd + 2;
+                    if (encoding === 1 || encoding === 2) {
+                        while (descStart < frameData.length - 1) {
+                            if (frameData[descStart] === 0 && frameData[descStart + 1] === 0) {
+                                descStart += 2;
+                                break;
+                            }
+                            descStart++;
+                        }
+                    } else {
+                        while (descStart < frameData.length && frameData[descStart] !== 0) descStart++;
+                        descStart++;
+                    }
+                    if (descStart >= frameData.length) break;
+                    var imgData = frameData.subarray(descStart);
+                    var blob = new Blob([imgData], { type: mime || 'image/jpeg' });
+                    if (that._preloadData && that._preloadData.path === targetPath) {
+                        var blobUrl = URL.createObjectURL(blob);
+                        that._preloadData.coverUrl = blobUrl;
+                        that._preloadData.coverIsBlob = true;
+                        // 预生成模糊背景缩略图
+                        that._createBlurThumb(blobUrl).then(function(blurUrl) {
+                            if (blurUrl && that._preloadData && that._preloadData.path === targetPath) {
+                                that._preloadData.coverBlurUrl = blurUrl;
+                            }
+                        });
+                    }
+                    return;
+                }
+                pos += 10 + frameSize;
+            }
+        }).catch(function() {});
+    }
+
+    /**
+     * 从封面 URL 创建预模糊的小缩略图（用于歌词背景）
+     * 用 Canvas 缩小到 80x80 + 高斯模糊，大幅降低实时渲染负担
+     * @param {string} imageUrl - 封面 blob URL
+     * @returns {Promise<string|null>} 模糊缩略图的 blob URL，失败返回 null
+     */
+    _createBlurThumb(imageUrl) {
+        return new Promise(function(resolve) {
+            var img = new Image();
+            img.onload = function() {
+                var W = 80, H = 80;
+                var canvas = document.createElement('canvas');
+                canvas.width = W;
+                canvas.height = H;
+                var ctx = canvas.getContext('2d');
+                ctx.filter = 'blur(6px) saturate(1.8)';
+                ctx.drawImage(img, 0, 0, W, H);
+                canvas.toBlob(function(blob) {
+                    if (blob) {
+                        resolve(URL.createObjectURL(blob));
+                    } else {
+                        resolve(null);
+                    }
+                }, 'image/jpeg', 0.6);
+            };
+            img.onerror = function() { resolve(null); };
+            img.src = imageUrl;
+        });
+    }
+
+    /**
+     * 封面 crossfade：从旧封面平滑过渡到新封面
+     * 使用 overlay 叠加层实现，避免 "先清后设" 的闪烁
+     * @param {HTMLElement} coverEl - cd-audio-cover 元素
+     * @param {string} newImageUrl - 新封面 URL
+     */
+    _crossfadeCover(coverEl, newImageUrl) {
+        var that = this;
+        var myEpoch = ++that._coverFadeEpoch; // 递增世代，旧 cleanup 自动失效
+
+        // 清理上一次未完成的 crossfade（快速切歌场景）
+        var pending = coverEl.querySelector('.cd-cover-fade');
+        if (pending) {
+            // 立即将 pending 的图片应用为封面背景
+            var pImg = pending.style.backgroundImage;
+            if (pImg) {
+                coverEl.style.backgroundImage = pImg;
+                coverEl.style.backgroundSize = 'cover';
+                coverEl.style.backgroundPosition = 'center';
+            } else {
+                coverEl.style.backgroundImage = '';
+            }
+            coverEl.innerHTML = '';
+            pending.remove();
+        }
+
+        // 相同图片，跳过动画
+        if (coverEl.style.backgroundImage === 'url(' + newImageUrl + ')') return;
+
+        // 无旧封面（首次加载），直接设置即可
+        if (!coverEl.style.backgroundImage) {
+            coverEl.style.backgroundImage = 'url(' + newImageUrl + ')';
+            coverEl.style.backgroundSize = 'cover';
+            coverEl.style.backgroundPosition = 'center';
+            coverEl.innerHTML = '';
+            return;
+        }
+
+        // 创建 overlay 叠加层，从透明渐变到不透明
+        var overlay = document.createElement('div');
+        overlay.className = 'cd-cover-fade';
+        overlay.style.cssText = 'position:absolute;inset:0;border-radius:inherit;background-size:cover;background-position:center;opacity:0;transition:opacity 0.35s ease;pointer-events:none;z-index:2';
+        overlay.style.backgroundImage = 'url(' + newImageUrl + ')';
+        coverEl.appendChild(overlay);
+
+        // 强制重排后启动过渡动画
+        void overlay.offsetHeight;
+        overlay.style.opacity = '1';
+
+        var cleaned = false;
+        var cleanup = function(e) {
+            if (cleaned) return;
+            if (myEpoch !== that._coverFadeEpoch) return; // 已被更新的 crossfade 取代，跳过
+            cleaned = true;
+            try { overlay.removeEventListener('transitionend', cleanup); } catch(x) {}
+            // 动画结束：将新封面设为元素背景，移除 overlay
+            coverEl.style.backgroundImage = 'url(' + newImageUrl + ')';
+            coverEl.style.backgroundSize = 'cover';
+            coverEl.style.backgroundPosition = 'center';
+            coverEl.innerHTML = '';
+            if (overlay.parentNode) overlay.remove();
+            // 延迟释放旧 blob URL（此时新图已完全显示）
+            if (that._pendingCoverBlobRevoke) {
+                try { URL.revokeObjectURL(that._pendingCoverBlobRevoke); } catch(x) {}
+                that._pendingCoverBlobRevoke = null;
+            }
+        };
+        overlay.addEventListener('transitionend', cleanup);
+        setTimeout(cleanup, 600); // 安全兜底
+    }
+
+    /**
+     * 封面 crossfade：从旧封面平滑过渡到无封面状态（显示 🎵）
+     * @param {HTMLElement} coverEl - cd-audio-cover 元素
+     */
+    _crossfadeToNoCover(coverEl) {
+        var that = this;
+        var myEpoch = ++that._coverFadeEpoch;
+
+        // 清理 pending（释放 pending overlay 的 blob 背景，防止泄漏）
+        var pending = coverEl.querySelector('.cd-cover-fade');
+        if (pending) {
+            var pImg = pending.style.backgroundImage;
+            if (pImg && pImg.indexOf('blob:') !== -1) {
+                try { URL.revokeObjectURL(pImg.replace(/^url\(["']?/, '').replace(/["']?\)$/, '')); } catch(x) {}
+            }
+            pending.remove();
+        }
+
+        // 已经无封面，跳过
+        if (!coverEl.style.backgroundImage) return;
+
+        // 创建 overlay：默认背景色 + 🎵，从透明渐变到不透明，遮住旧封面
+        var overlay = document.createElement('div');
+        overlay.className = 'cd-cover-fade';
+        overlay.style.cssText = 'position:absolute;inset:0;border-radius:inherit;background:var(--b3-theme-surface,#f0f0f0);opacity:0;transition:opacity 0.3s ease;pointer-events:none;z-index:2;display:flex;align-items:center;justify-content:center;font-size:48px';
+        overlay.textContent = '\uD83C\uDFB5'; // 🎵
+        coverEl.appendChild(overlay);
+
+        void overlay.offsetHeight;
+        overlay.style.opacity = '1';
+
+        var cleaned = false;
+        var cleanup = function(e) {
+            if (cleaned) return;
+            if (myEpoch !== that._coverFadeEpoch) return;
+            cleaned = true;
+            try { overlay.removeEventListener('transitionend', cleanup); } catch(x) {}
+            coverEl.style.backgroundImage = '';
+            coverEl.style.backgroundSize = 'cover';
+            coverEl.style.backgroundPosition = 'center';
+            coverEl.innerHTML = '\uD83C\uDFB5'; // 🎵
+            if (overlay.parentNode) overlay.remove();
+            if (that._pendingCoverBlobRevoke) {
+                try { URL.revokeObjectURL(that._pendingCoverBlobRevoke); } catch(x) {}
+                that._pendingCoverBlobRevoke = null;
+            }
+        };
+        overlay.addEventListener('transitionend', cleanup);
+        setTimeout(cleanup, 500);
+    }
+
+    /**
+     * 歌词背景 crossfade：平滑切换背景图/色
+     * @param {HTMLElement} bgEl - cd-audio-lrc-bg 元素
+     * @param {string|null} newImageUrl - 新背景 URL，null 表示使用柔和色
+     */
+    _crossfadeLrcBg(bgEl, newImageUrl) {
+        var that = this;
+        var myEpoch = ++that._lrcBgFadeEpoch;
+
+        // 清理 pending（释放 pending overlay 的 blob 背景，防止泄漏）
+        var pending = bgEl.querySelector('.cd-lrcbg-fade');
+        if (pending) {
+            var pImg = pending.style.backgroundImage;
+            var pColor = pending.style.backgroundColor;
+            if (pImg) {
+                bgEl.style.backgroundImage = pImg;
+                // 释放被覆盖的 blob URL
+                if (pImg.indexOf('blob:') !== -1) {
+                    try { URL.revokeObjectURL(pImg.replace(/^url\(["']?/, '').replace(/["']?\)$/, '')); } catch(x) {}
+                }
+            }
+            if (pColor) bgEl.style.backgroundColor = pColor;
+            pending.remove();
+        }
+
+        var hasImage = !!newImageUrl;
+
+        // 创建 overlay
+        var overlay = document.createElement('div');
+        overlay.className = 'cd-lrcbg-fade';
+        overlay.style.cssText = 'position:absolute;inset:0;border-radius:inherit;background-size:cover;background-position:center;opacity:0;transition:opacity 0.4s ease;pointer-events:none';
+        if (hasImage) {
+            overlay.style.backgroundImage = 'url(' + newImageUrl + ')';
+        } else {
+            overlay.style.backgroundColor = 'hsl(210, 35%, 88%)';
+        }
+        bgEl.appendChild(overlay);
+
+        void overlay.offsetHeight;
+        overlay.style.opacity = '1';
+
+        var cleaned = false;
+        var cleanup = function(e) {
+            if (cleaned) return;
+            if (myEpoch !== that._lrcBgFadeEpoch) return;
+            cleaned = true;
+            try { overlay.removeEventListener('transitionend', cleanup); } catch(x) {}
+            if (hasImage) {
+                bgEl.style.backgroundImage = 'url(' + newImageUrl + ')';
+                bgEl.style.backgroundColor = '';
+            } else {
+                bgEl.style.backgroundImage = '';
+                bgEl.style.backgroundColor = 'hsl(210, 35%, 88%)';
+            }
+            if (overlay.parentNode) overlay.remove();
+            // 释放旧的模糊缩略图 blob
+            if (that._pendingBlurBlobRevoke) {
+                try { URL.revokeObjectURL(that._pendingBlurBlobRevoke); } catch(x) {}
+                that._pendingBlurBlobRevoke = null;
+            }
+        };
+        overlay.addEventListener('transitionend', cleanup);
+        setTimeout(cleanup, 600);
+    }
+
+    /**
+     * 播放上一首/下一首
+     * @param {number} direction - -1 上一首，1 下一首
+     * @param {boolean} fromEnded - 是否由 ended 事件触发（影响播放模式行为）
+     */
+    _playAudioPrevNext(direction, fromEnded) {
+        var that = this;
+        if (!that._audioPlaylist || that._audioPlaylist.length === 0) return;
+        var len = that._audioPlaylist.length;
+
+        // 单曲循环（mode=2）：歌曲结束时重新播放当前
+        if (fromEnded && that._audioPlayMode === 2) {
+            that._audioEl.currentTime = 0;
+            that._audioEl.play().catch(function() {});
+            return;
+        }
+
+        // 随机播放（mode=0）且自动结束：随机选一首（避免重复当前，仅1首时顺序循环）
+        if (fromEnded && that._audioPlayMode === 0 && len > 1) {
+            var newIdx;
+            do { newIdx = Math.floor(Math.random() * len); } while (newIdx === that._audioIndex);
+            that._audioIndex = newIdx;
+        } else {
+            // 列表循环(1) 或 手动切歌（任何模式）：顺序切换
+            that._audioIndex = (that._audioIndex + direction + len) % len;
+        }
+        var f = that._audioPlaylist[that._audioIndex];
+        var audioPath = f.path || ((that.cachedPath && that.cachedPath.endsWith(that._sep) ? that.cachedPath : that.cachedPath + that._sep) + f.name);
+        that._audioCurrentPath = audioPath;
+        that._audioCurrentName = f.name;  // 单独存储文件名
+        var fileUrl = that.toFileUrl(audioPath);
+        that._audioEl.preload = 'metadata';
+        that._audioShouldAutoPlay = true;
+        var nameEl = document.getElementById('cd-audio-name');
+        if (nameEl) nameEl.textContent = '🎵 ' + f.name;
+        // 延迟显示 loading：本地文件 canplay 很快，不需要 loading；只有加载卡顿超过 80ms 才显示
+        if (that._audioLoadTimer) clearTimeout(that._audioLoadTimer);
+        that._audioLoadTimer = setTimeout(function() {
+            that._updateAudioPlayBtn('loading');
+        }, 80);
+        setTimeout(function() {
+            if (!that._audioEl) return;
+            that._audioEl.src = fileUrl;
+        }, 0);
+
+        // 加载歌词和封面：优先使用预加载数据，瞬间切换
+        var preloaded = that._preloadData && that._preloadData.path === audioPath;
+        if (preloaded) {
+            that._loadLrc(audioPath, that._preloadData);
+        } else {
+            that._loadLrc(audioPath);
+        }
+
+        // 清理预加载数据：如果预加载数据已用于当前封面（path 匹配），
+        // 则不释放 blob URL（封面元素还在引用），交给 onunload 统一释放
+        if (that._preloadData) {
+            if (!preloaded) {
+                if (that._preloadData.coverIsBlob && that._preloadData.coverUrl) {
+                    URL.revokeObjectURL(that._preloadData.coverUrl);
+                }
+                if (that._preloadData.coverBlurUrl) {
+                    URL.revokeObjectURL(that._preloadData.coverBlurUrl);
+                }
+            }
+            that._preloadData = null;
+        }
+        // 延迟触发下一首预加载（让当前切歌的 UI 更新先完成）
+        setTimeout(function() {
+            that._preloadNext();
+        }, 200);
+
+        // 保存播放器状态
+        that._audioPlayerClosed = false;
+        that._saveAudioState(audioPath, f.name);
+    }
+
+    /**
+     * 在文件列表中定位当前播放的音频文件并高亮
+     * 支持跨文件夹：如果音频不在当前目录，会自动导航到音频所在目录
+     */
+    _locateAudioInList() {
+        var that = this;
+        var filePath = that._audioCurrentPath;
+        if (!filePath) {
+            that.showToastMsg('没有正在播放的音频');
+            return;
+        }
+
+        // 优先使用单独存储的文件名（避免路径分隔符不匹配导致提取错误）
+        var fileName = that._audioCurrentName;
+        var dirPath = '';
+
+        // 如果没有单独存储的文件名，则从路径中提取（兼容两种分隔符）
+        if (!fileName) {
+            var sep = that._sep;
+            var lastSepIdx = filePath.lastIndexOf(sep);
+            // 兼容：如果平台分隔符找不到，尝试另一种分隔符
+            if (lastSepIdx < 0) {
+                var altSep = (sep === '\\' || sep === '\\\\') ? '/' : '\\';
+                var altIdx = filePath.lastIndexOf(altSep);
+                if (altIdx > lastSepIdx) lastSepIdx = altIdx;
+            }
+            fileName = lastSepIdx >= 0 ? filePath.substring(lastSepIdx + 1) : filePath;
+        }
+
+        // 从路径中提取目录路径（兼容两种分隔符）
+        var sep2 = that._sep;
+        var dirSepIdx = filePath.lastIndexOf(sep2);
+        if (dirSepIdx < 0) {
+            var altSep2 = (sep2 === '\\' || sep2 === '\\\\') ? '/' : '\\';
+            var altIdx2 = filePath.lastIndexOf(altSep2);
+            if (altIdx2 > dirSepIdx) dirSepIdx = altIdx2;
+        }
+        dirPath = dirSepIdx >= 0 ? filePath.substring(0, dirSepIdx) : '';
+
+        // 规范化目录路径用于比较（去末尾分隔符）
+        var normalizeDir = function(p) {
+            if (!p) return '';
+            while (p.length > 1 && (p.endsWith('\\') || p.endsWith('/'))) {
+                p = p.slice(0, -1);
+            }
+            return p;
+        };
+
+        var currentDir = normalizeDir(that.currentPath);
+        var targetDir = normalizeDir(dirPath);
+
+        that._log('_locateAudioInList: currentPath=', that.currentPath, 'filePath=', filePath, 'fileName=', fileName, 'currentDir=', currentDir, 'targetDir=', targetDir);
+
+        // 如果当前不在音频所在目录，先导航过去
+        if (targetDir && targetDir !== currentDir) {
+            // 设置待定位标记，renderFiles 完成后会自动定位
+            that._pendingLocateFileName = fileName;
+            that.loadDirectory(targetDir);
+            return;
+        }
+
+        // 当前已在目标目录，直接定位
+        that._doLocateFile(fileName);
+    }
+
+    /**
+     * 在当前文件列表中查找并高亮指定文件名
+     * @param {string} fileName - 文件名
+     * @param {number} [retryCount=0] - 当前重试次数
+     */
+    _doLocateFile(fileName, retryCount) {
+        var that = this;
+        retryCount = retryCount || 0;
+        var fileListEl = document.getElementById('cd-file-list');
+        if (!fileListEl) return;
+
+        // 查找匹配的文件项
+        var items = fileListEl.querySelectorAll('.cd-item[data-name]');
+        var target = null;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].dataset.name === fileName) {
+                target = items[i];
+                break;
+            }
+        }
+
+        if (!target) {
+            // 分批渲染模式下，目标文件可能还没被渲染到 DOM 中
+            var state = that.listRenderState;
+            if (state && state.files && state.renderedCount < state.files.length) {
+                var targetIdx = -1;
+                for (var k = 0; k < state.files.length; k++) {
+                    if (state.files[k].name === fileName) {
+                        targetIdx = k;
+                        break;
+                    }
+                }
+                if (targetIdx >= 0) {
+                    var neededBatch = Math.floor(targetIdx / state.batchSize) + 1;
+                    var currentBatch = Math.ceil(state.renderedCount / state.batchSize);
+                    if (currentBatch < neededBatch) {
+                        that._log('_doLocateFile: batch render needed, currentBatch=' + currentBatch + ', neededBatch=' + neededBatch);
+                        that.renderListBatch(fileListEl);
+                        setTimeout(function() {
+                            that._doLocateFile(fileName, retryCount);
+                        }, 80);
+                        return;
+                    }
+                }
+            }
+
+            // 列表可能还在渲染中（分批渲染或 DOM 未就绪），自动重试最多 5 次
+            if (retryCount < 5) {
+                that._log('_doLocateFile: not found, retry ' + (retryCount + 1) + '/5, fileName=', fileName, 'items=', items.length);
+                setTimeout(function() {
+                    that._doLocateFile(fileName, retryCount + 1);
+                }, 200);
+                return;
+            }
+            // 重试耗尽，输出详细诊断日志
+            var names = [];
+            for (var j = 0; j < Math.min(items.length, 20); j++) {
+                names.push(items[j].dataset.name);
+            }
+            that._log('_doLocateFile: not found after retries, fileName=', fileName, 'items=', items.length, 'sample names=', names.join(', '));
+            that.showToastMsg('未在当前列表中找到该音频');
+            return;
+        }
+
+        that._log('_doLocateFile: found', fileName);
+
+        // 滚动到目标元素
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+
+        // 添加高亮效果
+        target.style.background = 'var(--b3-theme-primary-lightest,rgba(66,133,244,0.15))';
+        target.style.transition = 'background 0.3s';
+
+        // 清除之前的高亮
+        if (that._lastAudioHighlight) {
+            that._lastAudioHighlight.style.background = '';
+        }
+        that._lastAudioHighlight = target;
+
+        // 2秒后淡出高亮
+        setTimeout(function() {
+            if (target && target.style) {
+                target.style.background = '';
+            }
+            if (that._lastAudioHighlight === target) {
+                that._lastAudioHighlight = null;
+            }
+        }, 2000);
+    }
+
+    /**
+     * 绑定音频播放器事件（仅绑定一次）
+     */
+    _bindAudioEvents() {
+        var that = this;
+        if (that._audioEventsBound) return;  // 防止重复绑定
+        that._audioEventsBound = true;
+
+        var playBtn = document.getElementById('cd-audio-play');
+        var prevBtn = document.getElementById('cd-audio-prev');
+        var nextBtn = document.getElementById('cd-audio-next');
+        var closeBtn = document.getElementById('cd-audio-close');
+        var volInput = document.getElementById('cd-audio-vol');
+        var volIcon = document.getElementById('cd-audio-vol-icon');
+        var progressWrap = document.getElementById('cd-audio-progress-wrap');
+        var lrcToggle = document.getElementById('cd-audio-lrc-toggle');
+        var progressBar = document.getElementById('cd-audio-progress');
+        var timeEl = document.getElementById('cd-audio-time');
+
+        // 播放/暂停
+        if (playBtn) {
+            playBtn.addEventListener('click', function() {
+                if (!that._audioEl) return;
+                if (that._audioEl.paused) {
+                    that._audioEl.play().catch(function() {});
+                    that._updateAudioPlayBtn(true);
+                } else {
+                    that._audioEl.pause();
+                    that._updateAudioPlayBtn(false);
+                }
+            });
+        }
+
+        // 点击歌曲名在文件列表中定位
+        var nameEl = document.getElementById('cd-audio-name');
+        if (nameEl) {
+            nameEl.addEventListener('click', function() {
+                that._locateAudioInList();
+            });
+        }
+
+        // 上一首/下一首
+        if (prevBtn) prevBtn.addEventListener('click', function() { that._playAudioPrevNext(-1); });
+        if (nextBtn) nextBtn.addEventListener('click', function() { that._playAudioPrevNext(1); });
+
+        // 播放模式切换
+        var modeBtn = document.getElementById('cd-audio-mode');
+        if (modeBtn) {
+            // 初始化按钮显示
+            that._updateModeBtn(modeBtn);
+            modeBtn.addEventListener('click', function() {
+                that._audioPlayMode = (that._audioPlayMode + 1) % 3;
+                that._updateModeBtn(modeBtn);
+                // 保存播放模式到 localStorage
+                try { localStorage.setItem('cd_audio_mode', that._audioPlayMode); } catch (e) {}
+            });
+        }
+
+        // 歌词面板展开/收起
+        if (lrcToggle) {
+            lrcToggle.addEventListener('click', function() {
+                that._lrcExpanded = !that._lrcExpanded;
+                var lrcPanel = document.getElementById('cd-audio-lrc-panel');
+                if (lrcPanel) {
+                    if (that._lrcExpanded) {
+                        // 动态计算 bottom：音频栏 + 底部统计栏的高度
+                        var audioBar = document.getElementById('cd-audio-bar');
+                        var statsBar = document.getElementById('cd-stats-bar');
+                        var bottom = 4;  // 容器 padding
+                        if (statsBar) bottom += statsBar.offsetHeight;
+                        if (audioBar) bottom += audioBar.offsetHeight;
+                        lrcPanel.style.bottom = bottom + 'px';
+                        lrcPanel.style.display = 'block';
+                    } else {
+                        lrcPanel.style.display = 'none';
+                    }
+                }
+                lrcToggle.style.opacity = that._lrcExpanded ? '1' : '0.5';
+            });
+        }
+
+        // 关闭播放器
+        if (closeBtn) {
+            closeBtn.addEventListener('click', function() {
+                if (that._audioEl) {
+                    that._audioEl.pause();
+                    that._audioEl.src = '';
+                }
+                var audioBar = document.getElementById('cd-audio-bar');
+                if (audioBar) audioBar.style.display = 'none';
+                that._updateAudioPlayBtn(false);
+                // 移除文件列表底部内边距
+                var fileListEl = document.getElementById('cd-file-list');
+                if (fileListEl) fileListEl.style.paddingBottom = '';
+                // 收起歌词面板
+                that._lrcExpanded = false;
+                var lrcPanel = document.getElementById('cd-audio-lrc-panel');
+                if (lrcPanel) lrcPanel.style.display = 'none';
+                if (lrcToggle) lrcToggle.style.opacity = '0.5';
+                // 标记用户手动关闭，下次启动不再恢复播放器
+                that._audioPlayerClosed = true;
+                that._audioCurrentName = null;
+                that._saveAudioState(null, null);
+            });
+        }
+
+        // 音量滑块
+        if (volInput) {
+            volInput.value = Math.round(that._savedVolume * 100);
+            volInput.addEventListener('input', function() {
+                var v = this.value / 100;
+                if (that._audioEl) that._audioEl.volume = v;
+                that._savedVolume = v;
+                localStorage.setItem('cd_audio_volume', v);
+                if (volIcon) volIcon.textContent = this.value == 0 ? '🔇' : (this.value < 50 ? '🔉' : '🔊');
+            });
+        }
+
+        // 点击音量图标静音/恢复
+        if (volIcon) {
+            volIcon.addEventListener('click', function() {
+                if (!that._audioEl) return;
+                if (that._audioEl.volume > 0) {
+                    that._audioEl._prevVol = that._audioEl.volume;
+                    that._audioEl.volume = 0;
+                    volInput.value = 0;
+                    volIcon.textContent = '🔇';
+                } else {
+                    var restoredVol = that._audioEl._prevVol || that._savedVolume || 0.8;
+                    that._audioEl.volume = restoredVol;
+                    that._savedVolume = restoredVol;
+                    localStorage.setItem('cd_audio_volume', restoredVol);
+                    volInput.value = Math.round(restoredVol * 100);
+                    volIcon.textContent = restoredVol < 0.5 ? '🔉' : '🔊';
+                }
+            });
+        }
+
+        // 进度条点击跳转
+        if (progressWrap) {
+            progressWrap.addEventListener('click', function(e) {
+                if (!that._audioEl || !that._audioEl.duration) return;
+                var rect = this.getBoundingClientRect();
+                var ratio = (e.clientX - rect.left) / rect.width;
+                ratio = Math.max(0, Math.min(1, ratio));
+                that._audioEl.currentTime = ratio * that._audioEl.duration;
+            });
+        }
+
+        // Audio 元素事件（仅首次创建时绑定，避免重复）
+        var newAudio = false;
+        if (!that._audioEl) {
+            that._audioEl = new Audio();
+            that._audioEl.volume = that._savedVolume;
+            that._audioPlaylist = [];
+            that._audioIndex = -1;
+            newAudio = true;
+        }
+
+        if (newAudio) {
+            that._audioEl.addEventListener('timeupdate', function() {
+                if (!that._audioEl.duration) return;
+                var pct = (that._audioEl.currentTime / that._audioEl.duration) * 100;
+                if (progressBar) progressBar.style.width = pct + '%';
+                if (timeEl) timeEl.textContent = that._formatAudioTime(that._audioEl.currentTime) + '/' + that._formatAudioTime(that._audioEl.duration);
+                // 同步歌词高亮
+                that._updateLrcHighlight(that._audioEl.currentTime);
+            });
+
+            // canplay：元数据加载完成，可以开始播放（解决网盘大文件阻塞 UI）
+            that._audioEl.addEventListener('canplay', function() {
+                if (!that._audioEl) return;
+                // 取消延迟 loading（本地文件加载快，不需要显示 loading）
+                if (that._audioLoadTimer) {
+                    clearTimeout(that._audioLoadTimer);
+                    that._audioLoadTimer = null;
+                }
+                // 仅当显式请求播放时才自动 play（恢复状态时不自动播放）
+                if (that._audioShouldAutoPlay && that._audioEl.paused) {
+                    that._audioShouldAutoPlay = false;
+                    that._audioEl.play().catch(function(e) {
+                        that._error('canplay auto-play failed:', e);
+                    });
+                }
+                // 当前歌曲已就绪，后台预加载下一首
+                that._preloadNext();
+            });
+
+            // waiting：网络缓冲中，显示加载状态
+            that._audioEl.addEventListener('waiting', function() {
+                if (that._audioLoadTimer) {
+                    clearTimeout(that._audioLoadTimer);
+                    that._audioLoadTimer = null;
+                }
+                that._updateAudioPlayBtn('loading');
+            });
+
+            // playing：开始播放，更新为暂停按钮
+            that._audioEl.addEventListener('playing', function() {
+                that._updateAudioPlayBtn(true);
+            });
+
+            that._audioEl.addEventListener('ended', function() {
+                // 随机播放(0) / 列表循环(1) / 单曲循环(2) 统一由 _playAudioPrevNext 处理
+                that._playAudioPrevNext(1, true);
+            });
+
+            that._audioEl.addEventListener('error', function() {
+                that._error('Audio playback error');
+                that._audioShouldAutoPlay = false;
+                that._updateAudioPlayBtn(false);
+            });
+        }
+    }
+
+    /**
+     * 保存音频播放器状态（双写：saveData 持久化 + localStorage 即时缓存）
+     * 音频路径是设备相关的，不需要跨设备同步
+     * @param {string|null} filePath - 音频文件路径，null 表示用户关闭了播放器
+     * @param {string|null} fileName - 音频文件名
+     */
+    _saveAudioState(filePath, fileName) {
+        var that = this;
+        try {
+            var key = 'cd_audio_state_' + this.platform;
+            var data = filePath && fileName ? { path: filePath, name: fileName } : null;
+            // localStorage 即时缓存（同步，_restoreAudioState 优先读取）
+            if (data) {
+                localStorage.setItem(key, JSON.stringify(data));
+            } else {
+                localStorage.removeItem(key);
+            }
+            // saveData 持久化到 data.json（异步，跨重启不丢失）
+            if (typeof this.saveData === 'function') {
+                this.saveData(key, data).catch(function(e) {
+                    that._error('saveData audio state failed:', e);
+                });
+            }
+        } catch (e) {
+            this._error('save audio state error:', e);
+        }
+    }
+
+    /**
+     * 恢复音频播放器状态（localStorage 优先，降级到 loadData）
+     * 如果上次用户没有关闭播放器，重新显示播放器（暂停状态）
+     */
+    _restoreAudioState() {
+        var that = this;
+        try {
+            var key = 'cd_audio_state_' + this.platform;
+
+            // 内部函数：根据保存的数据恢复播放器 UI
+            var doRestore = function(savedPath, savedName) {
+                if (!savedPath || !savedName) return;
+
+                // 验证文件是否存在于当前设备（使用 _fsExists 保证跨平台一致性）
+                that._fsExists(savedPath).then(function(exists) {
+                    if (!exists) {
+                        that._log('_restoreAudioState: file not exists, skip:', savedPath);
+                        localStorage.removeItem(key);
+                        return;
+                    }
+
+                    // 显示播放器（暂停状态）
+                    var audioBar = document.getElementById('cd-audio-bar');
+                    if (!audioBar) return;
+
+                    // 创建/复用 Audio 元素
+                    if (!that._audioEl) {
+                        that._audioEl = new Audio();
+                        that._audioEl.volume = that._savedVolume;
+                    }
+
+                    var fileUrl = that.toFileUrl(savedPath);
+                    that._audioEl.preload = 'metadata';
+                    // 不自动播放，暂停状态（_audioShouldAutoPlay 保持 false）
+                    that._audioCurrentPath = savedPath;
+                    that._audioCurrentName = savedName;  // 单独存储文件名，避免从路径二次提取
+                    setTimeout(function() {
+                        if (!that._audioEl) return;
+                        that._audioEl.src = fileUrl;
+                    }, 0);
+
+                    audioBar.style.display = 'flex';
+                    var nameEl = document.getElementById('cd-audio-name');
+                    if (nameEl) nameEl.textContent = '🎵 ' + savedName;
+                    that._updateAudioPlayBtn(false);
+
+                    // 为文件列表添加底部内边距，避免最后一个条目紧贴播放器栏
+                    var fileListEl = document.getElementById('cd-file-list');
+                    if (fileListEl) fileListEl.style.paddingBottom = '44px';
+
+                    // 加载歌词（不播放也能看歌词）
+                    that._loadLrc(savedPath);
+
+                    // 异步构建播放列表（从音频所在目录读取）
+                    that._buildAudioPlaylist(savedPath, savedName);
+
+                    that._log('_restoreAudioState: restored', savedName);
+                }).catch(function(e) {
+                    that._error('_restoreAudioState: _fsExists check failed:', e);
+                });
+            };
+
+            // 优先从 localStorage 读取（同步，速度快）
+            var saved = localStorage.getItem(key);
+            if (saved) {
+                var parsed = JSON.parse(saved);
+                doRestore(parsed.path, parsed.name);
+                return;
+            }
+
+            // localStorage 没有数据，尝试从 loadData 读取（重启后 localStorage 可能被清空）
+            if (typeof this.loadData === 'function') {
+                this.loadData(key).then(function(data) {
+                    if (data && data.path && data.name) {
+                        // 回写 localStorage 缓存，下次启动更快
+                        try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) {}
+                        doRestore(data.path, data.name);
+                    }
+                }).catch(function() {
+                    // 没有保存过数据，忽略
+                });
+            }
+        } catch (e) {
+            that._error('_restoreAudioState error:', e);
+        }
+    }
+
+    /**
+     * 从音频文件所在目录构建播放列表
+     * @param {string} audioPath - 音频文件完整路径
+     * @param {string} audioName - 音频文件名
+     */
+    _buildAudioPlaylist(audioPath, audioName) {
+        var that = this;
+        var sep = that._sep;
+        var lastSep = audioPath.lastIndexOf(sep);
+        // 兼容：如果平台分隔符找不到，尝试另一种分隔符
+        if (lastSep < 0) {
+            var altSep = (sep === '\\' || sep === '\\\\') ? '/' : '\\';
+            var altIdx = audioPath.lastIndexOf(altSep);
+            if (altIdx > lastSep) lastSep = altIdx;
+        }
+        var dirPath = lastSep >= 0 ? audioPath.substring(0, lastSep + 1) : '';
+
+        if (!dirPath || !fs || !fs.readdir) return;
+
+        try {
+            fs.readdir(dirPath, { withFileTypes: true }, function(err, entries) {
+                if (err || !entries) return;
+                var audioFiles = [];
+                for (var i = 0; i < entries.length; i++) {
+                    var e = entries[i];
+                    if (e.isFile() && that.isAudioFile(e.name)) {
+                        audioFiles.push({
+                            name: e.name,
+                            isDir: false,
+                            path: dirPath + e.name
+                        });
+                    }
+                }
+                that._audioPlaylist = audioFiles;
+                // 找到当前文件在播放列表中的索引
+                var idx = -1;
+                for (var j = 0; j < audioFiles.length; j++) {
+                    if (audioFiles[j].name === audioName) {
+                        idx = j;
+                        break;
+                    }
+                }
+                that._audioIndex = idx >= 0 ? idx : 0;
+            });
+        } catch (e) {
+            that._error('_buildAudioPlaylist error:', e);
+        }
+    }
+
+    /**
+     * 解析 LRC 歌词文本
+     * 支持格式：[mm:ss.xx] 或 [mm:ss.xxx] 或 [mm:ss]
+     * @param {string} text - LRC 原始文本
+     * @returns {Array<{time:number, text:string}>} 按时间排序的歌词行
+     */
+    _parseLrc(text) {
+        var lines = text.split('\n');
+        var result = [];
+        // 匹配时间标签 [mm:ss.xx] 或 [mm:ss]
+        var timeReg = /\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]/g;
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (!line) continue;
+            var times = [];
+            var match;
+            timeReg.lastIndex = 0;
+            while ((match = timeReg.exec(line)) !== null) {
+                var min = parseInt(match[1], 10);
+                var sec = parseInt(match[2], 10);
+                var ms = match[3] ? parseInt(match[3], 10) : 0;
+                // 补齐毫秒位数：.xx → x0, .xxx → xxx
+                if (match[3] && match[3].length === 2) ms = ms * 10;
+                if (match[3] && match[3].length === 1) ms = ms * 100;
+                var t = min * 60 + sec + ms / 1000;
+                times.push(t);
+            }
+            // 提取歌词文本（去掉所有时间标签）
+            var lyricText = line.replace(/\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]/g, '').trim();
+            if (!lyricText) continue;  // 纯时间标签行跳过
+            // 一行多个时间标签 → 拆成多条
+            for (var j = 0; j < times.length; j++) {
+                result.push({ time: times[j], text: lyricText });
+            }
+        }
+        // 按时间排序
+        result.sort(function(a, b) { return a.time - b.time; });
+        return result;
+    }
+
+    /**
+     * 加载歌词文件和封面
+     * 查找与音频文件同名的 .lrc 文件，解析并渲染歌词面板
+     * @param {string} audioPath - 音频文件完整路径
+     */
+    _loadLrc(audioPath, preloaded) {
+        var that = this;
+        that._lrcLines = [];
+        that._lrcActiveIndex = -1;
+
+        // 加载封面：优先使用预加载封面
+        if (preloaded && preloaded.coverUrl) {
+            that._loadCoverArt(audioPath, preloaded.coverUrl, preloaded.coverBlurUrl || null);
+        } else {
+            that._loadCoverArt(audioPath);
+        }
+
+        // 歌词：优先使用预加载歌词
+        if (preloaded && preloaded.lrcLines) {
+            that._lrcLines = preloaded.lrcLines;
+            that._renderLrcPanel(preloaded.lrcLines);
+            return;
+        }
+
+        var lrcPath = audioPath.replace(/\.[^.]+$/, '.lrc');
+        that._fsReadFile(lrcPath, 'utf-8').then(function(content) {
+            // 竞态保护：用户已切到其他歌曲，跳过
+            if (that._audioCurrentPath !== audioPath) return;
+            if (!content) {
+                that._renderLrcPanel([]);
+                return;
+            }
+            var lines = that._parseLrc(content);
+            that._lrcLines = lines;
+            that._renderLrcPanel(lines);
+        }).catch(function() {
+            // 找不到 .lrc 文件，显示提示
+            if (that._audioCurrentPath !== audioPath) return;
+            that._renderLrcPanel([]);
+        });
+    }
+
+    /**
+     * 渲染歌词面板
+     * @param {Array<{time:number, text:string}>} lines - 歌词行
+     */
+    _renderLrcPanel(lines) {
+        var that = this;
+
+        // 注入隐藏滚动条样式（仅一次）
+        if (!document.getElementById('cd-lrc-scrollbar-style')) {
+            var style = document.createElement('style');
+            style.id = 'cd-lrc-scrollbar-style';
+            style.textContent = '#cd-audio-lrc-content::-webkit-scrollbar{display:none}';
+            document.head.appendChild(style);
+        }
+
+        var lrcContent = document.getElementById('cd-audio-lrc-content');
+        if (!lrcContent) return;
+
+        // 更新"词"按钮状态：有歌词高亮，无歌词暗淡
+        var lrcToggle = document.getElementById('cd-audio-lrc-toggle');
+        if (lrcToggle) {
+            if (lines && lines.length > 0) {
+                lrcToggle.style.opacity = '1';
+                lrcToggle.style.color = 'var(--b3-theme-primary,#4285f4)';
+                lrcToggle.style.fontWeight = '600';
+                lrcToggle.title = '歌词 (' + lines.length + '行)';
+            } else {
+                lrcToggle.style.opacity = '0.35';
+                lrcToggle.style.color = 'inherit';
+                lrcToggle.style.fontWeight = 'normal';
+                lrcToggle.title = '歌词 (无)';
+            }
+        }
+
+        if (!lines || lines.length === 0) {
+            var emptyFrag = document.createDocumentFragment();
+            var emptyDiv = document.createElement('div');
+            emptyDiv.style.cssText = 'padding:16px 0;color:var(--b3-theme-secondary,#999);opacity:0.6';
+            emptyDiv.textContent = '暂无歌词';
+            emptyFrag.appendChild(emptyDiv);
+            lrcContent.replaceChildren(emptyFrag);
+            return;
+        }
+
+        // 用 DocumentFragment 原子替换歌词内容，避免 innerHTML 导致闪烁
+        var fragment = document.createDocumentFragment();
+        for (var i = 0; i < lines.length; i++) {
+            var div = document.createElement('div');
+            div.className = 'cd-lrc-line';
+            div.setAttribute('data-lrc-idx', i);
+            div.style.cssText = 'padding:1px 4px;cursor:pointer;transition:color 0.3s,font-weight 0.3s,transform 0.3s;font-size:12px;color:var(--b3-theme-secondary,#999)';
+            div.textContent = lines[i].text; // textContent 自动转义，无需 _escapeHtml
+            fragment.appendChild(div);
+        }
+        lrcContent.replaceChildren(fragment);
+
+        // 切歌后重置滚动到顶部，避免旧滚动位置 + scroll-behavior:smooth 产生上滚动画
+        lrcContent.scrollTop = 0;
+
+        // 点击歌词行跳转（必须从 lrcContent 获取，replaceChildren 已将 fragment 子节点移入 lrcContent）
+        var lrcDivs = lrcContent.querySelectorAll('.cd-lrc-line');
+        for (var j = 0; j < lrcDivs.length && j < lines.length; j++) {
+            (function(div, idx) {
+                div.addEventListener('click', function() {
+                    if (!that._audioEl) return;
+                    if (idx >= 0 && idx < that._lrcLines.length) {
+                        that._audioEl.currentTime = that._lrcLines[idx].time;
+                    }
+                });
+            })(lrcDivs[j], j);
+        }
+    }
+
+    /**
+     * HTML 转义
+     */
+    _escapeHtml(str) {
+        if (!str) return '';
+        return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    /**
+     * 更新歌词面板背景：有封面用封面图做模糊背景，无封面用随机柔和色
+     * @param {string} source - 封面 URL，传空/null 则使用随机柔和色
+     * @param {boolean} forceClear - 是否强制清除旧背景（切到无封面歌曲时使用）
+     */
+    _updateLrcBg(source, forceClear) {
+        var bgEl = document.getElementById('cd-audio-lrc-bg');
+        if (!bgEl) return;
+
+        // 判断是否需要触发 crossfade
+        var willCrossfade = false;
+        if (source) {
+            willCrossfade = true;
+        } else if (forceClear) {
+            willCrossfade = true;
+        } else if (!bgEl.style.backgroundImage && !bgEl.style.backgroundColor) {
+            willCrossfade = true;
+        }
+
+        // 仅在确定触发 crossfade 时才保存旧 blob URL（由 crossfade cleanup 负责释放）
+        // 必须在 _crossfadeLrcBg 调用之前设置，因为 cleanup 读取 _pendingBlurBlobRevoke
+        if (willCrossfade) {
+            var oldBg = bgEl.style.backgroundImage;
+            if (oldBg && oldBg.indexOf('blob:') !== -1) {
+                this._pendingBlurBlobRevoke = oldBg.replace(/^url\(["']?/, '').replace(/["']?\)$/, '');
+            }
+        }
+
+        if (source) {
+            this._crossfadeLrcBg(bgEl, source);
+        } else if (forceClear) {
+            this._crossfadeLrcBg(bgEl, null);
+        } else if (willCrossfade) {
+            this._crossfadeLrcBg(bgEl, null);
+        }
+    }
+
+    /**
+     * 加载封面图
+     * 优先查找同目录封面文件，再提取 MP3 内嵌封面
+     * @param {string} audioPath - 音频文件完整路径
+     */
+    _loadCoverArt(audioPath, preloadedCoverUrl, preloadedBlurUrl) {
+        var that = this;
+        var coverEl = document.getElementById('cd-audio-cover');
+        if (!coverEl) return;
+
+        // 延迟释放旧 blob URL：不立即 revoke，等 crossfade 完成后再释放
+        // （旧图片在 crossfade 过渡期间仍需显示）
+        var oldBg = coverEl.style.backgroundImage;
+        if (oldBg && oldBg.indexOf('blob:') !== -1) {
+            that._pendingCoverBlobRevoke = oldBg.replace(/^url\(["']?/, '').replace(/["']?\)$/, '');
+        }
+
+        // 如果有预加载封面，crossfade 过渡
+        if (preloadedCoverUrl) {
+            that._crossfadeCover(coverEl, preloadedCoverUrl);
+            that._updateLrcBg(preloadedBlurUrl || null);
+            // 如果模糊缩略图还没准备好，立即触发生成
+            if (!preloadedBlurUrl && preloadedCoverUrl) {
+                that._createBlurThumb(preloadedCoverUrl).then(function(blurUrl) {
+                    if (blurUrl) that._updateLrcBg(blurUrl);
+                });
+            }
+            return;
+        }
+
+        // 切歌时不立即清空封面/背景，保持旧内容直到新封面加载完成
+        // 避免异步加载期间出现“闪一下”的空白/随机色
+        var hadCover = !!coverEl.style.backgroundImage;
+
+        // 获取音频文件所在目录
+        var lastSep = audioPath.replace(/\\/g, '/').lastIndexOf('/');
+        var dir = lastSep >= 0 ? audioPath.substring(0, lastSep) : '';
+
+        // 常见封面文件名
+        var coverNames = ['cover.jpg', 'cover.png', 'folder.jpg', 'folder.png',
+            'album.jpg', 'album.png', 'front.jpg', 'front.png',
+            'Cover.jpg', 'Cover.png', 'Folder.jpg', 'Folder.png'];
+
+        // 逐个尝试查找封面文件
+        var tryIndex = 0;
+        function tryNextCover() {
+            if (tryIndex >= coverNames.length) {
+                // 目录封面没找到，尝试从 MP3 内嵌提取
+                that._extractMp3Cover(audioPath, hadCover);
+                return;
+            }
+            var coverPath = dir + that._sep + coverNames[tryIndex];
+            tryIndex++;
+            that._fsExists(coverPath).then(function(exists) {
+                if (exists && that._audioCurrentPath === audioPath) {
+                    var coverUrl = that.toFileUrl(coverPath);
+                    that._crossfadeCover(coverEl, coverUrl);
+                    // 先设柔和蓝背景，异步生成模糊缩略图后再替换
+                    that._updateLrcBg(null);
+                    that._createBlurThumb(coverUrl).then(function(blurUrl) {
+                        if (blurUrl && that._audioCurrentPath === audioPath) that._updateLrcBg(blurUrl);
+                    });
+                } else if (!exists) {
+                    tryNextCover();
+                }
+            }).catch(function() {
+                tryNextCover();
+            });
+        }
+        tryNextCover();
+    }
+
+    /**
+     * 从 MP3 文件提取内嵌封面（ID3v2 APIC 帧）
+     * @param {string} filePath - MP3 文件路径
+     */
+    _extractMp3Cover(filePath, keepOld) {
+        var that = this;
+        var ext = filePath.split('.').pop().toLowerCase();
+        if (ext !== 'mp3') {
+            // 非 MP3 文件，没有内嵌封面机制，保留旧封面（保持视觉连续性）
+            return;
+        }
+
+        var coverEl = document.getElementById('cd-audio-cover');
+        if (!coverEl) return;
+        // 注意：切歌时不要检查 backgroundImage 来跳过！
+        // 上一首歌的封面不应阻止当前歌提取新封面
+
+        // 仅读取前 256KB（ID3v2 标签通常在文件头部）
+        that._fsReadFile(filePath, null, 262144).then(function(buf) {
+            // 竞态保护：用户已切到其他歌曲，跳过
+            if (that._audioCurrentPath !== filePath) return;
+
+            if (!buf) {
+                that._crossfadeToNoCover(coverEl);
+                that._updateLrcBg(null, true);
+                return;
+            }
+            // 兼容 Node.js Buffer 和浏览器 ArrayBuffer
+            var bytes;
+            if (buf instanceof ArrayBuffer) {
+                bytes = new Uint8Array(buf);
+            } else if (buf.length !== undefined) {
+                // 直接用 Buffer 创建 Uint8Array（Buffer 继承自 Uint8Array）
+                bytes = new Uint8Array(buf);
+            } else {
+                that._crossfadeToNoCover(coverEl);
+                that._updateLrcBg(null, true);
+                return;
+            }
+
+            // 检查 ID3v2 头部
+            if (bytes.length < 10 || bytes[0] !== 0x49 || bytes[1] !== 0x44 || bytes[2] !== 0x33) {
+                that._crossfadeToNoCover(coverEl);
+                that._updateLrcBg(null, true);
+                return;
+            }
+
+            // 读取 ID3v2 标签总大小（syncsafe integer）
+            var tagSize = ((bytes[6] & 0x7F) << 21) | ((bytes[7] & 0x7F) << 14) | ((bytes[8] & 0x7F) << 7) | (bytes[9] & 0x7F);
+            var pos = 10;
+
+            // 遍历帧，查找 APIC
+            while (pos < Math.min(tagSize + 10, bytes.length) - 10) {
+                if (pos + 10 > bytes.length) break;
+                var frameId = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+                var frameSize = (bytes[pos + 4] << 24) | (bytes[pos + 5] << 16) | (bytes[pos + 6] << 8) | bytes[pos + 7];
+                if (frameSize <= 0 || pos + 10 + frameSize > bytes.length) break;
+
+                if (frameId === 'APIC') {
+                    var frameData = bytes.subarray(pos + 10, pos + 10 + frameSize);
+                    var encoding = frameData[0];
+                    // 找 MIME 类型（null-terminated）
+                    var mimeEnd = 1;
+                    while (mimeEnd < frameData.length && frameData[mimeEnd] !== 0) mimeEnd++;
+                    var mime = '';
+                    for (var m = 1; m < mimeEnd; m++) mime += String.fromCharCode(frameData[m]);
+
+                    // 跳过 picture type (1 byte) 和 description（null-terminated）
+                    var descStart = mimeEnd + 2;  // +1 null, +1 picture type
+                    if (encoding === 1 || encoding === 2) {
+                        // UTF-16 描述：找双零终止
+                        while (descStart < frameData.length - 1) {
+                            if (frameData[descStart] === 0 && frameData[descStart + 1] === 0) {
+                                descStart += 2;
+                                break;
+                            }
+                            descStart++;
+                        }
+                    } else {
+                        // Latin-1/UTF-8 描述：找单零终止
+                        while (descStart < frameData.length && frameData[descStart] !== 0) descStart++;
+                        descStart++;  // 跳过 null
+                    }
+
+                    if (descStart >= frameData.length) break;
+
+                    // 提取图片数据
+                    var imgData = frameData.subarray(descStart);
+                    var blob = new Blob([imgData], { type: mime || 'image/jpeg' });
+                    var url = URL.createObjectURL(blob);
+                    that._crossfadeCover(coverEl, url);
+                    // 异步生成模糊缩略图后再替换歌词背景
+                    that._updateLrcBg(null);
+                    that._createBlurThumb(url).then(function(blurUrl) {
+                        if (blurUrl) that._updateLrcBg(blurUrl);
+                    });
+                    return;
+                }
+                pos += 10 + frameSize;
+            }
+            // 遍历完所有帧都没找到 APIC，平滑过渡到无封面
+            that._crossfadeToNoCover(coverEl);
+            that._updateLrcBg(null, true);
+        }).catch(function() {
+            // 提取失败，平滑过渡到无封面
+            that._crossfadeToNoCover(coverEl);
+            that._updateLrcBg(null, true);
+        });
+    }
+
+    /**
+     * 同步歌词高亮
+     * @param {number} currentTime - 当前播放时间（秒）
+     */
+    _updateLrcHighlight(currentTime) {
+        var that = this;
+        var lines = that._lrcLines;
+        if (!lines || lines.length === 0) return;
+
+        // 二分查找当前时间对应的歌词行
+        var lo = 0, hi = lines.length - 1, idx = -1;
+        while (lo <= hi) {
+            var mid = Math.floor((lo + hi) / 2);
+            if (lines[mid].time <= currentTime) {
+                idx = mid;
+                lo = mid + 1;
+            } else {
+                hi = mid - 1;
+            }
+        }
+
+        if (idx === that._lrcActiveIndex) return;  // 没变则不更新
+        that._lrcActiveIndex = idx;
+
+        // 更新高亮样式（用 transform 代替 fontSize 避免重排卡顿）
+        var lrcContent = document.getElementById('cd-audio-lrc-content');
+        if (!lrcContent) return;
+        var allLines = lrcContent.querySelectorAll('.cd-lrc-line');
+        for (var i = 0; i < allLines.length; i++) {
+            if (i === idx) {
+                allLines[i].style.color = 'var(--b3-theme-primary,#4285f4)';
+                allLines[i].style.fontWeight = '700';
+                allLines[i].style.transform = 'scale(1.2)';
+            } else {
+                allLines[i].style.color = '';
+                allLines[i].style.fontWeight = '';
+                allLines[i].style.transform = 'scale(1)';
+            }
+        }
+
+        // 自动滚动到当前行
+        if (idx >= 0 && idx < allLines.length) {
+            var lineEl = allLines[idx];
+            var panelH = lrcContent.clientHeight;
+            var lineTop = lineEl.offsetTop;
+            var lineH = lineEl.clientHeight;
+            lrcContent.scrollTop = lineTop - panelH / 2 + lineH / 2;
+        }
     }
 
 
@@ -4494,7 +6295,7 @@ class LocalBrowsePlugin extends Plugin {
 
         var detected = this._detectPlatform();
         if (detected !== this.platform) {
-            that._log('platform corrected in renderFileTree:', this.platform, '→', detected);
+            this._log('platform corrected in renderFileTree:', this.platform, '→', detected);
             this.platform = detected;
             this.isWindows = (this.platform === 'win32');
             this.platformIcon = this.platform === 'darwin' ? '🍎' : (this.platform === 'linux' ? '🐧' : '🪟');
@@ -4560,21 +6361,32 @@ class LocalBrowsePlugin extends Plugin {
                     });
                     resolve(result);
                 } catch (err) {
-                    reject(err);
+                    // Node.js 模式失败时，尝试 API 兜底（沙箱/权限限制场景）
+                    that._apiReaddir(dirPath).then(resolve).catch(function() {
+                        reject(err);
+                    });
                 }
             } else {
-                fetch('/api/file/readDir', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ path: dirPath }),
-                    credentials: 'include'
-                }).then(function(resp) { return resp.json(); }).then(function(data) {
-                    if (data.code === 0 && Array.isArray(data.data)) {
-                        resolve(data.data);
-                    } else {
-                        reject(new Error(data.msg || 'API readDir failed'));
-                    }
-                }).catch(reject);
+                that._apiReaddir(dirPath).then(resolve).catch(reject);
+            }
+        });
+    }
+
+    /**
+     * API 模式读取目录（Docker/浏览器/沙箱环境）
+     * @param {string} dirPath 目录路径
+     */
+    _apiReaddir(dirPath) {
+        return fetch('/api/file/readDir', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ path: dirPath }),
+            credentials: 'include'
+        }).then(function(resp) { return resp.json(); }).then(function(data) {
+            if (data.code === 0 && Array.isArray(data.data)) {
+                return data.data;
+            } else {
+                throw new Error(data.msg || 'API readDir failed');
             }
         });
     }
@@ -4686,11 +6498,21 @@ class LocalBrowsePlugin extends Plugin {
      * @param {string} [encoding] 编码（如 'utf-8'）
      * @returns {Promise<Buffer|string>}
      */
-    _fsReadFile(filePath, encoding) {
+    _fsReadFile(filePath, encoding, maxBytes) {
         return new Promise(function(resolve, reject) {
             if (fs && fs.readFileSync) {
                 try {
-                    resolve(fs.readFileSync(filePath, encoding || null));
+                    if (maxBytes) {
+                        // 仅读取前 maxBytes 字节（预加载封面时避免读取整个大文件）
+                        var fd = fs.openSync(filePath, 'r');
+                        var buf = Buffer.alloc(maxBytes);
+                        var bytesRead = fs.readSync(fd, buf, 0, maxBytes, 0);
+                        fs.closeSync(fd);
+                        // Buffer.from 创建独立副本，避免 subarray 的 buffer 引用问题
+                        resolve(Buffer.from(buf.subarray(0, bytesRead)));
+                    } else {
+                        resolve(fs.readFileSync(filePath, encoding || null));
+                    }
                 } catch (err) {
                     reject(err);
                 }
@@ -5842,7 +7664,7 @@ class LocalBrowsePlugin extends Plugin {
             'pdf': '📕', 'doc': '📄', 'docx': '📄', 'xls': '📊', 'xlsx': '📊',
             'ppt': '📊', 'pptx': '📊', 'txt': '📝', 'md': '📝',
             'jpg': '🖼️', 'jpeg': '🖼️', 'png': '🖼️', 'gif': '🖼️', 'webp': '🖼️', 'svg': '🖼️', 'bmp': '🖼️', 'heic': '🖼️', 'heif': '🖼️', 'livp': '📷',
-            'mp3': '🎵', 'wav': '🎵', 'flac': '🎵', 'aac': '🎵',
+            'mp3': '🎵', 'wav': '🎵', 'flac': '🎵', 'aac': '🎵', 'ogg': '🎵', 'wma': '🎵', 'm4a': '🎵', 'ape': '🎵', 'opus': '🎵', 'aiff': '🎵', 'alac': '🎵',
             'mp4': '🎬', 'avi': '🎬', 'mkv': '🎬', 'mov': '🎬',
             'zip': '📦', 'rar': '📦', '7z': '📦', 'tar': '📦', 'gz': '📦',
             'exe': '⚙️', 'dll': '⚙️', 'msi': '⚙️',
@@ -5944,6 +7766,17 @@ class LocalBrowsePlugin extends Plugin {
             ' · 共 ' + that.formatSize(totalSize) +
             ' <span style="opacity:0.6">(' + parts.join(' | ') + ')</span>' +
         '</span>';
+
+        // 统计栏高度变化后，同步更新歌词面板的 bottom 定位
+        var lrcPanel = document.getElementById('cd-audio-lrc-panel');
+        if (lrcPanel && lrcPanel.style.display !== 'none') {
+            var statsBar = document.getElementById('cd-stats-bar');
+            var audioBar = document.getElementById('cd-audio-bar');
+            var newBottom = 4;
+            if (statsBar) newBottom += statsBar.offsetHeight;
+            if (audioBar) newBottom += audioBar.offsetHeight;
+            lrcPanel.style.bottom = newBottom + 'px';
+        }
     }
 
     /**
