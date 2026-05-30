@@ -2,7 +2,7 @@
     "name": "siyuan-plugin-localbrowse",
     "author": "sqalei",
     "url": "https://github.com/sqalei/siyuan-plugin-localbrowse",
-    "version": "0.6.2",
+    "version": "0.7.0",
     "minAppVersion": "3.0.0",
     "backends": [
         "all"

@@ -46,6 +46,9 @@ class LocalBrowsePlugin extends Plugin {
         this.preSearchPath = '';    // 深度搜索前所在的目录，用于返回
         this.availableDrives = [];  // 可用存储列表 [{value, label}]
         this.favorites = [];        // 收藏的文件夹列表 [{path, name}]
+        this.fileDocMap = {};       // 文件路径 → 文档ID 映射（关联当前文档功能）
+        this._selectedItems = [];   // 多选：当前选中的文件项 DOM 元素列表
+        this._lastClickedItem = null; // 多选：上次点击的文件项，用于 Shift 范围选择
         this.currentView = 'list';  // 当前视图模式：list | icon
         this.sortBy = 'name';       // 排序方式：name | size | mtime
         this.sortOrder = 'asc';     // 排序顺序：asc | desc
@@ -61,6 +64,7 @@ class LocalBrowsePlugin extends Plugin {
         this._boundIconScroll = this.onIconScroll.bind(this);
         this._boundListScroll = null; // 列表滚动处理（延迟绑定，避免构造时 this 不完整）
         this._clipboardCut = null;   // 剪切板：记录剪切的文件/文件夹路径 {path, name, isDir}
+        this._dragSource = null;    // 拖拽源：当前拖拽的文件信息 {path, name, isDir, el, multiFiles}
         this._linkStatus = 'none';    // 链接状态指示灯: none/green/yellow/red/checking
         this._lastCheckedDocId = '';  // 上次检测的文档 ID，避免重复扫描
         this.pathMap = null;          // 路径映射: { container: '/mnt/sync', host: 'C:\\Users\\sqalei\\坚果云' }
@@ -167,6 +171,7 @@ class LocalBrowsePlugin extends Plugin {
         this._log("onload");
         this.registerIcons();
         this.loadFavorites();
+        this.loadFileDocMap();
         this.loadSortSettings();
         this.loadDriveSettings();
         this.loadViewSettings();
@@ -174,6 +179,7 @@ class LocalBrowsePlugin extends Plugin {
         this.loadPathMap();
         this.loadSyncRoots();
         this.registerDock();
+        this.registerEditorDropHandler();
 
         // 链接指示灯初始化 + 自动检测
         var that = this;
@@ -261,10 +267,28 @@ class LocalBrowsePlugin extends Plugin {
             clearTimeout(this._searchDebounceTimer);
             this._searchDebounceTimer = null;
         }
+        // 清理编辑器拖拽 drop 处理器
+        if (this._editorDragOverHandler) {
+            document.removeEventListener('dragover', this._editorDragOverHandler, true);
+            this._editorDragOverHandler = null;
+        }
+        if (this._editorDropHandler) {
+            document.removeEventListener('drop', this._editorDropHandler, true);
+            this._editorDropHandler = null;
+        }
         // 清理链接点击拦截器
         if (this._linkClickInterceptor) {
-            document.removeEventListener('mousedown', this._linkClickInterceptor, true);
+            document.removeEventListener('click', this._linkClickInterceptor, true);
             this._linkClickInterceptor = null;
+        }
+        // 清理拖拽源引用
+        this._dragSource = null;
+        // 清理拖拽高亮监听器
+        if (this._clearDragHighlight) {
+            document.removeEventListener('dragend', this._clearDragHighlight, true);
+            document.removeEventListener('drop', this._clearDragHighlight, true);
+            this._clearDragHighlight = null;
+            this._dragEndListenerSet = false;
         }
         // 取消正在进行的深度搜索
         if (this._deepSearchAbort) {
@@ -521,10 +545,10 @@ class LocalBrowsePlugin extends Plugin {
             '</div>' +
             '<div id="cd-audio-bar" style="display:none;padding:4px 10px;flex-shrink:0;border-top:1px solid var(--b3-border,#eee);background:var(--b3-theme-background,#fff);flex-direction:column;gap:3px">' +
                 '<div style="display:flex;align-items:center;gap:8px">' +
-                    '<span id="cd-audio-prev" class="cd-audio-btn" title="上一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="17,5 8,12 17,19" fill="currentColor"/><rect x="5" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
-                    '<span id="cd-audio-play" class="cd-audio-btn cd-audio-btn-play" title="播放"><svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>' +
-                    '<span id="cd-audio-next" class="cd-audio-btn" title="下一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="7,5 16,12 7,19" fill="currentColor"/><rect x="16" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
-                    '<span id="cd-audio-mode" class="cd-audio-btn" title="随机播放"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-prev" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="上一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="17,5 8,12 17,19" fill="currentColor"/><rect x="5" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-play" class="cd-audio-btn cd-audio-btn-play" style="width:28px;height:28px;padding:0" title="播放"><svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-next" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="下一首"><svg viewBox="0 0 24 24" width="12" height="12"><polygon points="7,5 16,12 7,19" fill="currentColor"/><rect x="16" y="5" width="3" height="14" rx="1" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-audio-mode" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="随机播放"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" fill="currentColor"/></svg></span>' +
                     '<span id="cd-audio-name" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333);cursor:pointer" title="打开所在文件夹">未播放</span>' +
                     '<span id="cd-audio-lrc-toggle" class="cd-audio-lrc-btn" style="cursor:pointer;font-size:11px;opacity:0.35;flex-shrink:0;transition:opacity 0.2s,color 0.2s" title="歌词">词</span>' +
                     '<span id="cd-audio-time" style="font-size:10px;color:var(--b3-theme-secondary,#999);flex-shrink:0;white-space:nowrap">0:00/0:00</span>' +
@@ -919,6 +943,10 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadDirectory(dirPath) {
         var that = this;
+
+        // 切换目录时清除多选状态
+        this._selectedItems = [];
+        this._lastClickedItem = null;
 
         // 递增加载版本号，旧回调检测到版本过时则丢弃结果（防止异步竞态覆盖）
         this._loadSeq++;
@@ -2055,6 +2083,8 @@ class LocalBrowsePlugin extends Plugin {
 
                 var timeStr = f.mtime ? that.formatTime(f.mtime) : '';
                 var sizeStr = f.isDir ? '' : that.formatSize(f.size);
+                var favMark = that.isFavorite(fullPath) ? '<span style="margin-left:2px;font-size:11px;color:#f5a623">⭐</span>' : '';
+                var linkMark = that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="margin-left:2px;font-size:11px;cursor:pointer;color:#4fc3f7">🔗</span>' : '';
 
                 if (isDeepSearch && relativePathHtml) {
                     html += '<div class="cd-item ' + itemClass + '" ' +
@@ -2065,7 +2095,7 @@ class LocalBrowsePlugin extends Plugin {
                         'style="display:flex;align-items:flex-start;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
                         '<span style="font-size:16px;margin-right:8px;flex-shrink:0;margin-top:1px">' + icon + '</span>' +
                         '<span style="flex:1;overflow:hidden;min-width:0">' +
-                            '<div style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + name + '</div>' +
+                            '<div style="font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + name + linkMark + favMark + '</div>' +
                             relativePathHtml +
                         '</span>' +
                         (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
@@ -2088,7 +2118,7 @@ class LocalBrowsePlugin extends Plugin {
                         'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
                         expander +
                         '<span style="font-size:16px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + '</span>' +
+                        '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + linkMark + favMark + '</span>' +
                         (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
                         (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
                     '</div>' +
@@ -2151,6 +2181,8 @@ class LocalBrowsePlugin extends Plugin {
             var fullPath = f.path || ((currentPath.endsWith(that._sep) ? currentPath : currentPath + that._sep) + f.name);
             var timeStr = f.mtime ? that.formatTime(f.mtime) : '';
             var sizeStr = f.isDir ? '' : that.formatSize(f.size);
+            var favMark2 = that.isFavorite(fullPath) ? '<span style="margin-left:2px;font-size:11px;color:#f5a623">⭐</span>' : '';
+            var linkMark2 = that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="margin-left:2px;font-size:11px;cursor:pointer;color:#4fc3f7">🔗</span>' : '';
 
             // 文件夹直接显示展开箭头，点击时再检测是否有子项；文件显示空占位
             var isDockerList2 = that._isDockerBrowser();
@@ -2168,7 +2200,7 @@ class LocalBrowsePlugin extends Plugin {
                 'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
                 expander +
                 '<span style="font-size:16px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + linkMark2 + favMark2 + '</span>' +
                 (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
                 (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
             '</div>' +
@@ -2375,7 +2407,7 @@ class LocalBrowsePlugin extends Plugin {
                 'style="display:flex;align-items:center;padding:6px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f0f0f0);transition:background 0.15s;padding-left:' + (12 + indent) + 'px">' +
                 expander +
                 '<span style="font-size:15px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + (that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="font-size:11px;cursor:pointer;color:#4fc3f7;margin-left:2px">🔗</span>' : '') + '</span>' +
                 '<span class="cd-stat-size" style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right"></span>' +
                 '<span class="cd-stat-time" style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap"></span>' +
             '</div>' +
@@ -2546,6 +2578,10 @@ class LocalBrowsePlugin extends Plugin {
         if (isImg && f.size) {
             displayName += ' <span style="color:var(--b3-theme-secondary,#999);font-size:10px">(' + that.formatSize(f.size) + ')</span>';
         }
+        if (that.isFavorite(fullPath)) {
+            displayName += '<span style="margin-left:1px;font-size:9px;color:#f5a623">⭐</span>';
+        }
+        var linkMarkIcon = that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="font-size:9px;cursor:pointer;color:#4fc3f7">🔗</span>' : '';
 
         return '<div class="cd-item ' + itemClass + '" ' +
             'data-path="' + that.escapeHtml(fullPath) + '" ' +
@@ -2555,7 +2591,7 @@ class LocalBrowsePlugin extends Plugin {
             'draggable="true" ' +
             'style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:6px 4px;cursor:pointer;border-radius:4px;transition:background 0.15s;height:110px;box-sizing:border-box;overflow:hidden">' +
             '<div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;flex-shrink:0">' + iconHtml + '</div>' +
-            '<span class="cd-name" style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + displayName + '</span>' +
+            '<span class="cd-name" style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + displayName + linkMarkIcon + '</span>' +
         '</div>';
     }
 
@@ -2572,6 +2608,15 @@ class LocalBrowsePlugin extends Plugin {
                 item.addEventListener('click', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
+
+                    // 如果点击的是关联图标，打开关联文档
+                    if (e.target.classList.contains('cd-doc-link-icon')) {
+                        var linkPath = e.target.dataset.linkpath;
+                        if (linkPath) {
+                            that.openLinkedDoc(linkPath);
+                        }
+                        return;
+                    }
 
                     var isDir = item.dataset.isdir === 'true';
                     var hasChildren = item.dataset.hasChildren === 'true';
@@ -2616,11 +2661,16 @@ class LocalBrowsePlugin extends Plugin {
                         return;
                     }
 
-                    // 点击文件夹名称/图标：进入文件夹
+                    // 点击文件夹名称/图标：Ctrl/Shift 多选或进入文件夹
                     if (isDir) {
-                        that.loadDirectory(itemPath);
+                        // Ctrl/Cmd/Shift+点击文件夹时也支持多选（用于批量拖拽文件夹）
+                        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                            that.selectItem(item, e);
+                        } else {
+                            that.loadDirectory(itemPath);
+                        }
                     } else {
-                        that.selectItem(item);
+                        that.selectItem(item, e);
                     }
                 });
 
@@ -2633,11 +2683,15 @@ class LocalBrowsePlugin extends Plugin {
                     var name = item.dataset.name;
 
                     if (!isDir) {
-                        // 音频文件双击播放，其他文件插入链接
                         if (that.isAudioFile(name)) {
+                            // 音频文件：内置播放器播放
                             that.playAudio(itemPath, name);
+                        } else if (that.isVideoFile(name)) {
+                            // 视频文件：内置播放器播放
+                            that.playVideo(itemPath, name);
                         } else {
-                            that.handleFileClick(itemPath, name);
+                            // 其他文件：系统默认程序打开
+                            that.openFile(itemPath);
                         }
                     }
                 });
@@ -2709,23 +2763,96 @@ class LocalBrowsePlugin extends Plugin {
                     var isDir = item.dataset.isdir === 'true';
                     var itemPath = item.dataset.path;
                     var name = item.dataset.name;
+
+                    // 右键未选中项时，先选中该项（清除多选）
+                    if (!item.classList.contains('cd-selected')) {
+                        that.clearSelection();
+                        item.classList.add('cd-selected');
+                        item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                        that._selectedItems = [item];
+                        that._lastClickedItem = item;
+                    }
+
                     that.showContextMenu(e, itemPath, name, isDir);
                 });
 
-                // === 拖拽移动 ===
+                // === 拖拽 ===
                 item.addEventListener('dragstart', function(e) {
                     var isDir = item.dataset.isdir === 'true';
                     var itemPath = item.dataset.path;
                     var name = item.dataset.name;
-                    that._dragSource = {
-                        path: itemPath,
-                        name: name,
-                        isDir: isDir,
-                        el: item
-                    };
-                    item.style.opacity = '0.4';
-                    e.dataTransfer.effectAllowed = 'move';
-                    e.dataTransfer.setData('text/plain', itemPath);
+
+                    // 如果拖拽的项不在已选列表中，清除之前的选择，单选此项
+                    var isSelected = item.classList.contains('cd-selected');
+                    if (!isSelected) {
+                        that.clearSelection();
+                        item.classList.add('cd-selected');
+                        item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                        that._selectedItems = [item];
+                        that._lastClickedItem = item;
+                    }
+
+                    var selected = that._selectedItems;
+
+                    if (selected.length > 1) {
+                        // === 多选批量拖拽 ===
+                        var files = [];
+                        for (var si = 0; si < selected.length; si++) {
+                            var selItem = selected[si];
+                            files.push({
+                                path: selItem.dataset.path,
+                                name: selItem.dataset.name,
+                                isDir: selItem.dataset.isdir === 'true',
+                                el: selItem
+                            });
+                            selItem.style.opacity = '0.4';
+                        }
+                        that._dragSource = {
+                            multiFiles: files,
+                            // 兼容：也设置单文件属性（取第一个文件）
+                            path: files[0].path,
+                            name: files[0].name,
+                            isDir: files[0].isDir,
+                            el: item
+                        };
+                        e.dataTransfer.effectAllowed = 'copyMove';
+                        // 生成批量 Markdown 链接文本
+                        if (!that._isDockerBrowser()) {
+                            var batchMd = '';
+                            for (var bi = 0; bi < files.length; bi++) {
+                                if (bi > 0) batchMd += '\n';
+                                batchMd += that.buildLocalFileMarkdown(files[bi].path, files[bi].name, files[bi].isDir);
+                            }
+                            e.dataTransfer.setData('text/markdown', batchMd);
+                            e.dataTransfer.setData('text/plain', batchMd);
+                        } else {
+                            e.dataTransfer.setData('text/plain', files.map(function(f) { return f.path; }).join('\n'));
+                        }
+                    } else {
+                        // === 单文件拖拽（原有逻辑） ===
+                        that._dragSource = {
+                            path: itemPath,
+                            name: name,
+                            isDir: isDir,
+                            el: item
+                        };
+                        item.style.opacity = '0.4';
+                        e.dataTransfer.effectAllowed = 'copyMove';
+                        e.dataTransfer.setData('text/plain', itemPath);
+                        if (!that._isDockerBrowser()) {
+                            var fileUrl = that.toFileUrl(itemPath);
+                            var mdText;
+                            var icon = isDir ? '📂' : that.getFileIcon(name);
+                            var linkText = icon + ' ' + that.escapeMarkdown(name);
+                            if (!isDir && that.isImageFile(name)) {
+                                mdText = '![' + that.escapeMarkdown(name) + '](' + fileUrl + ')';
+                            } else {
+                                mdText = '[' + linkText + '](' + fileUrl + ')';
+                            }
+                            e.dataTransfer.setData('text/markdown', mdText);
+                            e.dataTransfer.setData('text/plain', mdText);
+                        }
+                    }
                     // 拖拽开始时关闭图片预览，避免遮挡
                     that.hideImagePreview();
                     if (that._previewTimer) {
@@ -2736,6 +2863,11 @@ class LocalBrowsePlugin extends Plugin {
 
                 item.addEventListener('dragend', function(e) {
                     item.style.opacity = '';
+                    // 恢复多选项的透明度
+                    var selected = that._selectedItems;
+                    for (var si = 0; si < selected.length; si++) {
+                        selected[si].style.opacity = '';
+                    }
                     that._dragSource = null;
                     // 清除所有拖拽高亮
                     var highlighted = fileListEl.querySelectorAll('.cd-drag-over');
@@ -2749,18 +2881,35 @@ class LocalBrowsePlugin extends Plugin {
                 // 文件夹作为拖拽目标
                 if (item.dataset.isdir === 'true') {
                     item.addEventListener('dragover', function(e) {
-                        e.preventDefault();
-                        e.dataTransfer.dropEffect = 'move';
-                        if (!item.classList.contains('cd-drag-over')) {
-                            item.classList.add('cd-drag-over');
-                            item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
-                            item.style.boxShadow = 'inset 0 0 0 2px var(--b3-theme-primary,#4285f4)';
+                        // 支持内部拖拽和外部文件拖入
+                        var hasInternal = !!that._dragSource;
+                        // dragover 阶段 files 为空，用 types 检测是否有外部文件拖入
+                        var hasExternal = false;
+                        if (e.dataTransfer && e.dataTransfer.types) {
+                            for (var ti = 0; ti < e.dataTransfer.types.length; ti++) {
+                                if (e.dataTransfer.types[ti].toLowerCase() === 'files') {
+                                    hasExternal = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (hasInternal || hasExternal) {
+                            e.preventDefault();
+                            e.dataTransfer.dropEffect = hasInternal ? 'move' : 'copy';
+                            if (!item.classList.contains('cd-drag-over')) {
+                                item.classList.add('cd-drag-over');
+                                item.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                                item.style.boxShadow = 'inset 0 0 0 2px var(--b3-theme-primary,#4285f4)';
+                            }
                         }
                     });
                     item.addEventListener('dragleave', function(e) {
-                        item.classList.remove('cd-drag-over');
-                        item.style.background = '';
-                        item.style.boxShadow = '';
+                        // 只在鼠标真正离开文件夹项时才移除高亮（避免移到子元素时误触）
+                        if (!item.contains(e.relatedTarget)) {
+                            item.classList.remove('cd-drag-over');
+                            item.style.background = '';
+                            item.style.boxShadow = '';
+                        }
                     });
                     item.addEventListener('drop', function(e) {
                         e.preventDefault();
@@ -2768,38 +2917,135 @@ class LocalBrowsePlugin extends Plugin {
                         item.classList.remove('cd-drag-over');
                         item.style.background = '';
                         item.style.boxShadow = '';
+                        // 同时清除面板虚线边框（外部拖拽时 fileListEl 的 drop 不会触发）
+                        that._clearDragHighlight && that._clearDragHighlight();
+                        var targetPath = item.dataset.path;
                         if (that._dragSource) {
-                            var targetPath = item.dataset.path;
-                            // 不能拖到自身内部
-                            if (targetPath.indexOf(that._dragSource.path) === 0) {
-                                that.showToastMsg('不能将文件夹移动到自身内部');
-                                return;
+                            // 内部拖拽：移动文件
+                            // 多选批量移动
+                            if (that._dragSource.multiFiles && that._dragSource.multiFiles.length > 1) {
+                                var files = that._dragSource.multiFiles;
+                                var movedCount = 0;
+                                for (var mi = 0; mi < files.length; mi++) {
+                                    if (targetPath.indexOf(files[mi].path) === 0) continue; // 不能拖到自身内部
+                                    that.moveFile(files[mi].path, targetPath, files[mi].name, files[mi].isDir);
+                                    movedCount++;
+                                }
+                                if (movedCount === 0) {
+                                    that.showToastMsg('不能将文件夹移动到自身内部');
+                                }
+                            } else {
+                                // 单文件移动
+                                if (targetPath.indexOf(that._dragSource.path) === 0) {
+                                    that.showToastMsg('不能将文件夹移动到自身内部');
+                                    return;
+                                }
+                                that.moveFile(that._dragSource.path, targetPath, that._dragSource.name, that._dragSource.isDir);
                             }
-                            that.moveFile(that._dragSource.path, targetPath, that._dragSource.name, that._dragSource.isDir);
+                        } else if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                            // 外部拖拽：复制文件到目标文件夹
+                            that.copyExternalFiles(e.dataTransfer.files, targetPath);
                         }
                     });
                 }
             })(items[j]);
         }
 
-        // 文件列表空白处作为拖拽目标（移动到当前目录）
-        fileListEl.addEventListener('dragover', function(e) {
+        // 文件列表空白处作为拖拽目标（内部拖拽=移动到当前目录，外部拖拽=复制到当前目录）
+        // 仅绑定一次，避免 loadDirectory 重复调用时累积监听器
+        if (!fileListEl._cdDragEventsBound) {
+            fileListEl._cdDragEventsBound = true;
+            fileListEl.addEventListener('dragover', function(e) {
             if (that._dragSource) {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = 'move';
+            } else {
+                // dragover 阶段用 types 检测是否有外部文件拖入（files 属性为空）
+                var hasExternal = false;
+                if (e.dataTransfer && e.dataTransfer.types) {
+                    for (var ti = 0; ti < e.dataTransfer.types.length; ti++) {
+                        if (e.dataTransfer.types[ti].toLowerCase() === 'files') {
+                            hasExternal = true;
+                            break;
+                        }
+                    }
+                }
+                if (hasExternal) {
+                    e.preventDefault();
+                    e.dataTransfer.dropEffect = 'copy';
+                    if (!fileListEl.classList.contains('cd-external-drag-over')) {
+                        fileListEl.classList.add('cd-external-drag-over');
+                        fileListEl.style.background = 'rgba(66,133,244,0.08)';
+                        fileListEl.style.outline = '2px dashed var(--b3-theme-primary,#4285f4)';
+                        fileListEl.style.outlineOffset = '-2px';
+                    }
+                }
             }
         });
+        fileListEl.addEventListener('dragleave', function(e) {
+            // 只在离开 fileListEl 本身时移除样式
+            if (!fileListEl.contains(e.relatedTarget)) {
+                fileListEl.classList.remove('cd-external-drag-over');
+                fileListEl.style.background = '';
+                fileListEl.style.outline = '';
+                fileListEl.style.outlineOffset = '';
+            }
+        });
+        // 拖拽结束时清除面板高亮（确保边框不会残留）
+        if (!this._dragEndListenerSet) {
+            this._clearDragHighlight = function() {
+                var fl = document.getElementById('cd-file-list');
+                if (fl) {
+                    fl.classList.remove('cd-external-drag-over');
+                    fl.style.background = '';
+                    fl.style.outline = '';
+                    fl.style.outlineOffset = '';
+                }
+                // 同时清除所有文件夹项的拖拽高亮
+                var dragOvers = document.querySelectorAll('.cd-drag-over');
+                for (var k = 0; k < dragOvers.length; k++) {
+                    dragOvers[k].classList.remove('cd-drag-over');
+                    dragOvers[k].style.background = '';
+                    dragOvers[k].style.boxShadow = '';
+                }
+            };
+            // dragend：内部拖拽结束时触发
+            document.addEventListener('dragend', this._clearDragHighlight, true);
+            // drop：外部拖拽放下的全局兜底（外部拖拽不会触发 dragend）
+            document.addEventListener('drop', this._clearDragHighlight, true);
+            this._dragEndListenerSet = true;
+        }
+
         fileListEl.addEventListener('drop', function(e) {
+            // 清除拖拽高亮
+            that._clearDragHighlight && that._clearDragHighlight();
+            // 如果 drop 在文件项上，由文件项的 drop 事件处理
+            if (e.target.closest('.cd-item')) return;
             if (that._dragSource) {
-                // 如果 drop 在文件项上，由文件项的 drop 事件处理
-                if (e.target.closest('.cd-item')) return;
                 e.preventDefault();
                 e.stopPropagation();
-                that.moveFile(that._dragSource.path, currentPath, that._dragSource.name, that._dragSource.isDir);
+                // 多选批量移动到当前目录
+                if (that._dragSource.multiFiles && that._dragSource.multiFiles.length > 1) {
+                    var files = that._dragSource.multiFiles;
+                    for (var mi = 0; mi < files.length; mi++) {
+                        that.moveFile(files[mi].path, currentPath, files[mi].name, files[mi].isDir);
+                    }
+                } else {
+                    that.moveFile(that._dragSource.path, currentPath, that._dragSource.name, that._dragSource.isDir);
+                }
+            } else if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                // 外部拖拽：复制文件到当前目录
+                e.preventDefault();
+                e.stopPropagation();
+                that.copyExternalFiles(e.dataTransfer.files, currentPath);
             }
         });
-
         // 文件列表空白处右键：显示粘贴菜单（如果有剪切内容）
+        // 点击空白区域清除多选
+        fileListEl.addEventListener('click', function(e) {
+            if (e.target.closest('.cd-item')) return;
+            that.clearSelection();
+        });
         fileListEl.addEventListener('contextmenu', function(e) {
             // 如果点击的是文件项，不处理（由上面的 item contextmenu 处理）
             if (e.target.closest('.cd-item')) return;
@@ -2810,6 +3056,7 @@ class LocalBrowsePlugin extends Plugin {
                 that.showPasteMenu(e, that.currentPath);
             }
         });
+        } // end if (!_cdDragEventsBound)
     }
 
     /**
@@ -2823,6 +3070,36 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 直接插入本地文件链接
         this.insertLocalFileLink(filePath, fileName);
+    }
+
+    /**
+     * 内置视频播放器：优先调用思播插件，未安装时打开系统默认播放器
+     */
+    playVideo(filePath, fileName) {
+        var that = this;
+        var fileUrl = this.toFileUrl(filePath);
+
+        // 优先：尝试调用思播(siyuan-media-player)插件播放
+        try {
+            var smp = window.siyuanMediaPlayer;
+            if (smp && typeof smp.playLink === 'function') {
+                smp.playLink(fileUrl).then(function(ok) {
+                    if (!ok) {
+                        // 思播无法解析该URL，打开系统默认播放器
+                        that.openFile(filePath);
+                    }
+                }).catch(function(e) {
+                    that._error('思播播放失败，打开系统默认播放器:', e);
+                    that.openFile(filePath);
+                });
+                return;
+            }
+        } catch (e) {
+            that._error('调用思播失败:', e);
+        }
+
+        // 思播未安装或不可用，打开系统默认播放器
+        that.openFile(filePath);
     }
 
     /**
@@ -2852,7 +3129,7 @@ class LocalBrowsePlugin extends Plugin {
             // 图片：直接显示
             markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
         } else {
-            // 其他文件：显示为链接，锚文本干净，标题放指纹
+            // 视频和其他文件：显示为链接，锚文本干净，标题放指纹
             if (fingerprintTitle) {
                 markdown = '[' + linkText + '](' + fileUrl + ' "' + fingerprintTitle + '")';
             } else {
@@ -2868,6 +3145,354 @@ class LocalBrowsePlugin extends Plugin {
                 that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
             }
         });
+    }
+
+    /**
+     * 注册编辑器区域的拖拽 drop 处理器
+     * 实现拖拽文件/文件夹到文档后插入链接到鼠标位置，没有鼠标位置则插入到文档最下面
+     */
+    registerEditorDropHandler() {
+        var that = this;
+
+        // dragover 处理：允许在编辑器区域 drop，设置 copy 效果
+        this._editorDragOverHandler = function(e) {
+            if (!that._dragSource) return;
+            // 检查拖拽目标是否在编辑器区域内
+            var targetEl = e.target.nodeType === 1 ? e.target : (e.target.parentElement || e.target);
+            var protyle = targetEl.closest ? targetEl.closest('.protyle') : null;
+            if (protyle) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'copy';
+            }
+        };
+
+        // drop 处理：在鼠标位置插入链接
+        this._editorDropHandler = function(e) {
+            if (!that._dragSource) return;
+
+            // Docker 浏览器模式下 file:/// 链接无法打开，禁止插入
+            if (that._isDockerBrowser()) {
+                that.showToastMsg('Docker 浏览器环境下无法打开本地文件链接，已禁止插入');
+                that._dragSource = null;
+                return;
+            }
+
+            var targetEl = e.target.nodeType === 1 ? e.target : (e.target.parentElement || e.target);
+            var protyleWysiwyg = targetEl.closest ? targetEl.closest('.protyle-wysiwyg') : null;
+            var protyle = targetEl.closest ? targetEl.closest('.protyle') : null;
+
+            if (!protyle) return; // 不在编辑器区域内，不处理
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            var source = that._dragSource;
+
+            // 检查是否为多选批量拖拽
+            if (source.multiFiles && source.multiFiles.length > 1) {
+                var files = source.multiFiles;
+                // 批量插入：使用思源 API 逐个插入独立块，确保每个链接独占一行
+                that.insertBatchFileLinks(files, protyleWysiwyg, e);
+            } else {
+                // 单文件拖拽
+                var filePath = source.path;
+                var fileName = source.name;
+                var isDir = source.isDir;
+
+                if (protyleWysiwyg) {
+                    that.insertAtDropPosition(e, protyleWysiwyg, filePath, fileName, isDir);
+                } else {
+                    var wysiwyg2 = protyle.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+                    if (wysiwyg2) {
+                        that.insertAtDocBottom(wysiwyg2, filePath, fileName, isDir);
+                    }
+                }
+            }
+
+            // 清理拖拽源
+            that._dragSource = null;
+        };
+
+        document.addEventListener('dragover', this._editorDragOverHandler, true);
+        document.addEventListener('drop', this._editorDropHandler, true);
+    }
+
+    /**
+     * 在鼠标 drop 位置插入链接
+     * 使用 caretRangeFromPoint 获取鼠标落点对应的文档位置
+     */
+    insertAtDropPosition(e, protyleWysiwyg, filePath, fileName, isDir) {
+        var that = this;
+
+        // 生成要插入的 Markdown 链接
+        var markdown = that.buildLocalFileMarkdown(filePath, fileName, isDir);
+
+        // 使用 caretRangeFromPoint 获取鼠标落点位置
+        var range = null;
+        try {
+            if (document.caretRangeFromPoint) {
+                range = document.caretRangeFromPoint(e.clientX, e.clientY);
+            } else if (document.caretPositionFromPoint) {
+                var pos = document.caretPositionFromPoint(e.clientX, e.clientY);
+                if (pos) {
+                    range = document.createRange();
+                    range.setStart(pos.offsetNode, pos.offset);
+                    range.collapse(true);
+                }
+            }
+        } catch (ex) {
+            that._log('caretRangeFromPoint error:', ex);
+        }
+
+        if (range && protyleWysiwyg.contains(range.startContainer)) {
+            // 鼠标位置在编辑器内容区内 → 在该位置插入链接
+            try {
+                // 先聚焦编辑器
+                protyleWysiwyg.focus();
+
+                // 设置选区到鼠标落点位置（focus 后设置，避免 focus 重置选区）
+                var selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+
+                // 在选区位置插入文本
+                range.deleteContents();
+                var textNode = document.createTextNode(markdown);
+                range.insertNode(textNode);
+                range.setStartAfter(textNode);
+                range.collapse(true);
+                selection.removeAllRanges();
+                selection.addRange(range);
+
+                // 触发输入事件，让思源感知内容变更
+                var inputEvent = new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: markdown
+                });
+                protyleWysiwyg.dispatchEvent(inputEvent);
+                try {
+                    var pasteEvent = new InputEvent('input', {
+                        bubbles: true,
+                        cancelable: true,
+                        inputType: 'insertFromPaste',
+                        data: markdown
+                    });
+                    protyleWysiwyg.dispatchEvent(pasteEvent);
+                } catch (ex2) {}
+
+                return;
+            } catch (ex) {
+                that._error('insertAtDropPosition error:', ex);
+                // 降级到文档底部插入
+            }
+        }
+
+        // 无法确定鼠标位置 → 插入到文档最底部
+        that.insertAtDocBottom(protyleWysiwyg, filePath, fileName, isDir);
+    }
+
+    /**
+     * 在文档最底部插入链接
+     */
+    insertAtDocBottom(protyleWysiwyg, filePath, fileName, isDir) {
+        var that = this;
+
+        // 将光标移到编辑器末尾
+        protyleWysiwyg.focus();
+        var selection = window.getSelection();
+        var newRange = document.createRange();
+        newRange.selectNodeContents(protyleWysiwyg);
+        newRange.collapse(false); // 折叠到末尾
+        selection.removeAllRanges();
+        selection.addRange(newRange);
+
+        // 使用 insertLocalFileLink 插入（带指纹和重试机制）
+        that.insertLocalFileLink(filePath, fileName, isDir);
+    }
+
+    /**
+     * 批量插入多个文件链接为独立块（竖排显示，每个链接一个块）
+     * 有鼠标位置时：第一个文件在鼠标位置插入，后续文件依次追加新块
+     * 无鼠标位置时：追加到文档底部
+     * @param {Array<{path, name, isDir}>} files - 文件列表
+     * @param {Element} protyleWysiwyg - 编辑器 DOM
+     * @param {Event} dropEvent - drop 事件对象（用于获取鼠标位置）
+     */
+    insertBatchFileLinks(files, protyleWysiwyg, dropEvent) {
+        var that = this;
+
+        if (!protyleWysiwyg) {
+            // 无编辑器 DOM，尝试获取
+            var protyle = dropEvent && dropEvent.target ? (dropEvent.target.closest ? dropEvent.target.closest('.protyle') : null) : null;
+            if (protyle) {
+                protyleWysiwyg = protyle.querySelector('.protyle-wysiwyg[contenteditable="true"]');
+            }
+        }
+        if (!protyleWysiwyg) {
+            // 最终降级：复制到剪贴板
+            var allMd = '';
+            for (var i = 0; i < files.length; i++) {
+                if (i > 0) allMd += '\n';
+                allMd += that.buildLocalFileMarkdown(files[i].path, files[i].name, files[i].isDir);
+            }
+            that.copyToClipboard(allMd);
+            that.showToastMsg('已复制到剪贴板，请 Ctrl+V 粘贴');
+            return;
+        }
+
+        // 检测鼠标是否在编辑器内容区内
+        var hasDropPosition = false;
+        if (dropEvent && protyleWysiwyg) {
+            var range = null;
+            try {
+                if (document.caretRangeFromPoint) {
+                    range = document.caretRangeFromPoint(dropEvent.clientX, dropEvent.clientY);
+                } else if (document.caretPositionFromPoint) {
+                    var pos = document.caretPositionFromPoint(dropEvent.clientX, dropEvent.clientY);
+                    if (pos) {
+                        range = document.createRange();
+                        range.setStart(pos.offsetNode, pos.offset);
+                        range.collapse(true);
+                    }
+                }
+            } catch (ex) {}
+
+            if (range && protyleWysiwyg.contains(range.startContainer)) {
+                hasDropPosition = true;
+                // 设置选区到鼠标位置
+                protyleWysiwyg.focus();
+                var selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+        }
+
+        if (hasDropPosition) {
+            // === 有鼠标位置：第一个文件在鼠标位置插入，后续逐个追加新块 ===
+            that.insertAtDropPosition(dropEvent, protyleWysiwyg, files[0].path, files[0].name, files[0].isDir);
+            // 后续文件：逐个在新块中插入
+            var index = 1;
+            function insertNext() {
+                if (index >= files.length) return;
+                var file = files[index];
+                index++;
+                // 在当前光标位置插入链接
+                that.insertLocalFileLink(file.path, file.name, file.isDir);
+                // 延迟模拟 Enter 键创建新块
+                if (index < files.length) {
+                    setTimeout(function() {
+                        protyleWysiwyg.focus();
+                        var enterEvent = new KeyboardEvent('keydown', {
+                            key: 'Enter',
+                            code: 'Enter',
+                            keyCode: 13,
+                            which: 13,
+                            bubbles: true,
+                            cancelable: true
+                        });
+                        protyleWysiwyg.dispatchEvent(enterEvent);
+                        setTimeout(insertNext, 50);
+                    }, 100);
+                }
+            }
+            // 第一个文件插入后，模拟 Enter 创建新块再插入第二个
+            if (files.length > 1) {
+                setTimeout(function() {
+                    protyleWysiwyg.focus();
+                    var enterEvent = new KeyboardEvent('keydown', {
+                        key: 'Enter',
+                        code: 'Enter',
+                        keyCode: 13,
+                        which: 13,
+                        bubbles: true,
+                        cancelable: true
+                    });
+                    protyleWysiwyg.dispatchEvent(enterEvent);
+                    setTimeout(insertNext, 50);
+                }, 150);
+            }
+        } else {
+            // === 无鼠标位置：用 API 追加到文档底部 ===
+            var docId = that.getCurrentDocId();
+            if (!docId) {
+                that.showToastMsg('无法获取当前文档，批量插入失败');
+                return;
+            }
+
+            // 构建批量 markdown：每个链接之间用空行分隔（空行 = 新块）
+            var batchMd = '';
+            for (var j = 0; j < files.length; j++) {
+                if (j > 0) batchMd += '\n\n';
+                batchMd += that.buildLocalFileMarkdown(files[j].path, files[j].name, files[j].isDir);
+            }
+
+            fetch('/api/block/insertBlock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    data: batchMd,
+                    dataType: 'markdown',
+                    parentID: docId
+                }),
+                credentials: 'include'
+            }).then(function(resp) {
+                return resp.json();
+            }).then(function(data) {
+                if (data.code !== 0) {
+                    that._log('insertBatchFileLinks API failed:', data.msg);
+                    // 降级：逐个 DOM 插入到文档底部
+                    for (var k = 0; k < files.length; k++) {
+                        that.insertAtDocBottom(protyleWysiwyg, files[k].path, files[k].name, files[k].isDir);
+                    }
+                }
+            }).catch(function(e) {
+                that._error('insertBatchFileLinks error:', e);
+                // 降级
+                for (var k2 = 0; k2 < files.length; k2++) {
+                    that.insertAtDocBottom(protyleWysiwyg, files[k2].path, files[k2].name, files[k2].isDir);
+                }
+            });
+        }
+    }
+
+    /**
+     * 构建本地文件/文件夹的 Markdown 链接文本
+     * @param {string} filePath - 文件完整路径
+     * @param {string} fileName - 文件名
+     * @param {boolean} isDir - 是否为文件夹
+     * @returns {string} Markdown 格式的链接文本
+     */
+    buildLocalFileMarkdown(filePath, fileName, isDir) {
+        var fileUrl = this.toFileUrl(filePath);
+        var icon = isDir ? '📂' : this.getFileIcon(fileName);
+        var linkText = icon + ' ' + this.escapeMarkdown(fileName);
+
+        // 尝试获取文件指纹（size + mtime），用于失效链接修复
+        var fingerprintTitle = '';
+        try {
+            var stat = fs.statSync(filePath);
+            if (stat) {
+                fingerprintTitle = 'size=' + stat.size + '&mtime=' + (stat.mtime ? stat.mtime.getTime() : 0);
+            }
+        } catch (e) {
+            // 获取不到就算了
+        }
+
+        var markdown;
+        if (!isDir && this.isImageFile(fileName)) {
+            // 图片：直接显示
+            markdown = '![' + this.escapeMarkdown(fileName) + '](' + fileUrl + ')';
+        } else {
+            // 文件夹和非图片文件：显示为链接
+            if (fingerprintTitle) {
+                markdown = '[' + linkText + '](' + fileUrl + ' "' + fingerprintTitle + '")';
+            } else {
+                markdown = '[' + linkText + '](' + fileUrl + ')';
+            }
+        }
+        return markdown;
     }
 
     /**
@@ -3407,6 +4032,9 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
 
+            // 更新文件-文档关联映射中的路径
+            that.updateFileDocMapPath(srcPath, finalDestPath);
+
             // 刷新当前目录
             that.loadDirectory(that.currentPath);
         } catch(e) {
@@ -3502,6 +4130,9 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
 
+            // 更新文件-文档关联映射中的路径
+            that.updateFileDocMapPath(srcPath, finalDestPath);
+
             // 粘贴成功，无提示
             that._clipboardCut = null;
 
@@ -3548,6 +4179,181 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
         fs.rmdirSync(dirPath);
+    }
+
+    /**
+     * 处理外部拖拽文件复制到目标目录
+     * 从系统文件管理器等外部来源拖入的文件，复制到插件面板当前目录或目标文件夹
+     * @param {FileList} fileList - dataTransfer.files 对象
+     * @param {string} targetDir - 目标目录路径
+     */
+    copyExternalFiles(fileList, targetDir) {
+        var that = this;
+        if (!fs || !path) {
+            this.showToastMsg('文件系统不可用，无法复制');
+            return;
+        }
+        if (!fileList || fileList.length === 0) {
+            this.showToastMsg('没有检测到文件');
+            return;
+        }
+        // 检查目标目录是否存在
+        if (!fs.existsSync(targetDir)) {
+            this.showToastMsg('目标目录不存在: ' + targetDir);
+            return;
+        }
+
+        // 尝试获取 electron.webUtils（新版 Electron 获取文件路径的方式）
+        var webUtils = null;
+        try {
+            var electron = require('electron');
+            webUtils = electron.webUtils || (electron.remote && electron.remote.webUtils);
+        } catch(e) {
+            // 非 Electron 环境或无法 require electron
+        }
+
+        var copiedCount = 0;
+        var failedCount = 0;
+        var skippedCount = 0;
+        var failMsgs = [];
+        var pendingAsync = 0;  // FileReader 异步处理中的文件数
+
+        function finish() {
+            // 刷新目录（始终刷新当前目录，以显示新复制进来的文件）
+            that.loadDirectory(that.currentPath);
+            // 提示结果
+            var msgs = [];
+            if (copiedCount > 0) msgs.push('已复制 ' + copiedCount + ' 个文件');
+            if (failedCount > 0) msgs.push(failedCount + ' 个失败（' + failMsgs.join('; ') + '）');
+            if (skippedCount > 0) msgs.push(skippedCount + ' 个跳过');
+            if (msgs.length === 0) msgs.push('没有文件被复制');
+            that.showToastMsg(msgs.join('，'));
+        }
+
+        for (var i = 0; i < fileList.length; i++) {
+            var file = fileList[i];
+            var srcPath = null;
+
+            // 方式1：file.path（旧版 Electron）
+            if (file.path && typeof file.path === 'string' && file.path.length > 0) {
+                srcPath = file.path;
+            }
+            // 方式2：electron.webUtils.getPathForFile(file)（新版 Electron 20+）
+            if (!srcPath && webUtils && typeof webUtils.getPathForFile === 'function') {
+                try {
+                    srcPath = webUtils.getPathForFile(file);
+                } catch(e) {
+                    // ignore
+                }
+            }
+
+            if (!srcPath) {
+                // 无法获取完整路径，使用 FileReader 读取文件内容并写入
+                pendingAsync++;
+                that._copyExternalFileByReader(file, targetDir, function(ok, msg) {
+                    if (ok) {
+                        copiedCount++;
+                    } else {
+                        failedCount++;
+                        failMsgs.push(msg);
+                    }
+                    pendingAsync--;
+                    if (pendingAsync === 0) finish();
+                });
+                continue;
+            }
+
+            // 有路径时走文件系统复制
+            if (!fs.existsSync(srcPath)) {
+                failMsgs.push(file.name + ' 源文件不存在');
+                failedCount++;
+                continue;
+            }
+
+            var srcName = path.basename(srcPath);
+            var isDir = fs.statSync(srcPath).isDirectory();
+
+            // 如果源路径就在目标目录内，跳过（用 path.normalize 避免斜杠差异）
+            var srcDir = path.normalize(path.dirname(srcPath));
+            if (srcDir === path.normalize(targetDir)) {
+                skippedCount++;
+                continue;
+            }
+
+            // 构造目标路径，处理重名
+            var destPath = path.join(targetDir, srcName);
+            var finalDestPath = destPath;
+            var counter = 1;
+            while (fs.existsSync(finalDestPath)) {
+                var ext = isDir ? '' : path.extname(srcName);
+                var base = isDir ? srcName : path.basename(srcName, ext);
+                finalDestPath = path.join(targetDir, base + ' (' + counter + ')' + ext);
+                counter++;
+            }
+
+            try {
+                if (isDir) {
+                    that.copyDirectorySync(srcPath, finalDestPath);
+                } else {
+                    fs.copyFileSync(srcPath, finalDestPath);
+                }
+                copiedCount++;
+            } catch(e) {
+                that._error('copyExternalFiles error:', e);
+                failMsgs.push(file.name + ': ' + (e.message || '未知错误'));
+                failedCount++;
+            }
+        }
+
+        // 如果没有异步操作，立即刷新和提示
+        if (pendingAsync === 0) finish();
+    }
+
+    /**
+     * 通过 FileReader 读取外部拖入文件并写入目标目录（当 file.path 不可用时的降级方案）
+     */
+    _copyExternalFileByReader(file, targetDir, callback) {
+        var that = this;
+        var srcName = file.name || 'unknown';
+
+        // 文件夹无法通过 FileReader 读取（size=0 且无 type 是文件夹的粗略特征）
+        if (file.size === 0 && !file.type) {
+            callback(false, srcName + ': 无法复制文件夹（浏览器未暴露文件路径）');
+            return;
+        }
+
+        // 构造目标路径，处理重名
+        var destPath = path.join(targetDir, srcName);
+        var finalDestPath = destPath;
+        var counter = 1;
+        try {
+            while (fs.existsSync(finalDestPath)) {
+                var ext = path.extname(srcName);
+                var base = path.basename(srcName, ext);
+                finalDestPath = path.join(targetDir, base + ' (' + counter + ')' + ext);
+                counter++;
+            }
+        } catch(e) {
+            callback(false, srcName + ': 路径检查失败');
+            return;
+        }
+
+        var reader = new FileReader();
+        reader.onload = function(e) {
+            try {
+                var arrayBuffer = e.target.result;
+                var buffer = Buffer.from(arrayBuffer);
+                fs.writeFileSync(finalDestPath, buffer);
+                callback(true);
+            } catch(err) {
+                that._error('_copyExternalFileByReader write error:', err);
+                callback(false, srcName + ': ' + (err.message || '写入失败'));
+            }
+        };
+        reader.onerror = function() {
+            callback(false, srcName + ': 读取失败');
+        };
+        reader.readAsArrayBuffer(file);
     }
 
     /**
@@ -3672,37 +4478,35 @@ class LocalBrowsePlugin extends Plugin {
         var isDocker = that._isDockerBrowser();
         var items = [];
         if (isDir) {
-            items.push({ icon: '📂', label: '打开', action: function() { that.loadDirectory(filePath); } });
-            items.push({ type: 'divider' });
+            // 文件夹右键菜单：插入链接、收藏文件夹、关联当前文档、打开所在位置、查看属性
+            items.push({ icon: '📎', label: '插入链接', action: isDocker ? null : function() { that.insertLocalFileLink(filePath, fileName, true); }, disabled: isDocker });
             if (that.isFavorite(filePath)) {
                 items.push({ icon: '❌', label: '移除收藏', action: function() { that.removeFavorite(filePath); } });
             } else {
-                items.push({ icon: '⭐', label: '添加到收藏', action: function() { that.addFavorite(filePath, fileName); } });
+                items.push({ icon: '⭐', label: '收藏文件夹', action: function() { that.addFavorite(filePath, fileName); } });
             }
-            items.push({ type: 'divider' });
-            items.push({ icon: '🔗', label: '添加到文档', action: isDocker ? null : function() { that.insertLocalFileLink(filePath, fileName, true); }, disabled: isDocker });
-            items.push({ type: 'divider' });
-            items.push({ icon: '✂️', label: '剪切', action: isDocker ? null : function() { that.cutFile(filePath, fileName, isDir); }, disabled: isDocker });
-            // 如果有剪切内容，显示粘贴选项
-            if (that._clipboardCut) {
-                items.push({ type: 'divider' });
-                items.push({ icon: '📋', label: '粘贴「' + that._clipboardCut.name + '」', action: isDocker ? null : function() { that.pasteFile(filePath); }, disabled: isDocker });
+            // 关联当前文档
+            if (that.isFileDocLinked(filePath)) {
+                items.push({ icon: '🔗', label: '取消关联', action: function() { that.unlinkFileDoc(filePath); } });
+                items.push({ icon: '📖', label: '打开关联文档', action: function() { that.openLinkedDoc(filePath); } });
+            } else {
+                items.push({ icon: '🔗', label: '关联当前文档', action: function() { that.linkFileToCurrentDoc(filePath); } });
             }
+            items.push({ icon: '📁', label: '打开所在位置', action: isDocker ? null : function() { that.openContainingFolder(filePath); }, disabled: isDocker });
             items.push({ type: 'divider' });
             items.push({ icon: 'ℹ️', label: '查看属性', action: function() { that.showFileProperties(filePath, fileName, isDir); } });
         } else {
-            // 音频文件：优先显示播放选项
-            if (that.isAudioFile(fileName)) {
-                items.push({ icon: '🎵', label: '播放', action: function() { that.playAudio(filePath, fileName); } });
+            // 文件右键菜单：插入链接、插入文件、关联当前文档、打开所在位置、剪切、查看属性
+            items.push({ icon: '📎', label: '插入链接', action: isDocker ? null : function() { that.handleFileClick(filePath, fileName); }, disabled: isDocker });
+            items.push({ icon: '📦', label: '插入文件', action: function() { that.copyFileToAssets(filePath, fileName); } });
+            // 关联当前文档
+            if (that.isFileDocLinked(filePath)) {
+                items.push({ icon: '🔗', label: '取消关联', action: function() { that.unlinkFileDoc(filePath); } });
+                items.push({ icon: '📖', label: '打开关联文档', action: function() { that.openLinkedDoc(filePath); } });
+            } else {
+                items.push({ icon: '🔗', label: '关联当前文档', action: function() { that.linkFileToCurrentDoc(filePath); } });
             }
-            items.push({ icon: '📂', label: '打开文件', action: isDocker ? null : function() { that.openFile(filePath); }, disabled: isDocker });
-            items.push({ icon: '📁', label: '打开所在文件夹', action: isDocker ? null : function() { that.openContainingFolder(filePath); }, disabled: isDocker });
-            items.push({ type: 'divider' });
-            items.push({ icon: '📋', label: '复制路径', action: isDocker ? null : function() { that.copyFilePath(filePath); }, disabled: isDocker });
-            items.push({ icon: '🔗', label: '复制 Markdown 链接', action: isDocker ? null : function() { that.copyMarkdownLink(filePath, fileName); }, disabled: isDocker });
-            items.push({ type: 'divider' });
-            items.push({ icon: '📎', label: '插入本地链接', action: isDocker ? null : function() { that.handleFileClick(filePath, fileName); }, disabled: isDocker });
-            items.push({ icon: '📦', label: '插入本地文件', action: function() { that.copyFileToAssets(filePath, fileName); } });
+            items.push({ icon: '📁', label: '打开所在位置', action: isDocker ? null : function() { that.openContainingFolder(filePath); }, disabled: isDocker });
             items.push({ type: 'divider' });
             items.push({ icon: '✂️', label: '剪切', action: isDocker ? null : function() { that.cutFile(filePath, fileName, isDir); }, disabled: isDocker });
             items.push({ type: 'divider' });
@@ -3825,6 +4629,14 @@ class LocalBrowsePlugin extends Plugin {
      */
     openFile(filePath) {
         var that = this;
+        // 如果是文件夹，在插件面板中打开，不弹出系统资源管理器
+        try {
+            if (fs && fs.statSync(filePath).isDirectory()) {
+                that.loadDirectory(filePath);
+                that.ensurePanelVisible();
+                return;
+            }
+        } catch (e) {}
         try {
             var electron = window.require && window.require('electron');
             if (electron && electron.shell && electron.shell.openPath) {
@@ -3877,33 +4689,66 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 注册链接点击拦截器
-     * 拦截文档中 file:/// 链接的点击，确保带指纹信息的链接能正确打开
-     * 指纹信息存储在 title 属性中（如 title="size=123&mtime=456"），
-     * 也兼容 URL fragment 格式（如 #size=123&mtime=456）
+     * 拦截文档中 file:/// 链接的点击：
+     * 1. 文件夹链接 → 在插件面板中打开
+     * 2. 带指纹信息的文件链接 → 去掉指纹后正确打开
+     *
+     * 思源编辑器中链接可能渲染为 <a href="..."> 或 <span data-type="a" data-href="...">
      */
     registerLinkClickInterceptor() {
         var that = this;
-        that._linkClickInterceptor = function(e) {
-            // 查找被点击的链接元素
+
+        /**
+         * 从点击事件中提取 file:/// 链接的 href 和元素
+         * @returns {{ href: string, linkEl: Element } | null}
+         */
+        function findFileLink(e) {
             var target = e.target;
-            var linkEl = null;
-            // 向上查找 <a> 标签
             while (target && target !== document) {
-                if (target.tagName === 'A' && target.href) {
-                    linkEl = target;
-                    break;
+                // 标准链接 <a href="file:///...">
+                if (target.tagName === 'A' && target.href && target.href.indexOf('file:///') === 0) {
+                    return { href: target.href, linkEl: target };
+                }
+                // 思源 protyle 链接 <span data-type="a" data-href="file:///...">
+                if (target.dataset && target.dataset.type === 'a' && target.dataset.href && target.dataset.href.indexOf('file:///') === 0) {
+                    return { href: target.dataset.href, linkEl: target };
                 }
                 target = target.parentElement;
             }
-            if (!linkEl) return;
+            return null;
+        }
 
-            var href = linkEl.href;
-            // 只处理 file:/// 链接
-            if (!href || href.indexOf('file:///') !== 0) return;
+        that._linkClickInterceptor = function(e) {
+            var linkInfo = findFileLink(e);
+            if (!linkInfo) return;
+
+            var href = linkInfo.href;
+            // 解析本地路径（去掉 fragment）
+            var cleanUrl = href.split('#')[0];
+            var localPath = that.fileUrlToLocalPath(cleanUrl);
+
+            // 文件夹链接：在插件面板中打开，不弹出系统资源管理器
+            if (localPath) {
+                try {
+                    if (fs && fs.statSync(localPath).isDirectory()) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        that.loadDirectory(localPath);
+                        that.ensurePanelVisible();
+                        return;
+                    }
+                } catch(ex) {
+                    // 路径不存在或无法访问，继续走文件逻辑
+                }
+
+                // 文件链接：在插件面板中同步定位到该文件
+                that.locateFileInPanel(localPath);
+            }
 
             // 检查是否包含指纹信息（URL fragment 或 title 属性）
             var hasFragmentFingerprint = (href.indexOf('#size=') !== -1 || href.indexOf('#mtime=') !== -1);
-            var titleAttr = linkEl.getAttribute('title') || '';
+            var titleAttr = linkInfo.linkEl.getAttribute('title') || '';
             var hasTitleFingerprint = (titleAttr.indexOf('size=') !== -1 || titleAttr.indexOf('mtime=') !== -1);
 
             if (!hasFragmentFingerprint && !hasTitleFingerprint) return;
@@ -3914,11 +4759,50 @@ class LocalBrowsePlugin extends Plugin {
             e.stopImmediatePropagation();
 
             // 去掉 fragment 后打开文件
-            var cleanUrl = href.split('#')[0];
             that.openFileByUrl(cleanUrl);
         };
-        // 在捕获阶段拦截，比思源的默认处理更早
-        document.addEventListener('mousedown', that._linkClickInterceptor, true);
+
+        // 在捕获阶段拦截 click 事件（思源通过 click 处理链接，不用 mousedown）
+        document.addEventListener('click', that._linkClickInterceptor, true);
+    }
+
+    /**
+     * 在插件面板中定位到指定文件（导航到文件所在目录并高亮选中）
+     * @param {string} filePath - 文件的完整本地路径
+     */
+    locateFileInPanel(filePath) {
+        var that = this;
+        if (!filePath) return;
+
+        // 从完整路径中提取文件名和目录路径
+        var fileName = require('path').basename(filePath);
+        var dirPath = require('path').dirname(filePath);
+
+        // 规范化目录路径用于比较（去末尾分隔符）
+        var normalizeDir = function(p) {
+            if (!p) return '';
+            while (p.length > 1 && (p.endsWith('\\') || p.endsWith('/'))) {
+                p = p.slice(0, -1);
+            }
+            return p;
+        };
+
+        var currentDir = normalizeDir(that.currentPath);
+        var targetDir = normalizeDir(dirPath);
+
+        // 确保面板可见
+        that.ensurePanelVisible();
+
+        // 如果当前不在文件所在目录，先导航过去
+        if (targetDir && targetDir !== currentDir) {
+            // 设置待定位标记，renderFiles 完成后会自动定位
+            that._pendingLocateFileName = fileName;
+            that.loadDirectory(targetDir);
+            return;
+        }
+
+        // 当前已在目标目录，直接定位
+        that._doLocateFile(fileName);
     }
 
     /**
@@ -3930,6 +4814,22 @@ class LocalBrowsePlugin extends Plugin {
             this.openFile(localPath);
         } else {
             this.showToastMsg('无法解析文件路径：' + url);
+        }
+    }
+
+    /**
+     * 确保插件面板可见（如果面板被隐藏则显示它）
+     */
+    ensurePanelVisible() {
+        if (!this.dockPanel || !this.dockPanel.element) return;
+        // 检查面板自身是否可见
+        var panelEl = this.dockPanel.element;
+        var rect = panelEl.getBoundingClientRect();
+        if (rect.width > 0 && rect.height > 0) return; // 已可见
+        // 面板不可见，模拟点击 dock 图标来显示
+        var dockIcon = document.querySelector('.dock__item[data-type="cd_filetree"]');
+        if (dockIcon) {
+            dockIcon.click();
         }
     }
 
@@ -4031,17 +4931,89 @@ class LocalBrowsePlugin extends Plugin {
     /**
      * 选中文件项（高亮）
      */
-    selectItem(selectedItem) {
-        var list = document.getElementById('cd-file-list');
-        if (list) {
-            var items = list.querySelectorAll('.cd-item');
-            for (var i = 0; i < items.length; i++) {
-                items[i].classList.remove('cd-selected');
-                items[i].style.background = '';
+    selectItem(selectedItem, e) {
+        // 支持 Ctrl/Cmd + 点击：切换选中；Shift + 点击：范围选择；普通点击：单选
+        var multiKey = e && (e.ctrlKey || e.metaKey);
+        var shiftKey = e && e.shiftKey;
+
+        if (shiftKey && this._lastClickedItem) {
+            // Shift + 点击：范围选择（从上次点击到当前项之间的所有项）
+            this._selectRange(this._lastClickedItem, selectedItem);
+        } else if (multiKey) {
+            // Ctrl/Cmd + 点击：切换当前项选中状态
+            if (selectedItem.classList.contains('cd-selected')) {
+                selectedItem.classList.remove('cd-selected');
+                selectedItem.style.background = '';
+                // 从 _selectedItems 中移除
+                var idx = this._selectedItems.indexOf(selectedItem);
+                if (idx !== -1) this._selectedItems.splice(idx, 1);
+            } else {
+                selectedItem.classList.add('cd-selected');
+                selectedItem.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+                this._selectedItems.push(selectedItem);
             }
+            this._lastClickedItem = selectedItem;
+        } else {
+            // 普通点击：清除其他选中，只选中当前项
+            this.clearSelection();
+            selectedItem.classList.add('cd-selected');
+            selectedItem.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+            this._selectedItems = [selectedItem];
+            this._lastClickedItem = selectedItem;
         }
-        selectedItem.classList.add('cd-selected');
-        selectedItem.style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+    }
+
+    /**
+     * 范围选择：选中 from 到 to 之间的所有项
+     */
+    _selectRange(fromItem, toItem) {
+        var list = document.getElementById('cd-file-list');
+        if (!list) return;
+        var allItems = list.querySelectorAll('.cd-item');
+        var fromIdx = -1, toIdx = -1;
+        for (var i = 0; i < allItems.length; i++) {
+            if (allItems[i] === fromItem) fromIdx = i;
+            if (allItems[i] === toItem) toIdx = i;
+        }
+        if (fromIdx === -1 || toIdx === -1) return;
+        var start = Math.min(fromIdx, toIdx);
+        var end = Math.max(fromIdx, toIdx);
+        // 清除之前的选择
+        this.clearSelection();
+        for (var j = start; j <= end; j++) {
+            allItems[j].classList.add('cd-selected');
+            allItems[j].style.background = 'var(--b3-theme-primary-light,#bbdefb)';
+            this._selectedItems.push(allItems[j]);
+        }
+    }
+
+    /**
+     * 清除所有选中状态
+     */
+    clearSelection() {
+        for (var i = 0; i < this._selectedItems.length; i++) {
+            this._selectedItems[i].classList.remove('cd-selected');
+            this._selectedItems[i].style.background = '';
+        }
+        this._selectedItems = [];
+    }
+
+    /**
+     * 获取所有选中文件的信息列表
+     * @returns {Array<{path, name, isDir, el}>}
+     */
+    getSelectedFiles() {
+        var result = [];
+        for (var i = 0; i < this._selectedItems.length; i++) {
+            var item = this._selectedItems[i];
+            result.push({
+                path: item.dataset.path,
+                name: item.dataset.name,
+                isDir: item.dataset.isdir === 'true',
+                el: item
+            });
+        }
+        return result;
     }
 
     /**
@@ -4863,16 +5835,6 @@ class LocalBrowsePlugin extends Plugin {
             that._lastAudioHighlight.style.background = '';
         }
         that._lastAudioHighlight = target;
-
-        // 2秒后淡出高亮
-        setTimeout(function() {
-            if (target && target.style) {
-                target.style.background = '';
-            }
-            if (that._lastAudioHighlight === target) {
-                that._lastAudioHighlight = null;
-            }
-        }, 2000);
     }
 
     /**
@@ -7382,6 +8344,255 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 从 data.json 加载文件-文档关联映射（按平台隔离）
+     * 存储格式: { "win32": { "C:\\path\\to\\file": "20240101docId", ... }, "darwin": {...}, "linux": {...} }
+     */
+    loadFileDocMap() {
+        var that = this;
+        try {
+            if (typeof this.loadData === 'function') {
+                this.loadData('fileDocMap').then(function(data) {
+                    that.fileDocMap = that._extractPlatformData(data);
+                }).catch(function() {
+                    that.fileDocMap = {};
+                });
+            } else {
+                var saved = localStorage.getItem('cd_file_doc_map');
+                if (saved) {
+                    try {
+                        that.fileDocMap = that._extractPlatformData(JSON.parse(saved));
+                    } catch (e) {
+                        that.fileDocMap = {};
+                    }
+                }
+            }
+        } catch (e) {
+            this.fileDocMap = {};
+        }
+    }
+
+    /**
+     * 保存文件-文档关联映射到 data.json（按平台隔离）
+     */
+    saveFileDocMap() {
+        var that = this;
+        try {
+            var fullData = {};
+            if (typeof this.loadData === 'function') {
+                // 先读取现有数据，更新当前平台部分，保留其他平台
+                this.loadData('fileDocMap').then(function(existing) {
+                    if (existing && typeof existing === 'object') {
+                        fullData = existing;
+                    }
+                    fullData[that.platform] = that.fileDocMap;
+                    that.saveData('fileDocMap', fullData).catch(function(e) {
+                        that._error('saveFileDocMap failed:', e);
+                    });
+                }).catch(function() {
+                    fullData[that.platform] = that.fileDocMap;
+                    that.saveData('fileDocMap', fullData).catch(function(e) {
+                        that._error('saveFileDocMap failed:', e);
+                    });
+                });
+            } else {
+                var saved = localStorage.getItem('cd_file_doc_map');
+                if (saved) {
+                    try {
+                        fullData = JSON.parse(saved);
+                    } catch (e) {}
+                }
+                if (!fullData || typeof fullData !== 'object') fullData = {};
+                fullData[this.platform] = this.fileDocMap;
+                localStorage.setItem('cd_file_doc_map', JSON.stringify(fullData));
+            }
+        } catch (e) {
+            this._error('saveFileDocMap error:', e);
+        }
+    }
+
+    /**
+     * 从存储数据中解析当前平台的数据（兼容旧格式纯对象）
+     */
+    _extractPlatformData(data) {
+        if (!data) return {};
+        // 旧格式兼容：直接是 path→docId 映射
+        if (typeof data === 'object' && !data.win32 && !data.darwin && !data.linux) {
+            return data;
+        }
+        // 新格式：按平台分组的字典
+        if (data && typeof data === 'object' && typeof data[this.platform] === 'object') {
+            return data[this.platform];
+        }
+        return {};
+    }
+
+    /**
+     * 移动/重命名文件后，更新 fileDocMap 中的关联路径
+     * @param {string} oldPath - 原路径
+     * @param {string} newPath - 新路径
+     */
+    updateFileDocMapPath(oldPath, newPath) {
+        if (oldPath === newPath) return;
+        var updated = false;
+        // 直接匹配：文件本身的关联
+        if (this.fileDocMap[oldPath]) {
+            this.fileDocMap[newPath] = this.fileDocMap[oldPath];
+            delete this.fileDocMap[oldPath];
+            updated = true;
+        }
+        // 前缀匹配：文件夹移动时，其内部文件的关联路径也需要更新
+        var oldPrefix = oldPath + path.sep;
+        var keys = Object.keys(this.fileDocMap);
+        for (var i = 0; i < keys.length; i++) {
+            if (keys[i].indexOf(oldPrefix) === 0) {
+                var newKey = newPath + keys[i].substring(oldPath.length);
+                this.fileDocMap[newKey] = this.fileDocMap[keys[i]];
+                delete this.fileDocMap[keys[i]];
+                updated = true;
+            }
+        }
+        if (updated) {
+            this.saveFileDocMap();
+        }
+    }
+
+    /**
+     * 检查文件是否已关联文档
+     */
+    isFileDocLinked(filePath) {
+        return !!this.fileDocMap[filePath];
+    }
+
+    /**
+     * 获取文件关联的文档ID
+     */
+    getLinkedDocId(filePath) {
+        return this.fileDocMap[filePath] || null;
+    }
+
+    /**
+     * 关联文件与当前文档，并在文档第一行插入文件链接
+     */
+    linkFileToCurrentDoc(filePath) {
+        var that = this;
+        var docId = that.getCurrentDocId();
+        if (!docId) {
+            that.showToastMsg('无法获取当前文档 ID，请先打开一个文档');
+            return;
+        }
+        that.fileDocMap[filePath] = docId;
+        that.saveFileDocMap();
+        that.loadDirectory(that.currentPath); // 刷新文件列表显示关联图标
+        that.showToastMsg('已关联当前文档');
+
+        // 在当前文档第一行插入文件链接
+        that.insertLinkAtDocTop(docId, filePath);
+    }
+
+    /**
+     * 在指定文档的第一行插入文件链接
+     */
+    insertLinkAtDocTop(docId, filePath) {
+        var that = this;
+        var fileName = require('path').basename(filePath);
+        var isDir = false;
+        try { isDir = fs.statSync(filePath).isDirectory(); } catch(e) {}
+
+        var markdown = that.buildLocalFileMarkdown(filePath, fileName, isDir);
+
+        // 获取文档第一个子块 ID，用于 nextID 参数将链接插入到第一行
+        fetch('/api/block/getChildBlocks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: docId }),
+            credentials: 'include'
+        }).then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            if (data.code === 0 && data.data && data.data.length > 0) {
+                var firstBlockId = data.data[0].id;
+                // 用 nextID 插入到第一个块前面（即文档第一行）
+                return fetch('/api/block/insertBlock', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        data: markdown,
+                        dataType: 'markdown',
+                        nextID: firstBlockId
+                    }),
+                    credentials: 'include'
+                });
+            } else {
+                // 文档没有子块（空文档），用 parentID 追加
+                return fetch('/api/block/insertBlock', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        data: markdown,
+                        dataType: 'markdown',
+                        parentID: docId
+                    }),
+                    credentials: 'include'
+                });
+            }
+        }).then(function(resp) {
+            if (resp) return resp.json();
+        }).then(function(data) {
+            if (data && data.code !== 0) {
+                that._log('insertLinkAtDocTop API failed:', data.msg);
+            }
+        }).catch(function(e) {
+            that._error('insertLinkAtDocTop error:', e);
+        });
+    }
+
+    /**
+     * 取消文件与文档的关联
+     */
+    unlinkFileDoc(filePath) {
+        var that = this;
+        if (that.fileDocMap[filePath]) {
+            delete that.fileDocMap[filePath];
+            that.saveFileDocMap();
+            that.loadDirectory(that.currentPath); // 刷新文件列表
+            that.showToastMsg('已取消关联');
+        }
+    }
+
+    /**
+     * 打开关联的文档
+     */
+    openLinkedDoc(filePath) {
+        var that = this;
+        var docId = that.getLinkedDocId(filePath);
+        if (!docId) {
+            that.showToastMsg('该文件未关联文档');
+            return;
+        }
+        // 使用思源 API 打开文档
+        try {
+            var app = (window.siyuan && window.siyuan.app) ? window.siyuan.app : null;
+            if (window.siyuan && typeof window.siyuan.openTab === 'function' && app) {
+                window.siyuan.openTab({
+                    app: app,
+                    position: 'right',
+                    doc: { id: docId },
+                    keepCursor: false,
+                    removeCurrentTab: false
+                });
+            } else if (window.siyuan && typeof window.siyuan.openBy === 'function') {
+                window.siyuan.openBy({ id: docId, position: 'right' });
+            } else {
+                // 最终降级方案：使用 siyuan:// 协议链接
+                window.open('siyuan://blocks/' + docId);
+            }
+        } catch (e) {
+            that._error('openLinkedDoc error:', e);
+            that.showToastMsg('打开文档失败');
+        }
+    }
+
+    /**
      * 从 data.json 加载收藏夹（按平台隔离）
      * 存储格式: { "win32": [...], "darwin": [...], "linux": [...] }
      */
@@ -7638,7 +8849,7 @@ class LocalBrowsePlugin extends Plugin {
         if (this.isFavorite(dirPath)) return;
         this.favorites.push({ path: dirPath, name: dirName });
         this.saveFavorites();
-        // 收藏成功，无提示
+        this.loadDirectory(this.currentPath);
     }
 
     /**
@@ -7654,7 +8865,7 @@ class LocalBrowsePlugin extends Plugin {
         }
         if (removed) {
             this.saveFavorites();
-            // 移除收藏成功，无提示
+            this.loadDirectory(this.currentPath);
         }
     }
 

@@ -34,7 +34,7 @@ Note: `LocalBrowseSync` is fixed. Select the parent folder of your sync disk (e.
 
 ### 4. Insert File Links
 
-- **Double-click a file** → Insert a local file link (supports file reorganization — if you move files, links auto-repair to the new path)
+- **Right-click a file** → Insert local file link (supports file reorganization — if you move files, links auto-repair to the new path)
 - **Right-click a folder** → Insert a folder link (📂 icon)
 
 ### 5. Bookmark Folders
@@ -63,7 +63,8 @@ Automatically detects all available storage. Switch quickly via the top-left dro
 
 ### ✨ Insert File/Folder Links
 
-**Double-click a file** to insert a link. Different file types have different effects:
+**Right-click a file** to insert a link. Different file types have different effects:
+
 
 | File Type | Format | Effect |
 |-----------|--------|--------|
@@ -73,22 +74,37 @@ Automatically detects all available storage. Switch quickly via the top-left dro
 
 **Right-click a folder** to insert a folder link: `[📂 foldername](file:///path)`
 
+**Drag-and-drop** to insert links:
+
+- Drag a file/folder from the browser panel directly into a document
+- **Multi-select**: Ctrl/Cmd+Click to toggle, Shift+Click to range-select, then batch drag
+- Each file in a batch gets its own block (vertical layout)
+- Smart insertion: drops onto editor content → inserts at mouse cursor position; drops onto blank area → appends to document bottom
+
+**Click links in documents**:
+
+- Click a file link → opens the file AND the browser panel auto-navigates to and highlights the file
+- Click a folder link → opens the folder in the browser panel (no longer opens system file manager)
+
 **Right-click menu** provides more options:
+
 
 | Menu Item | Description | Cross-Device |
 |-----------|-------------|--------------|
 | Insert Local File | Copy file to SiYuan `assets` directory and insert | ✅ Accessible on any device |
-| Insert Local Link | Insert `file:///` absolute path link | ⚠️ Current device only (works with cross-device sync) |
+| Insert Local Link | Insert `file:///` absolute path link | ⚠️ Current device only (works cross-device with sync folder) |
+| Associate with Current Doc | Link file to current doc and insert link at top | — |
 | Open File/Folder | Open with system default app | — |
 | Show in File Manager | Open file/folder location | — |
 | Copy Path | Copy full path to clipboard | — |
 
 **Which insertion method to use?**
 
+
 | Scenario | Recommended Method |
 |----------|-------------------|
 | Files in sync folder, used on multiple computers | Double-click + configure cross-device sync folder |
-| Files used on one computer only | Double-click |
+| Files used on one computer only | Right-click → Insert Local Link |
 | Need access on all devices (including mobile) | Right-click → Insert Local File (stored in assets) |
 
 ### 🔍 Search Files
@@ -122,6 +138,7 @@ Preference is saved automatically.
 ### 🔗 Broken Link Repair
 
 The plugin automatically detects `file:///` local links in the current document. The toolbar indicator light shows status:
+
 
 | Indicator | Status | Meaning |
 |-----------|--------|---------|
@@ -164,6 +181,7 @@ When using sync disks (Baidu Netdisk, Nutstore, iCloud Drive, OneDrive, etc.) ac
 
 **Example**: Using Baidu Netdisk sync, three devices configured as follows:
 
+
 | Device | Platform | Selected Parent Folder | Actual Sync Folder Path |
 |--------|----------|----------------------|------------------------|
 | Office Desktop | Windows | `D:\BaiduSyncdisk` | `D:\BaiduSyncdisk\LocalBrowseSync` |
@@ -190,7 +208,6 @@ Repair flow for links within the sync folder:
 
 ---
 
-
 ### 🎵 Music Player
 
 Double-click any audio file to play. Built-in music player features:
@@ -213,6 +230,7 @@ A: Make sure the editor is focused (click the editing area) before double-clicki
 
 **Q: Inserted links don't work on other computers?**
 A: Double-click inserts a `file:///` local link, valid only on the current computer. Solutions for cross-device use:
+
 - **Option 1**: Right-click → "Insert Local File" — file is stored in SiYuan `assets` directory, accessible on any device after sync
 - **Option 2**: If the file is in a sync disk, configure cross-device sync folder for automatic repair
 
@@ -235,15 +253,23 @@ A: Ensure the file exists on accessible storage. For mounted cloud drives, confi
 
 ## Changelog
 
-### v0.6.2
+### v0.7.0
+
+**Drag-and-drop links + file-document association + click-to-locate**
+
+- 🖱️ Drag files/folders from the browser panel directly into documents to insert links
+- ✋ Multi-select files with Ctrl/Shift+Click, then batch drag-and-drop to insert multiple links at once
+- 🔗 Right-click "Associate with Current Doc" auto-inserts file link at the top of the document
+- 📍 Click a file link in a document → file opens AND the browser panel auto-navigates to and highlights the file
+- 📂 Click a folder link in a document → opens the folder in the browser panel instead of the system file manager
+- 🎯 Smart insertion: drag to editor → inserts at mouse cursor position; drag to blank area → appends to document bottom
+
+### v0.6.1
 
 **Music player + performance optimizations**
 
 - 🎵 Music player: play/pause, prev/next, seek, volume, LRC lyrics sync, cover art, immersive lyrics background
 - Cover/lyrics crossfade transition animations
-- Next track audio and cover art preloading, instant switching
-- Canvas pre-generated blur thumbnails, lyrics background delay fully eliminated
-- 8 bug fixes (cover not updating, lyrics flickering, async race conditions, etc.)
 
 ### v0.6.0
 
@@ -256,7 +282,6 @@ A: Ensure the file exists on accessible storage. For mounted cloud drives, confi
 - Opens sync folder by default on startup
 - macOS cloud drive shortcuts
 - Docker / API dual-mode support
-- 20+ bug fixes
 
 ### v0.5.6
 
