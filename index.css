@@ -1,5 +1,10 @@
 /* LocalBrowse Plugin Styles */
 
+@keyframes cd-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
 .cd-container {
     display: flex;
     flex-direction: column;
@@ -239,4 +244,148 @@
 }
 .cd-audio-btn.cd-loading svg {
     animation: cd-spin 1s linear infinite;
+}
+
+/* ==================== Tab Bar ==================== */
+#cd-tab-bar {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    border-bottom: 1px solid var(--b3-border, #e0e0e0);
+    margin-bottom: 4px;
+}
+
+.cd-tab-btn {
+    padding: 6px 12px;
+    font-size: 12px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--b3-theme-secondary, #999);
+    cursor: pointer;
+    transition: all 0.2s;
+    flex-shrink: 0;
+}
+
+.cd-tab-btn:hover {
+    color: var(--b3-theme-primary, #4285f4);
+}
+
+.cd-tab-btn.cd-tab-active {
+    color: var(--b3-theme-primary, #4285f4);
+    border-bottom-color: var(--b3-theme-primary, #4285f4);
+}
+
+/* ==================== Assets Panel ==================== */
+#cd-panel-assets,
+#cd-panel-clean {
+    flex-direction: column;
+    flex: 1;
+    overflow: hidden;
+}
+
+#cd-assets-list,
+#cd-clean-results {
+    flex: 1;
+    overflow-y: auto;
+    border: 1px solid var(--b3-border, #e0e0e0);
+    border-radius: 4px;
+    background: var(--b3-theme-background, #fff);
+    min-height: 0;
+}
+
+#cd-assets-list::-webkit-scrollbar,
+#cd-clean-results::-webkit-scrollbar {
+    width: 6px;
+}
+
+#cd-assets-list::-webkit-scrollbar-track,
+#cd-clean-results::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#cd-assets-list::-webkit-scrollbar-thumb,
+#cd-clean-results::-webkit-scrollbar-thumb {
+    background: var(--b3-border, #ccc);
+    border-radius: 3px;
+}
+
+#cd-assets-list::-webkit-scrollbar-thumb:hover,
+#cd-clean-results::-webkit-scrollbar-thumb:hover {
+    background: var(--b3-theme-secondary, #999);
+}
+
+#cd-assets-summary {
+    margin-bottom: 4px;
+    padding: 4px 8px;
+    font-size: 11px;
+    color: var(--b3-theme-secondary, #888);
+    background: var(--b3-theme-surface, #f5f5f5);
+    border-radius: 4px;
+    flex-shrink: 0;
+}
+
+/* Asset item hover */
+.cd-asset-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--b3-border, #eee);
+    cursor: pointer;
+    transition: background 0.15s;
+    user-select: none;
+}
+
+/* ==================== Clean Panel ==================== */
+.cd-clean-mode-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    background: var(--b3-theme-surface, #f0f0f0);
+    color: var(--b3-theme-on-background, #333);
+    border: 1px solid var(--b3-border, #ddd);
+    border-radius: 4px;
+    cursor: pointer;
+    flex-shrink: 0;
+}
+
+.cd-clean-mode-btn.cd-clean-active {
+    background: var(--b3-theme-primary, #4285f4);
+    color: #fff;
+    border: none;
+}
+
+#cd-clean-progress {
+    margin-bottom: 8px;
+    flex-shrink: 0;
+}
+
+#cd-clean-progress-bar {
+    height: 100%;
+    background: var(--b3-theme-primary, #4285f4);
+    border-radius: 2px;
+    width: 0%;
+    transition: width 0.3s;
+}
+
+#cd-clean-actions {
+    margin-top: 4px;
+    padding: 6px 10px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px solid var(--b3-border, #eee);
+}
+
+/* === 内部资源面板 === */
+.cd-assets-node:hover,
+.cd-asset-file:hover {
+    background: var(--b3-theme-hover, #e3f2fd);
+}
+
+@media (prefers-color-scheme: dark) {
+    .cd-assets-node:hover,
+    .cd-asset-file:hover {
+        background: rgba(66, 133, 244, 0.15);
+    }
 }

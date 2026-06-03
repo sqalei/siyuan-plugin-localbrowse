@@ -1,9 +1,3 @@
-## Introduction
-
-SiYuan Note is great, but handling local files (videos, images, documents, archives, etc.) is cumbersome — either importing everything increases storage, or manually finding files and writing links is tedious. **LocalBrowse** embeds a local file browser right into SiYuan's Dock panel, letting you browse, search, and insert local files without leaving SiYuan. *After inserting links, you'll inevitably need to reorganize local files — moving them around, which breaks the links in your notes.* The core of this plugin: **when local files are moved, broken links are automatically repaired**, with cross-platform and cross-device sync support. All data is stored locally, no cloud dependency, no note-taking.
-
----
-
 ## Overview
 
 **LocalBrowse** is a SiYuan Note desktop plugin that provides a local file browser in the right Dock panel. It supports browsing, searching, bookmarking, one-click file link insertion, automatic broken link repair, and cross-device sync folder functionality.
@@ -220,6 +214,44 @@ Double-click any audio file to play. Built-in music player features:
 - **Playlist**: Auto-detects all audio files in the current directory, continuous folder playback
 - **Preload Optimization**: Preloads next track audio and cover art for instant switching
 
+### 📦 Internal Assets Manager
+
+The new **📦 Internal Assets** tab lets you browse and manage all resource files in SiYuan's `assets/` directory directly from the Dock panel — no need to open the system file manager.
+
+#### Browse Assets
+
+- **Tree structure**: Organized by sub-document hierarchy. Root level shows notebooks; child levels show resources associated with each document
+- **Type filter**: Top dropdown — All / Images / Videos / Audio / Documents / Others
+- **Extension filter**: Top tag bar for quick filtering by PDF / XLSX / DOCX / ZIP, etc.
+- **Real-time search**: Type keywords to instantly filter resource filenames
+
+#### Asset Details
+
+- File size and modification time for each resource
+- Reference count (how many documents reference this resource)
+- Hover-to-preview large images
+
+#### View Toggle
+
+Click the ☰ / ⊞ button on the toolbar to switch:
+
+- **List View**: Compact layout showing filename, size, and modification time
+- **Icon View**: Thumbnail grid. Root-level notebooks displayed as tiles; child levels show image thumbnails
+
+#### Quick Actions
+
+| Action | Description |
+|--------|-------------|
+| **Double-click** | Open the document that references this resource and jump to the reference location |
+| **Right-click → 📋 Open File** | Open the resource with the system default application |
+| **Right-click → 📂 Show in File Manager** | Locate and highlight the file in the system file manager |
+| **Right-click → 📄 Open Referencing Doc** | Same as double-click — open the referencing document and locate |
+| **Right-click → 🗑️ Delete** | Delete the resource from the `assets/` directory |
+
+> 💡 Subdirectories under `assets/` (e.g., `assets/memos/`) are fully supported. Right-click "Open File" automatically resolves the correct relative path.
+
+---
+
 ## FAQ
 
 **Q: "Cannot access directory" error?**
@@ -252,6 +284,19 @@ A: Ensure the file exists on accessible storage. For mounted cloud drives, confi
 ---
 
 ## Changelog
+
+### v0.8.0
+
+**📦 Internal Assets Manager + Experience Improvements**
+
+- 📦 New "Internal Assets" tab for browsing and managing SiYuan `assets/` resources
+- 🏷️ Type filtering (Images/Videos/Audio/Documents/Others) and extension filtering
+- 🔢 Resource reference count display
+- 🔍 Real-time search by resource filename
+- 👁️ Hover-to-preview large images
+- 📑 Double-click resource to open referencing document and auto-locate
+- 📋 Right-click menu: Open File / Show in File Manager / Open Referencing Doc / Delete
+- 🖼️ List/Icon dual view toggle (with root-level notebook tiles and child-level thumbnails)
 
 ### v0.7.0
 

@@ -97,11 +97,20 @@ class LocalBrowsePlugin extends Plugin {
             this._savedVolume = 0.8; // 默认音量
         }
         // 预加载缓存：提前准备下一首的封面、歌词，切歌时瞬间切换
-        this._preloadData = null; // {path, coverUrl, coverIsBlob, coverBlurUrl, lrcLines, lrcTitle, lrcArtist}
+        this._preloadData = null; // {path, nextIdx, coverUrl, coverIsBlob, coverBlurUrl, lrcLines, lrcTitle, lrcArtist}
+        this._playlistBuildSeq = 0; // 播放列表构建版本号，防止异步回调覆盖
         this._pendingCoverBlobRevoke = null; // crossfade 完成后待释放的旧封面 blob URL
         this._pendingBlurBlobRevoke = null; // crossfade 完成后待释放的旧模糊缩略图 blob URL
         this._coverFadeEpoch = 0; // crossfade 世代计数器，快速切歌时旧 cleanup 自动失效
         this._lrcBgFadeEpoch = 0; // 歌词背景 crossfade 世代计数器
+        // 本地文件：展开的文件夹路径集合（点击小房子返回根目录时折叠所有）
+        this._expandedDirs = new Set();
+        // 内部资源面板：路径导航状态
+        this._assetsNavStack = []; // 导航栈 [{type:'notebook'|'doc', id, name, node}]
+        this._assetsCurrentView = 'list'; // 内部资源视图模式：list | icon
+        this._assetsExtFilter = null; // 格式筛选（如 'png', 'jpg'）
+        this._assetsSizeFilter = 0; // 大小筛选阈值（字节），0=不筛选
+        this._bigFileThreshold = 10 * 1024 * 1024; // 10MB
     }
 
     /**
@@ -500,39 +509,84 @@ class LocalBrowsePlugin extends Plugin {
         var el = this.dockPanel.element;
         
         var isDocker = that._isDockerBrowser();
+        var activeTab = that._activeTab || 'local';
         el.innerHTML = '<div class="cd-container" style="height:100%;display:flex;flex-direction:column;padding:4px;box-sizing:border-box;font-size:13px;overflow:hidden;position:relative">' +
-            '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px">' +
-                '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
-                '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
-                '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
-                '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
-                '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0;opacity:0.6;transition:opacity 0.2s" title="点击修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔘</button>' +
+            // === Tab 栏 ===
+            '<div id="cd-tab-bar" style="display:flex;align-items:center;flex-shrink:0;border-bottom:1px solid var(--b3-border,#e0e0e0);margin-bottom:4px">' +
+                '<button class="cd-tab-btn' + (activeTab === 'local' ? ' cd-tab-active' : '') + '" data-tab="local" style="padding:6px 12px;font-size:12px;background:transparent;border:none;border-bottom:2px solid ' + (activeTab === 'local' ? 'var(--b3-theme-primary,#4285f4)' : 'transparent') + ';color:' + (activeTab === 'local' ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-theme-secondary,#999)') + ';cursor:pointer;transition:all 0.2s;flex-shrink:0">📁 本地文件</button>' +
+                '<button class="cd-tab-btn' + (activeTab === 'assets' ? ' cd-tab-active' : '') + '" data-tab="assets" style="padding:6px 12px;font-size:12px;background:transparent;border:none;border-bottom:2px solid ' + (activeTab === 'assets' ? 'var(--b3-theme-primary,#4285f4)' : 'transparent') + ';color:' + (activeTab === 'assets' ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-theme-secondary,#999)') + ';cursor:pointer;transition:all 0.2s;flex-shrink:0">📦 内部资源</button>' +
             '</div>' +
-            '<div id="cd-syncroot-inline" style="margin-bottom:2px;padding:6px 8px;background:var(--b3-theme-surface,#f0f0f0);border-radius:4px;display:none;flex-shrink:0">' +
-                '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">' +
-                    '<span style="font-size:12px;color:var(--b3-theme-on-background,#333);font-weight:700">跨端同步文件夹</span>' +
-                    '<span style="font-size:10px;padding:1px 6px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:8px;color:var(--b3-theme-secondary,#888);line-height:1.4" title="' + this._getDeviceId() + '">' + this.platformName + '</span>' +
+            // === 本地文件面板 ===
+            '<div id="cd-panel-local" style="display:' + (activeTab === 'local' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden">' +
+                '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px;height:28px">' +
+                    '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
+                    '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
+                    '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
+                    '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
+                    '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0;opacity:0.6;transition:opacity 0.2s" title="点击修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔘</button>' +
                 '</div>' +
-                '<div style="font-size:9px;color:var(--b3-theme-secondary,#888);margin-bottom:4px;line-height:1.3">选择网盘同步目录的父文件夹，将自动创建 LocalBrowseSync 子文件夹</div>' +
-                '<div style="display:flex;gap:4px;align-items:center">' +
-                    '<input id="cd-syncroot-path" type="text" placeholder="如 D:\\BaiduSyncdisk（自动拼接 LocalBrowseSync）" style="flex:1;min-width:0;padding:3px 6px;font-size:11px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
-                    '<button id="cd-syncroot-browse" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="浏览选择父文件夹">📂</button>' +
-                    '<button id="cd-syncroot-save" style="padding:3px 8px;font-size:11px;background:#ccc;color:#888;border:none;border-radius:3px;cursor:default;flex-shrink:0">保存</button>' +
-                    '<button id="cd-syncroot-clear" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-error,#d32f2f);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="清除同步文件夹">✕</button>' +
+                '<div id="cd-syncroot-inline" style="margin-bottom:2px;padding:6px 8px;background:var(--b3-theme-surface,#f0f0f0);border-radius:4px;display:none;flex-shrink:0">' +
+                    '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">' +
+                        '<span style="font-size:12px;color:var(--b3-theme-on-background,#333);font-weight:700">跨端同步文件夹</span>' +
+                        '<span style="font-size:10px;padding:1px 6px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:8px;color:var(--b3-theme-secondary,#888);line-height:1.4" title="' + this._getDeviceId() + '">' + this.platformName + '</span>' +
+                    '</div>' +
+                    '<div style="font-size:9px;color:var(--b3-theme-secondary,#888);margin-bottom:4px;line-height:1.3">选择网盘同步目录的父文件夹，将自动创建 LocalBrowseSync 子文件夹</div>' +
+                    '<div style="display:flex;gap:4px;align-items:center">' +
+                        '<input id="cd-syncroot-path" type="text" placeholder="如 D:\\BaiduSyncdisk（自动拼接 LocalBrowseSync）" style="flex:1;min-width:0;padding:3px 6px;font-size:11px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+                        '<button id="cd-syncroot-browse" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="浏览选择父文件夹">📂</button>' +
+                        '<button id="cd-syncroot-save" style="padding:3px 8px;font-size:11px;background:#ccc;color:#888;border:none;border-radius:3px;cursor:default;flex-shrink:0">保存</button>' +
+                        '<button id="cd-syncroot-clear" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-error,#d32f2f);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="清除同步文件夹">✕</button>' +
+                    '</div>' +
+                '</div>' +
+                '<div id="cd-search-wrap" style="margin-bottom:2px;position:relative;flex-shrink:0;height:28px;display:none">' +
+                    '<input id="cd-search" type="text" placeholder="搜索当前目录（按 Enter 深度搜索）..." style="width:100%;height:28px;line-height:1;padding:0 56px 0 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+                    '<button id="cd-deep-search" style="position:absolute;right:24px;top:50%;transform:translateY(-50%);padding:0 4px;font-size:13px;line-height:1;background:transparent;border:none;color:var(--b3-theme-secondary,#999);cursor:pointer;opacity:0.6;transition:opacity 0.2s" title="深度搜索子目录" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔍</button>' +
+                    '<button id="cd-clear-search" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);padding:0 4px;font-size:14px;line-height:1;background:transparent;border:none;color:var(--b3-theme-secondary,#999);cursor:pointer;display:none">×</button>' +
+                '</div>' +
+                '<div style="margin-bottom:2px;display:flex;align-items:center;gap:2px;flex-shrink:0;background:transparent;border:none;height:24px">' +
+                    '<div id="cd-breadcrumb" style="flex:1;padding:0 0 0 8px;font-size:12px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:none;display:flex;align-items:center"></div>' +
+                    '<button id="cd-sort-btn" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;white-space:nowrap" title="排序" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⇅ 名称</button>' +
+                '</div>' +
+                '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
+                    '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
+                '</div>' +
+                '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
+                    '<span id="cd-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📊 加载中...</span>' +
+                    '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
                 '</div>' +
             '</div>' +
-            '<div id="cd-search-wrap" style="margin-bottom:2px;position:relative;flex-shrink:0;display:none">' +
-                '<input id="cd-search" type="text" placeholder="搜索当前目录（按 Enter 深度搜索）..." style="width:100%;padding:6px 56px 6px 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
-                '<button id="cd-deep-search" style="position:absolute;right:24px;top:50%;transform:translateY(-50%);padding:0 4px;font-size:13px;line-height:1;background:transparent;border:none;color:var(--b3-theme-secondary,#999);cursor:pointer;opacity:0.6;transition:opacity 0.2s" title="深度搜索子目录" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔍</button>' +
-                '<button id="cd-clear-search" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);padding:0 4px;font-size:14px;line-height:1;background:transparent;border:none;color:var(--b3-theme-secondary,#999);cursor:pointer;display:none">×</button>' +
+            // === 内部资源面板 ===
+            '<div id="cd-panel-assets" style="display:' + (activeTab === 'assets' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden">' +
+                '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:6px;height:28px">' +
+                    '<select id="cd-assets-filter" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:80px;flex-shrink:0">' +
+                        '<option value="all">全部类型</option>' +
+                        '<option value="image">🖼️ 图片</option>' +
+                        '<option value="video">🎬 视频</option>' +
+                        '<option value="audio">🎵 音频</option>' +
+                        '<option value="doc">📄 文档</option>' +
+                        '<option value="other">📦 其他</option>' +
+                    '</select>' +
+                    '<div id="cd-assets-type-stats" style="flex:1;min-width:0;font-size:11px;color:var(--b3-theme-secondary,#999);white-space:nowrap;overflow-x:auto;scrollbar-width:none;-ms-overflow-style:none;-webkit-overflow-scrolling:touch;line-height:1.6"></div>' +
+                    '<button id="cd-assets-view-toggle" style="padding:3px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
+                    '<button id="cd-assets-expand-toggle" style="padding:3px 8px;font-size:12px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="展开/折叠全部" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⊕</button>' +
+                '</div>' +
+                '<div style="margin-bottom:2px;flex-shrink:0;position:relative;height:28px">' +
+                    '<input id="cd-assets-search" type="text" placeholder="搜索资源文件名..." style="width:100%;height:28px;line-height:1;padding:0 28px 0 10px;box-sizing:border-box;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+                    '<button id="cd-assets-search-clear" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);padding:0 4px;font-size:14px;line-height:1;background:transparent;border:none;color:var(--b3-theme-secondary,#999);cursor:pointer;display:none">×</button>' +
+                '</div>' +
+                '<div style="margin-bottom:2px;display:flex;align-items:center;gap:2px;flex-shrink:0;background:transparent;border:none;height:24px">' +
+                    '<div id="cd-assets-breadcrumb" style="flex:1;padding:0 0 0 8px;font-size:12px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:none;display:flex;align-items:center"></div>' +
+                    '<button id="cd-assets-sort-btn" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;white-space:nowrap" title="排序" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⇅ 名称</button>' +
+                '</div>' +
+                '<div id="cd-assets-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
+                    '<div style="padding:20px;text-align:center;color:#999">切换到「内部资源」标签以查看</div>' +
+                '</div>' +
+                '<div id="cd-assets-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
+                    '<span id="cd-assets-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">加载中...</span>' +
+                    '<span id="cd-assets-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
+                '</div>' +
             '</div>' +
-            '<div style="margin-bottom:2px;display:flex;align-items:center;gap:2px;flex-shrink:0;background:transparent;border:none">' +
-                '<div id="cd-breadcrumb" style="flex:1;padding:0 0 0 8px;font-size:12px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:none"></div>' +
-                '<button id="cd-sort-btn" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;white-space:nowrap" title="排序" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⇅ 名称</button>' +
-            '</div>' +
-            '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
-                '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
-            '</div>' +
+            // === 共享音频播放器 ===
             '<div id="cd-audio-lrc-panel" style="display:none;position:absolute;bottom:36px;left:4px;right:4px;height:160px;overflow:hidden;font-size:11px;border:1px solid var(--b3-border,#eee);border-radius:8px 8px 0 0;z-index:10;box-shadow:0 -4px 16px rgba(0,0,0,0.12);scrollbar-width:none;-ms-overflow-style:none">' +
                 '<div id="cd-audio-lrc-bg" style="position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px 8px 0 0;opacity:0.38;background-size:cover;background-position:center;pointer-events:none"></div>' +
                 '<div style="position:absolute;top:0;left:0;right:0;bottom:0;border-radius:8px 8px 0 0;background:rgba(255,255,255,0.55);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);pointer-events:none"></div>' +
@@ -560,10 +614,7 @@ class LocalBrowsePlugin extends Plugin {
                     '<div id="cd-audio-progress" style="height:100%;background:var(--b3-theme-primary,#4285f4);border-radius:2px;width:0%;transition:width 0.1s linear;pointer-events:none"></div>' +
                 '</div>' +
             '</div>' +
-            '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
-                '<span id="cd-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📊 加载中...</span>' +
-                '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
-            '</div>' +
+            // === 共享元素 ===
             '<div id="cd-context-menu" style="display:none;position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);min-width:160px;padding:4px 0;font-size:13px;user-select:none">' +
             '</div>' +
             '<div id="cd-image-preview" style="display:none;position:fixed;z-index:9998;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,0.18);padding:6px;pointer-events:none">' +
@@ -743,6 +794,25 @@ class LocalBrowsePlugin extends Plugin {
                     that.loadDirectory(that.currentPath || that.getRootPath());
                 }
             });
+        }
+
+        // 绑定 Tab 切换
+        var tabBtns = el.querySelectorAll('.cd-tab-btn');
+        tabBtns.forEach(function(btn) {
+            btn.addEventListener('click', function() {
+                var tabName = this.getAttribute('data-tab');
+                that._switchTab(tabName);
+            });
+        });
+
+        // 初始化时把音频播放器放入当前活动面板（默认 local），放在统计栏上方
+        var initAudioBar = document.getElementById('cd-audio-bar');
+        var initPanel = document.getElementById('cd-panel-' + (that._activeTab || 'local'));
+        if (initPanel) {
+            var initStats = initPanel.querySelector('#cd-stats-bar, #cd-assets-stats-bar');
+            if (initStats && initAudioBar) {
+                initPanel.insertBefore(initAudioBar, initStats);
+            }
         }
 
         // 绑定排序按钮
@@ -936,6 +1006,14 @@ class LocalBrowsePlugin extends Plugin {
         // 渲染收藏夹（DOM 已就绪）
         this.renderFavorites();
         this._updateSyncPill();
+
+        // 恢复上次活跃的 Tab
+        try {
+            var savedTab = localStorage.getItem('cd-active-tab');
+            if (savedTab && savedTab !== 'local') {
+                that._switchTab(savedTab);
+            }
+        } catch (e) {}
     }
 
     /**
@@ -947,6 +1025,9 @@ class LocalBrowsePlugin extends Plugin {
         // 切换目录时清除多选状态
         this._selectedItems = [];
         this._lastClickedItem = null;
+
+        // 切换目录时清除展开状态
+        if (this._expandedDirs) this._expandedDirs.clear();
 
         // 递增加载版本号，旧回调检测到版本过时则丢弃结果（防止异步竞态覆盖）
         this._loadSeq++;
@@ -1011,62 +1092,90 @@ class LocalBrowsePlugin extends Plugin {
             breadcrumbEl.innerHTML = '';
             breadcrumbEl.style.cursor = 'default';
 
-            var parts = [];
-            // 安全获取路径分隔符（path 模块在 Docker 中应可用，但做 null 保护）
             var _sep = this._sep;
-            var cleanPath = dirPath.endsWith(_sep) ? dirPath.slice(0, -1) : dirPath;
+            // 统一路径分隔符（兼容正斜杠输入）
+            var normalizedPath = dirPath.replace(/\//g, _sep);
+            var cleanPath = normalizedPath.endsWith(_sep) ? normalizedPath.slice(0, -1) : normalizedPath;
+            // 物理根目录判断：Windows 盘符根（D: 或 D:\）或 Unix 根 /
+            var isRootDir = /^[A-Za-z]:$/.test(cleanPath) || cleanPath === '/' || cleanPath === '';
+            var homeIcon = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;display:inline-block;vertical-align:middle;fill:currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>';
+            // 根路径：Windows 盘符加反斜杠，Unix 根 /
+            var rootPath = isRootDir ? (cleanPath + (this.isWindows ? '\\' : '/')) : (cleanPath.split(_sep)[0] + _sep);
 
-            if (/^[A-Za-z]:$/.test(cleanPath) || cleanPath === '/') {
-                parts = [{name: '🏠', path: cleanPath + (this.isWindows ? '\\' : '/')}];
-            } else {
-                var segments = cleanPath.split(_sep);
-                var accumulated = '';
-                for (var i = 0; i < segments.length; i++) {
-                    if (i === 0) {
-                        accumulated = segments[0] + _sep;
-                        parts.push({name: '🏠', path: accumulated});
-                    } else {
-                        accumulated += segments[i] + _sep;
-                        parts.push({name: segments[i], path: accumulated});
+            // 小房子：始终绑定点击事件（展开文件夹后需动态亮起）
+            var rootSpan = document.createElement('span');
+            rootSpan.id = 'cd-breadcrumb-home';
+            rootSpan.innerHTML = homeIcon;
+            rootSpan.style.display = 'inline-block';
+            rootSpan.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (that._expandedDirs && that._expandedDirs.size > 0) {
+                    // 有展开：折叠最近一层（最后一个加入的）
+                    var expandedArr = Array.from(that._expandedDirs);
+                    var lastExpanded = expandedArr[expandedArr.length - 1];
+                    var allItems = document.querySelectorAll('.cd-item');
+                    for (var k = 0; k < allItems.length; k++) {
+                        if (allItems[k].dataset.path === lastExpanded) {
+                            var exp = allItems[k].querySelector('.cd-list-expand');
+                            var child = allItems[k].nextElementSibling;
+                            if (child && child.classList.contains('cd-list-children')) {
+                                child.style.display = 'none';
+                            }
+                            if (exp) exp.style.transform = 'rotate(0deg)';
+                            break;
+                        }
                     }
+                    that._expandedDirs.delete(lastExpanded);
+                    that._updateBreadcrumbHomeState();
+                } else if (!isRootDir) {
+                    // 子目录无展开：返回根目录
+                    that.loadDirectory(rootPath);
                 }
-            }
+                // 根目录无展开：什么都不做
+            });
+            breadcrumbEl.appendChild(rootSpan);
 
-            for (var i = 0; i < parts.length; i++) {
-                var isLast = (i === parts.length - 1);
+            // 子目录路径部分（去掉根目录）
+            if (!isRootDir) {
+                var segments = cleanPath.split(_sep);
+                var accumulated = segments[0] + _sep;
+                for (var i = 1; i < segments.length; i++) {
+                    accumulated += segments[i] + _sep;
+                    var isLast = (i === segments.length - 1);
 
-                var span = document.createElement('span');
-                span.textContent = parts[i].name;
-                span.style.display = 'inline-block';
-
-                if (isLast) {
-                    span.style.fontWeight = 'bold';
-                    span.style.color = 'var(--b3-theme-on-background,#333)';
-                } else {
-                    span.style.cursor = 'pointer';
-                    span.style.color = 'var(--b3-theme-primary,#4285f4)';
-                    span.style.textDecoration = 'underline';
-                    span.style.marginRight = '2px';
-                    (function(targetPath) {
-                        span.addEventListener('click', function(e) {
-                            e.stopPropagation();
-                            that.loadDirectory(targetPath);
-                        });
-                    })(parts[i].path);
-                }
-
-                breadcrumbEl.appendChild(span);
-
-                if (!isLast) {
                     var sep = document.createElement('span');
-                    sep.textContent = '>';
-                    sep.style.margin = '0 6px';
-                    sep.style.color = 'var(--b3-theme-secondary,#999)';
+                    sep.innerHTML = '<svg viewBox="0 0 24 24" style="width:12px;height:12px;display:inline-block;fill:currentColor;vertical-align:middle"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>';
+                    sep.style.display = 'inline-block';
+                    sep.style.margin = '0 5px';
+                    sep.style.color = 'var(--b3-theme-primary,#4285f4)';
                     breadcrumbEl.appendChild(sep);
+
+                    var span = document.createElement('span');
+                    span.textContent = segments[i];
+                    span.style.display = 'inline-block';
+                    if (isLast) {
+                        span.style.fontWeight = 'bold';
+                        span.style.color = 'var(--b3-theme-on-background,#333)';
+                    } else {
+                        span.style.cursor = 'pointer';
+                        span.style.color = 'var(--b3-theme-primary,#4285f4)';
+                        span.style.textDecoration = 'underline';
+                        span.style.marginRight = '2px';
+                        (function(targetPath) {
+                            span.addEventListener('click', function(e) {
+                                e.stopPropagation();
+                                that.loadDirectory(targetPath);
+                            });
+                        })(accumulated);
+                    }
+                    breadcrumbEl.appendChild(span);
                 }
             }
+
+            // 初始化小房子状态
+            this._updateBreadcrumbHomeState();
         }
-        
+
         fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">正在加载...</div>';
         
         // 优先使用 Node.js fs 读取
@@ -1238,6 +1347,7 @@ class LocalBrowsePlugin extends Plugin {
      * 处理目录读取错误（统一的错误处理逻辑）
      */
     _handleDirReadError(dirPath, normalizedPath, err, fileListEl) {
+        var that = this;
         var isRootDir = /^[A-Za-z]:\\?$/.test(dirPath) || dirPath === '/' || dirPath === '';
         if (err.code === 'ENOENT' || err.code === 'EPERM' || err.code === 'EACCES') {
             if (isRootDir) {
@@ -2197,12 +2307,12 @@ class LocalBrowsePlugin extends Plugin {
                 'data-has-children="false" ' +
                 'data-level="0" ' +
                 'draggable="true" ' +
-                'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s">' +
+                'style="display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s;font-size:13px;user-select:none">' +
                 expander +
                 '<span style="font-size:16px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + name + linkMark2 + favMark2 + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--b3-theme-on-background,#333)">' + name + linkMark2 + favMark2 + '</span>' +
                 (sizeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right">' + sizeStr + '</span>' : '') +
-                (timeStr ? '<span style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
+                (timeStr ? '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap">' + timeStr + '</span>' : '') +
             '</div>' +
             '<div class="cd-list-children" data-parent="' + that.escapeHtml(fullPath) + '" data-level="0" style="display:none"></div>';
         }
@@ -2389,7 +2499,7 @@ class LocalBrowsePlugin extends Plugin {
         var isDockerBuildList = that._isDockerBrowser();
         for (var i = 0; i < entries.length; i++) {
             var entry = entries[i];
-            var fullPath = path.join(dirPath, entry.name);
+            var fullPath = path ? path.join(dirPath, entry.name) : (dirPath.replace(/[\\\/]+$/, '') + that._sep + entry.name);
             var isDir = typeof entry.isDirectory === 'function' ? entry.isDirectory() : entry.isDir;
             var icon = isDir ? '📁' : that.getFileIcon(entry.name);
 
@@ -2407,7 +2517,7 @@ class LocalBrowsePlugin extends Plugin {
                 'style="display:flex;align-items:center;padding:6px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f0f0f0);transition:background 0.15s;padding-left:' + (12 + indent) + 'px">' +
                 expander +
                 '<span style="font-size:15px;margin-right:6px;flex-shrink:0">' + icon + '</span>' +
-                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px">' + that.escapeHtml(entry.name) + (that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="font-size:11px;cursor:pointer;color:#4fc3f7;margin-left:2px">🔗</span>' : '') + '</span>' +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:400">' + that.escapeHtml(entry.name) + (that.isFileDocLinked(fullPath) ? '<span class="cd-doc-link-icon" data-linkpath="' + that.escapeHtml(fullPath) + '" title="点击打开关联文档" style="font-size:11px;cursor:pointer;color:#4fc3f7;margin-left:2px">🔗</span>' : '') + '</span>' +
                 '<span class="cd-stat-size" style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap;min-width:50px;text-align:right"></span>' +
                 '<span class="cd-stat-time" style="font-size:11px;color:#bbb;margin-left:8px;flex-shrink:0;white-space:nowrap"></span>' +
             '</div>' +
@@ -2471,8 +2581,7 @@ class LocalBrowsePlugin extends Plugin {
             var batchEntries = [];
             for (var i = 0; index < entries.length && i < BATCH; index++, i++) {
                 (function(entry) {
-                    var fullPath = path.join(dirPath, entry.name);
-                    batchEntries.push({ entry: entry, fullPath: fullPath });
+                    var fullPath = path ? path.join(dirPath, entry.name) : (dirPath.replace(/[\\\/]+$/, '') + that._sep + entry.name);({ entry: entry, fullPath: fullPath });
                     tasks.push(new Promise(function(resolve) {
                         fs.stat(fullPath, function(err, stat) {
                             resolve({ entry: entry, fullPath: fullPath, stat: err ? null : stat });
@@ -2489,7 +2598,12 @@ class LocalBrowsePlugin extends Plugin {
                     if (!r.stat) continue;
                     if (!containerEl.parentNode) return;
 
-                    var itemEl = containerEl.querySelector('.cd-item[data-path="' + CSS.escape(r.fullPath) + '"]');
+                    // 遍历匹配（避免 CSS.escape 无法处理 Windows 反斜杠路径的 DOMException）
+                    var itemEl = null;
+                    var allItems = containerEl.querySelectorAll('.cd-item');
+                    for (var j = 0; j < allItems.length; j++) {
+                        if (allItems[j].dataset.path === r.fullPath) { itemEl = allItems[j]; break; }
+                    }
                     if (!itemEl) continue;
 
                     var isDir = typeof r.entry.isDirectory === 'function' ? r.entry.isDirectory() : r.entry.isDir;
@@ -2518,8 +2632,13 @@ class LocalBrowsePlugin extends Plugin {
         for (var i = 0; i < entries.length; i++) {
             var entry = entries[i];
             if (!containerEl.parentNode) return;
-            var fullPath = path.join(dirPath, entry.name);
-            var itemEl = containerEl.querySelector('.cd-item[data-path="' + CSS.escape(fullPath) + '"]');
+            var fullPath = path ? path.join(dirPath, entry.name) : (dirPath.replace(/[\\\/]+$/, '') + that._sep + entry.name);
+            // 遍历匹配（避免 CSS.escape 无法处理 Windows 反斜杠路径的 DOMException）
+            var itemEl = null;
+            var allItems = containerEl.querySelectorAll('.cd-item');
+            for (var k = 0; k < allItems.length; k++) {
+                if (allItems[k].dataset.path === fullPath) { itemEl = allItems[k]; break; }
+            }
             if (!itemEl) continue;
             var isDir = typeof entry.isDirectory === 'function' ? entry.isDirectory() : entry.isDir;
             if (!isDir && entry.size) {
@@ -2601,6 +2720,13 @@ class LocalBrowsePlugin extends Plugin {
      */
     bindItemEvents(fileListEl, files, currentPath) {
         var that = this;
+        // 注入箭头 hover 样式（仅一次）
+        if (!document.getElementById('cd-expand-hover-style')) {
+            var hoverStyle = document.createElement('style');
+            hoverStyle.id = 'cd-expand-hover-style';
+            hoverStyle.textContent = '.cd-list-expand:hover,.cd-asset-arrow:hover,.cd-asset-doc-arrow:hover{background:var(--b3-theme-hover,rgba(0,0,0,0.06));border-radius:3px}';
+            document.head.appendChild(hoverStyle);
+        }
         var items = fileListEl.querySelectorAll('.cd-item:not([data-bound])');
         for (var j = 0; j < items.length; j++) {
             (function(item) {
@@ -2619,59 +2745,60 @@ class LocalBrowsePlugin extends Plugin {
                     }
 
                     var isDir = item.dataset.isdir === 'true';
-                    var hasChildren = item.dataset.hasChildren === 'true';
                     var itemPath = item.dataset.path;
-                    var expander = item.querySelector('.cd-list-expand');
-                    // 从 item 的下一个兄弟元素获取 children 容器
-                    var childrenEl = item.nextElementSibling;
-                    if (childrenEl && !childrenEl.classList.contains('cd-list-children')) {
-                        childrenEl = null;
-                    }
 
-                    // 获取当前层级
-                    var currentLevel = parseInt(item.dataset.level || '0', 10);
-
-                    // 如果点击的是展开箭头（wrapper 或其内部的 SVG/path），则展开/折叠
-                    var isExpandClick = e.target.classList.contains('cd-list-expand') ||
-                        (e.target.parentElement && e.target.parentElement.classList.contains('cd-list-expand')) ||
-                        (e.target.parentElement && e.target.parentElement.parentElement && e.target.parentElement.parentElement.classList.contains('cd-list-expand'));
-                    if (isExpandClick) {
+                    if (isDir) {
+                        // Ctrl/Cmd/Shift+点击文件夹时支持多选
+                        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+                            that.selectItem(item, e);
+                            return;
+                        }
                         // Docker 浏览器模式下禁止展开子目录
                         if (that._isDockerBrowser()) {
                             return;
                         }
-                        if (childrenEl) {
-                            if (childrenEl.style.display === 'none') {
-                                if (childrenEl.innerHTML === '') {
-                                    // 标记正在加载，防止快速双击重复渲染
-                                    childrenEl.dataset.loading = 'true';
-                                    that.renderListChildren(childrenEl, itemPath, currentLevel + 1);
-                                } else {
-                                    childrenEl.style.display = 'block';
-                                }
-                                if (expander) expander.style.transform = 'rotate(90deg)';
-                            } else if (childrenEl.dataset.loading === 'true') {
-                                // 正在加载中，忽略重复点击
-                                return;
-                            } else {
-                                childrenEl.style.display = 'none';
-                                if (expander) expander.style.transform = 'rotate(0deg)';
+                        // 判断点击的是箭头还是文件夹名称/图标区域
+                        var expandEl = e.target.closest ? e.target.closest('.cd-list-expand') : null;
+                        // SVG 在箭头内部，也属于箭头点击
+                        if (!expandEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-list-expand')) {
+                            expandEl = e.target.parentElement;
+                        }
+                        if (expandEl) {
+                            // 点击箭头 → 展开/折叠（零延迟，瞬间响应）
+                            var expander = item.querySelector('.cd-list-expand');
+                            var childrenEl = item.nextElementSibling;
+                            if (childrenEl && !childrenEl.classList.contains('cd-list-children')) {
+                                childrenEl = null;
                             }
+                            var currentLevel = parseInt(item.dataset.level || '0', 10);
+                            if (childrenEl) {
+                                if (childrenEl.style.display === 'none') {
+                                    if (childrenEl.innerHTML === '') {
+                                        childrenEl.dataset.loading = 'true';
+                                        that.renderListChildren(childrenEl, itemPath, currentLevel + 1);
+                                    } else {
+                                        childrenEl.style.display = 'block';
+                                    }
+                                    if (expander) expander.style.transform = 'rotate(90deg)';
+                                    that._expandedDirs.add(itemPath);
+                                } else if (childrenEl.dataset.loading === 'true') {
+                                    return;
+                                } else {
+                                    childrenEl.style.display = 'none';
+                                    if (expander) expander.style.transform = 'rotate(0deg)';
+                                    that._expandedDirs.delete(itemPath);
+                                }
+                            }
+                            that._updateBreadcrumbHomeState();
+                        } else {
+                            // 点击文件夹名称/图标区域 → 进入该目录
+                            that.loadDirectory(itemPath);
                         }
                         return;
                     }
 
-                    // 点击文件夹名称/图标：Ctrl/Shift 多选或进入文件夹
-                    if (isDir) {
-                        // Ctrl/Cmd/Shift+点击文件夹时也支持多选（用于批量拖拽文件夹）
-                        if (e.ctrlKey || e.metaKey || e.shiftKey) {
-                            that.selectItem(item, e);
-                        } else {
-                            that.loadDirectory(itemPath);
-                        }
-                    } else {
-                        that.selectItem(item, e);
-                    }
+                    // 文件：单击选中
+                    that.selectItem(item, e);
                 });
 
                 item.addEventListener('dblclick', function(e) {
@@ -2682,15 +2809,23 @@ class LocalBrowsePlugin extends Plugin {
                     var itemPath = item.dataset.path;
                     var name = item.dataset.name;
 
-                    if (!isDir) {
+                    if (isDir) {
+                        // 双击箭头时忽略（已由 click 处理展开/折叠），仅双击名称区域才进入目录
+                        var expandEl = e.target.closest ? e.target.closest('.cd-list-expand') : null;
+                        if (!expandEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-list-expand')) {
+                            expandEl = e.target.parentElement;
+                        }
+                        if (expandEl) return;
+                        that.loadDirectory(itemPath);
+                    } else {
+                        // 文件：双击打开
                         if (that.isAudioFile(name)) {
                             // 音频文件：内置播放器播放
                             that.playAudio(itemPath, name);
                         } else if (that.isVideoFile(name)) {
-                            // 视频文件：内置播放器播放
+                            // 视频文件：优先思播，降级系统默认
                             that.playVideo(itemPath, name);
                         } else {
-                            // 其他文件：系统默认程序打开
                             that.openFile(itemPath);
                         }
                     }
@@ -3073,35 +3208,8 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 内置视频播放器：优先调用思播插件，未安装时打开系统默认播放器
+     * 内置视频播放器：在 Dock 面板内播放视频，支持时间戳、循环片段、截图
      */
-    playVideo(filePath, fileName) {
-        var that = this;
-        var fileUrl = this.toFileUrl(filePath);
-
-        // 优先：尝试调用思播(siyuan-media-player)插件播放
-        try {
-            var smp = window.siyuanMediaPlayer;
-            if (smp && typeof smp.playLink === 'function') {
-                smp.playLink(fileUrl).then(function(ok) {
-                    if (!ok) {
-                        // 思播无法解析该URL，打开系统默认播放器
-                        that.openFile(filePath);
-                    }
-                }).catch(function(e) {
-                    that._error('思播播放失败，打开系统默认播放器:', e);
-                    that.openFile(filePath);
-                });
-                return;
-            }
-        } catch (e) {
-            that._error('调用思播失败:', e);
-        }
-
-        // 思播未安装或不可用，打开系统默认播放器
-        that.openFile(filePath);
-    }
-
     /**
      * 插入本地文件链接到编辑器
      * 附加文件的 size 和 mtime 信息到 URL fragment，用于失效链接修复时的精确匹配
@@ -4625,6 +4733,37 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 播放视频文件
+     * 优先调用思播(siyuan-media-player)插件播放，降级到系统默认播放器
+     */
+    playVideo(filePath, fileName) {
+        var that = this;
+        var fileUrl = this.toFileUrl(filePath);
+
+        // 优先：尝试调用思播(siyuan-media-player)插件播放
+        try {
+            var smp = window.siyuanMediaPlayer;
+            if (smp && typeof smp.playLink === 'function') {
+                smp.playLink(fileUrl).then(function(ok) {
+                    if (!ok) {
+                        // 思播无法解析该URL，打开系统默认播放器
+                        that.openFile(filePath);
+                    }
+                }).catch(function(e) {
+                    that._error('思播播放失败，打开系统默认播放器:', e);
+                    that.openFile(filePath);
+                });
+                return;
+            }
+        } catch (e) {
+            that._error('调用思播失败:', e);
+        }
+
+        // 思播未安装或不可用，打开系统默认播放器
+        that.openFile(filePath);
+    }
+
+    /**
      * 用系统默认程序打开文件（跨平台：Electron > cmd/open/xdg-open）
      */
     openFile(filePath) {
@@ -4666,6 +4805,33 @@ class LocalBrowsePlugin extends Plugin {
      */
     openContainingFolder(filePath) {
         var that = this;
+        console.log('[localbrowse] openContainingFolder path:', filePath);
+        // 优先通过思源 IPC 通道发送 showItemInFolder（和思源自带功能完全一致）
+        try {
+            var electron = window.require && window.require('electron');
+            if (electron && electron.ipcRenderer) {
+                electron.ipcRenderer.send('siyuan-cmd', {
+                    cmd: 'showItemInFolder',
+                    filePath: filePath
+                });
+                console.log('[localbrowse] sent siyuan-cmd showItemInFolder');
+                return;
+            }
+        } catch (e) {
+            console.warn('[localbrowse] ipcRenderer unavailable:', e);
+        }
+        // 回退到 Electron shell API
+        try {
+            var electron = window.require && window.require('electron');
+            if (electron && electron.shell && typeof electron.shell.showItemInFolder === 'function') {
+                electron.shell.showItemInFolder(filePath);
+                console.log('[localbrowse] showItemInFolder called');
+                return;
+            }
+        } catch (e) {
+            console.warn('[localbrowse] showItemInFolder unavailable:', e);
+        }
+        // 回退到 child_process
         try {
             var cp = require('child_process');
             if (that.isWindows) {
@@ -4674,16 +4840,62 @@ class LocalBrowsePlugin extends Plugin {
                     detached: true
                 }).unref();
             } else if (that.platform === 'darwin') {
-                // macOS: 在 Finder 中显示并选中文件
                 cp.spawn('open', ['-R', filePath], { stdio: 'ignore', detached: true }).unref();
             } else {
-                // Linux: 打开文件所在目录
                 var dir = filePath.substring(0, Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\')));
                 cp.spawn('xdg-open', [dir || '/'], { stdio: 'ignore', detached: true }).unref();
             }
-            return;
         } catch (e) {
-            this.showToastMsg('无法打开文件夹，请手动访问');
+            console.error('[localbrowse] openContainingFolder failed:', e, 'path:', filePath);
+            that.showToastMsg('无法打开文件夹，请手动访问');
+        }
+    }
+
+    /**
+     * 用系统默认程序打开文件（内部资源）
+     * 通过 siyuan-cmd IPC 调用主进程 openPath
+     */
+    _openAssetFile(filePath) {
+        var that = this;
+        console.log('[localbrowse] _openAssetFile path:', filePath);
+        // 优先通过思源 IPC 通道发送 openPath
+        try {
+            var electron = window.require && window.require('electron');
+            if (electron && electron.ipcRenderer) {
+                electron.ipcRenderer.send('siyuan-cmd', {
+                    cmd: 'openPath',
+                    filePath: filePath
+                });
+                console.log('[localbrowse] sent siyuan-cmd openPath');
+                return;
+            }
+        } catch (e) {
+            console.warn('[localbrowse] ipcRenderer unavailable:', e);
+        }
+        // 回退到 Electron shell API
+        try {
+            var electron = window.require && window.require('electron');
+            if (electron && electron.shell && typeof electron.shell.openPath === 'function') {
+                electron.shell.openPath(filePath);
+                console.log('[localbrowse] shell.openPath called');
+                return;
+            }
+        } catch (e) {
+            console.warn('[localbrowse] shell.openPath unavailable:', e);
+        }
+        // 回退到 child_process
+        try {
+            var cp = require('child_process');
+            if (that.isWindows) {
+                cp.spawn('explorer', [filePath], { stdio: 'ignore', detached: true }).unref();
+            } else if (that.platform === 'darwin') {
+                cp.spawn('open', [filePath], { stdio: 'ignore', detached: true }).unref();
+            } else {
+                cp.spawn('xdg-open', [filePath], { stdio: 'ignore', detached: true }).unref();
+            }
+        } catch (e) {
+            console.error('[localbrowse] _openAssetFile failed:', e, 'path:', filePath);
+            that.showToastMsg('无法打开文件，请手动访问');
         }
     }
 
@@ -4734,8 +4946,12 @@ class LocalBrowsePlugin extends Plugin {
                         e.preventDefault();
                         e.stopPropagation();
                         e.stopImmediatePropagation();
-                        that.loadDirectory(localPath);
+                        // 确保面板可见并切换到本地文件标签
                         that.ensurePanelVisible();
+                        if (that._activeTab !== 'local') {
+                            that._switchTab('local');
+                        }
+                        that.loadDirectory(localPath);
                         return;
                     }
                 } catch(ex) {
@@ -4790,8 +5006,11 @@ class LocalBrowsePlugin extends Plugin {
         var currentDir = normalizeDir(that.currentPath);
         var targetDir = normalizeDir(dirPath);
 
-        // 确保面板可见
+        // 确保面板可见并切换到本地文件标签
         that.ensurePanelVisible();
+        if (that._activeTab !== 'local') {
+            that._switchTab('local');
+        }
 
         // 如果当前不在文件所在目录，先导航过去
         if (targetDir && targetDir !== currentDir) {
@@ -5134,6 +5353,8 @@ class LocalBrowsePlugin extends Plugin {
         // 为文件列表添加底部内边距，避免最后一个条目紧贴播放器栏
         var fileListEl = document.getElementById('cd-file-list');
         if (fileListEl) fileListEl.style.paddingBottom = '44px';
+        var assetsListEl = document.getElementById('cd-assets-list');
+        if (assetsListEl) assetsListEl.style.paddingBottom = '44px';
 
         // 加载歌词和封面：清理可能存在的旧预加载数据
         if (that._preloadData) {
@@ -5235,14 +5456,22 @@ class LocalBrowsePlugin extends Plugin {
             return curIdx;
         }
 
-        // 随机播放（mode=0）且自动结束：随机选一首（避免重复当前，仅1首时顺序循环）
-        if (fromEnded && that._audioPlayMode === 0 && len > 1) {
-            var newIdx;
-            do { newIdx = Math.floor(Math.random() * len); } while (newIdx === curIdx);
-            return newIdx;
+        // 随机播放（mode=0）：下一首随机选（避免重复当前，仅1首时顺序循环）
+        if (that._audioPlayMode === 0 && len > 1) {
+            if (direction === 1) {
+                // 优先使用预加载的索引，确保和预加载的封面/歌词一致
+                if (that._preloadData && that._preloadData.nextIdx >= 0 && that._preloadData.nextIdx < len) {
+                    return that._preloadData.nextIdx;
+                }
+                var newIdx;
+                do { newIdx = Math.floor(Math.random() * len); } while (newIdx === curIdx);
+                return newIdx;
+            }
+            // 上一首：顺序回退
+            return (curIdx - 1 + len) % len;
         }
 
-        // 列表循环(1) 或 手动切歌（任何模式）：顺序切换
+        // 列表循环(1) 或 单曲循环(2) 手动切歌：顺序切换
         return (curIdx + direction + len) % len;
     }
 
@@ -5268,7 +5497,8 @@ class LocalBrowsePlugin extends Plugin {
         if (that._preloadData && that._preloadData.coverBlurUrl) {
             URL.revokeObjectURL(that._preloadData.coverBlurUrl);
         }
-        that._preloadData = { path: audioPath, coverUrl: null, coverIsBlob: false, coverBlurUrl: null, lrcLines: null };
+        // 保存 nextIdx：随机模式下确保预加载的"下一首"和实际切歌一致
+        that._preloadData = { path: audioPath, nextIdx: nextIdx, coverUrl: null, coverIsBlob: false, coverBlurUrl: null, lrcLines: null };
 
         // 预加载歌词
         var lrcPath = audioPath.replace(/\.[^.]+$/, '.lrc');
@@ -5633,13 +5863,23 @@ class LocalBrowsePlugin extends Plugin {
             return;
         }
 
-        // 随机播放（mode=0）且自动结束：随机选一首（避免重复当前，仅1首时顺序循环）
-        if (fromEnded && that._audioPlayMode === 0 && len > 1) {
-            var newIdx;
-            do { newIdx = Math.floor(Math.random() * len); } while (newIdx === that._audioIndex);
-            that._audioIndex = newIdx;
+        // 随机播放（mode=0）：下一首随机选（避免重复当前，仅1首时顺序循环）
+        if (that._audioPlayMode === 0 && len > 1) {
+            if (direction === 1) {
+                // 优先使用预加载的索引，确保和预加载的封面/歌词一致
+                if (that._preloadData && that._preloadData.nextIdx >= 0 && that._preloadData.nextIdx < len) {
+                    that._audioIndex = that._preloadData.nextIdx;
+                } else {
+                    var newIdx;
+                    do { newIdx = Math.floor(Math.random() * len); } while (newIdx === that._audioIndex);
+                    that._audioIndex = newIdx;
+                }
+            } else {
+                // 上一首：顺序回退
+                that._audioIndex = (that._audioIndex - 1 + len) % len;
+            }
         } else {
-            // 列表循环(1) 或 手动切歌（任何模式）：顺序切换
+            // 列表循环(1) 或 单曲循环(2) 手动切歌：顺序切换
             that._audioIndex = (that._audioIndex + direction + len) % len;
         }
         var f = that._audioPlaylist[that._audioIndex];
@@ -5902,11 +6142,14 @@ class LocalBrowsePlugin extends Plugin {
                 var lrcPanel = document.getElementById('cd-audio-lrc-panel');
                 if (lrcPanel) {
                     if (that._lrcExpanded) {
-                        // 动态计算 bottom：音频栏 + 底部统计栏的高度
+                        // 动态计算 bottom：音频栏 + 当前可见的底部统计栏的高度
                         var audioBar = document.getElementById('cd-audio-bar');
                         var statsBar = document.getElementById('cd-stats-bar');
+                        var assetsStatsBar = document.getElementById('cd-assets-stats-bar');
                         var bottom = 4;  // 容器 padding
-                        if (statsBar) bottom += statsBar.offsetHeight;
+                        // 取当前可见的统计栏（offsetParent 不为 null 表示可见）
+                        var activeStats = (statsBar && statsBar.offsetParent !== null) ? statsBar : assetsStatsBar;
+                        if (activeStats) bottom += activeStats.offsetHeight;
                         if (audioBar) bottom += audioBar.offsetHeight;
                         lrcPanel.style.bottom = bottom + 'px';
                         lrcPanel.style.display = 'block';
@@ -5931,6 +6174,8 @@ class LocalBrowsePlugin extends Plugin {
                 // 移除文件列表底部内边距
                 var fileListEl = document.getElementById('cd-file-list');
                 if (fileListEl) fileListEl.style.paddingBottom = '';
+                var assetsListEl = document.getElementById('cd-assets-list');
+                if (assetsListEl) assetsListEl.style.paddingBottom = '';
                 // 收起歌词面板
                 that._lrcExpanded = false;
                 var lrcPanel = document.getElementById('cd-audio-lrc-panel');
@@ -6129,6 +6374,8 @@ class LocalBrowsePlugin extends Plugin {
                     // 为文件列表添加底部内边距，避免最后一个条目紧贴播放器栏
                     var fileListEl = document.getElementById('cd-file-list');
                     if (fileListEl) fileListEl.style.paddingBottom = '44px';
+                    var assetsListEl = document.getElementById('cd-assets-list');
+                    if (assetsListEl) assetsListEl.style.paddingBottom = '44px';
 
                     // 加载歌词（不播放也能看歌词）
                     that._loadLrc(savedPath);
@@ -6186,8 +6433,13 @@ class LocalBrowsePlugin extends Plugin {
 
         if (!dirPath || !fs || !fs.readdir) return;
 
+        // 递增版本号，旧回调检测到版本过时则丢弃结果（防止异步竞态覆盖）
+        that._playlistBuildSeq++;
+        var mySeq = that._playlistBuildSeq;
+
         try {
             fs.readdir(dirPath, { withFileTypes: true }, function(err, entries) {
+                if (mySeq !== that._playlistBuildSeq) return; // 版本过时，丢弃结果
                 if (err || !entries) return;
                 var audioFiles = [];
                 for (var i = 0; i < entries.length; i++) {
@@ -7179,6 +7431,7 @@ class LocalBrowsePlugin extends Plugin {
      * 保存路径映射配置
      */
     savePathMap() {
+        var that = this;
         try {
             if (this.pathMap) {
                 localStorage.setItem('cd_path_map', JSON.stringify(this.pathMap));
@@ -7200,6 +7453,7 @@ class LocalBrowsePlugin extends Plugin {
      * 3. 兜底：默认 win32
      */
     _detectPlatform() {
+        var that = this;
         // 1. 桌面版：Node.js os 模块
         if (os && os.platform) {
             return os.platform();
@@ -7272,6 +7526,7 @@ class LocalBrowsePlugin extends Plugin {
      * 用于区分同一平台的多台设备（如两台 Windows 电脑）
      */
     _getDeviceId() {
+        var that = this;
         if (!this._deviceId) {
             // 1. 桌面版：Node.js os 模块
             if (os && os.hostname) {
@@ -7302,17 +7557,41 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 异步读取目录内容
-     * 桌面版：fs.readdirSync（同步包装为 Promise）
+     * 桌面版：fs.readdir（异步回调，避免网盘挂载时阻塞主线程）
      * Docker/鸿蒙版：/api/file/readDir
      * @param {string} dirPath 目录路径
+     * @param {number} [timeoutMs] 超时毫秒数（默认 5000，网盘挂载场景防止无限挂起）
      * @returns {Promise<Array<{name:string, isDir:boolean, isSymlink:boolean, updated:number}>>}
      */
-    _fsReaddir(dirPath) {
+    _fsReaddir(dirPath, timeoutMs) {
         var that = this;
+        timeoutMs = timeoutMs || 5000;
         return new Promise(function(resolve, reject) {
-            if (fs && fs.readdirSync) {
-                try {
-                    var entries = fs.readdirSync(dirPath, { withFileTypes: true });
+            var done = false;
+            var timer = setTimeout(function() {
+                if (!done) {
+                    done = true;
+                    that._error('_fsReaddir timeout:', dirPath);
+                    reject(new Error('readdir timeout: ' + dirPath));
+                }
+            }, timeoutMs);
+
+            function finish(val) {
+                if (!done) { done = true; clearTimeout(timer); resolve(val); }
+            }
+            function fail(err) {
+                if (!done) { done = true; clearTimeout(timer); reject(err); }
+            }
+
+            if (fs && fs.readdir) {
+                fs.readdir(dirPath, { withFileTypes: true }, function(err, entries) {
+                    if (err) {
+                        // Node.js 异步模式失败时，尝试 API 兜底（沙箱/权限限制场景）
+                        that._apiReaddir(dirPath).then(finish).catch(function() {
+                            fail(err);
+                        });
+                        return;
+                    }
                     var result = entries.map(function(e) {
                         return {
                             name: e.name,
@@ -7321,15 +7600,10 @@ class LocalBrowsePlugin extends Plugin {
                             updated: 0
                         };
                     });
-                    resolve(result);
-                } catch (err) {
-                    // Node.js 模式失败时，尝试 API 兜底（沙箱/权限限制场景）
-                    that._apiReaddir(dirPath).then(resolve).catch(function() {
-                        reject(err);
-                    });
-                }
+                    finish(result);
+                });
             } else {
-                that._apiReaddir(dirPath).then(resolve).catch(reject);
+                that._apiReaddir(dirPath).then(finish).catch(fail);
             }
         });
     }
@@ -7407,9 +7681,12 @@ class LocalBrowsePlugin extends Plugin {
     _fsStat(filePath) {
         var that = this;
         return new Promise(function(resolve, reject) {
-            if (fs && fs.statSync) {
-                try {
-                    var st = fs.statSync(filePath);
+            if (fs && fs.stat) {
+                fs.stat(filePath, function(err, st) {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
                     resolve({
                         isDirectory: function() { return st.isDirectory(); },
                         isFile: function() { return st.isFile(); },
@@ -7417,9 +7694,7 @@ class LocalBrowsePlugin extends Plugin {
                         mtime: st.mtime,
                         isSymlink: function() { return st.isSymbolicLink && st.isSymbolicLink(); }
                     });
-                } catch (err) {
-                    reject(err);
-                }
+                });
             } else {
                 // API 版：列出父目录，匹配文件名
                 var sep = that._sep || '/';
@@ -7838,6 +8113,7 @@ class LocalBrowsePlugin extends Plugin {
      * 用 _loadSeq 版本号机制可以安全地丢弃旧的 C:\ 回调。
      */
     _navigateToSyncRootOnLoad() {
+        var that = this;
         var syncRoot = this._getMySyncRoot();
         that._log('_navigateToSyncRootOnLoad: syncRoot=' + syncRoot + ', currentPath=' + this.currentPath + ', dockPanel=' + !!this.dockPanel + ', _loadSeq=' + this._loadSeq);
         if (!syncRoot) return;
@@ -7875,6 +8151,7 @@ class LocalBrowsePlugin extends Plugin {
      * 保存跨端同步文件夹配置（使用 saveData/loadData 实现跨端共享）
      */
     saveSyncRoots() {
+        var that = this;
         try {
             // 清理空的平台对象（所有设备都被删除的平台）
             var platforms = ['win32', 'darwin', 'linux'];
@@ -8188,6 +8465,7 @@ class LocalBrowsePlugin extends Plugin {
      *   syncSearchRoot: 当前平台的同步文件夹路径（供后续搜索用）
      */
     _crossSyncRepair(localPath, fileName) {
+        var that = this;
         if (!localPath || !this.syncRoots) return null;
         var myRoot = this._getMySyncRoot();
         if (!myRoot) {
@@ -10172,6 +10450,7 @@ class LocalBrowsePlugin extends Plugin {
      * 获取当前活动文档的 block ID
      */
     getCurrentDocId() {
+        var that = this;
         try {
             // 方式1：通过思源布局 API 获取当前活动文档（最可靠）
             if (window.siyuan && window.siyuan.layout && window.siyuan.layout.centerLayout) {
@@ -10529,9 +10808,6 @@ class LocalBrowsePlugin extends Plugin {
             if (e.target === dialog) {
                 dialog._relinkAborted = true;
                 document.body.removeChild(dialog);
-                // 关闭对话框后刷新指示灯状态
-                that._lastCheckedDocId = '';
-                that._autoCheckLinks();
             }
         });
 
@@ -10541,9 +10817,6 @@ class LocalBrowsePlugin extends Plugin {
             closeBtn.addEventListener('click', function() {
                 dialog._relinkAborted = true;
                 if (dialog.parentNode) document.body.removeChild(dialog);
-                // 关闭对话框后刷新指示灯状态
-                that._lastCheckedDocId = '';
-                that._autoCheckLinks();
             });
         }
     }
@@ -10953,7 +11226,7 @@ class LocalBrowsePlugin extends Plugin {
             }
 
             var html = '';
-            var parentDir = path.dirname(dirPath);
+            var parentDir = path ? path.dirname(dirPath) : (function() { var s = dirPath.indexOf('\\') >= 0 ? '\\' : '/'; var idx = dirPath.replace(/[\\\/]+$/, '').lastIndexOf(s); return idx > 0 ? dirPath.substring(0, idx) : dirPath; })();
             if (parentDir && parentDir !== dirPath) {
                 html += '<div class="cd-pick-dir-item" data-dir="' + that.escapeHtml(parentDir) + '" style="padding:5px 10px;cursor:pointer;border-bottom:1px solid var(--b3-border,#f5f5f5);color:var(--b3-theme-secondary,#999)">📁 ..</div>';
             }
@@ -11083,7 +11356,7 @@ class LocalBrowsePlugin extends Plugin {
                             }
 
                             if (matchType) {
-                                var fullPath = path.join(item.dir, entry.name);
+                                var fullPath = path ? path.join(item.dir, entry.name) : (item.dir.replace(/[\\\/]+$/, '') + that._sep + entry.name);
                                 var stat = await that._fsStat(fullPath).catch(function() { return null; });
                                 var result = {
                                     fullPath: fullPath,
@@ -11101,7 +11374,7 @@ class LocalBrowsePlugin extends Plugin {
                         } else if (isDir) {
                             if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
                             // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
-                            var nextDir = path.join(item.dir, entry.name);
+                            var nextDir = path ? path.join(item.dir, entry.name) : (item.dir.replace(/[\\\/]+$/, '') + that._sep + entry.name);
                             if (entry.name === 'Data' && item.dir === '/System/Volumes') continue;
                             queue.push({ dir: nextDir, depth: item.depth + 1 });
                         } else if (isSymlink) {
@@ -11251,8 +11524,8 @@ class LocalBrowsePlugin extends Plugin {
                 if (abortFlag.cancelled) { taskFinished(); return Promise.resolve(); }
                 if (exactResults.length >= maxResults) { taskFinished(); return Promise.resolve(); }
 
-                // 异步读取目录（同 deepSearch）
-                return fs.promises.readdir(normalizedPath, { withFileTypes: true }).then(function(entries) {
+                // 异步读取目录（使用插件封装，兼容 Docker/API 模式）
+                return that._fsReaddir(normalizedPath.replace(/[\\\/]+$/, '')).then(function(entries) {
                     var subPromises = [];
                     searchedDirs++;
 
@@ -11277,7 +11550,7 @@ class LocalBrowsePlugin extends Plugin {
                             if (matchType) {
                                 // 用 IIFE 捕获 matchType 和 fullPath，避免闭包 bug
                                 (function(mt, fp) {
-                                    var statP = fs.promises.stat(fp).then(function(st) {
+                                    var statP = that._fsStat(fp).then(function(st) {
                                         exactResults.push({
                                             fullPath: fp,
                                             size: st.size,
@@ -11303,8 +11576,9 @@ class LocalBrowsePlugin extends Plugin {
                             // OTHER 类型（symlink/junction）：尝试 fs.statSync 判断是否为目录
                             // Windows 上如 "Documents and Settings"、用户目录下的兼容性链接
                             try {
+                                if (!fs || !fs.statSync) { taskFinished(); continue; }
                                 var st = fs.statSync(fullPath);
-                                if (st.isDirectory()) {
+                                if (st && st.isDirectory()) {
                                     if (entry.name.charAt(0) !== '.' && entry.name !== '$RECYCLE.BIN' && entry.name !== 'System Volume Information' && entry.name !== 'node_modules' && entry.name !== '.git') {
                                         searchRecursive(fullPath);
                                     }
@@ -11362,7 +11636,7 @@ class LocalBrowsePlugin extends Plugin {
                     var frName = fr.name || (fr.path ? fr.path.replace(/\\/g, '/').split('/').pop() : '');
                     if (frName === fileName || frName.toLowerCase() === fileNameLower) {
                         try {
-                            var fst = fr.path ? fs.statSync(fr.path) : null;
+                            var fst = fr.path ? await that._fsStat(fr.path).catch(function() { return null; }) : null;
                             exactResults.push({
                                 fullPath: fr.path || '',
                                 size: fst ? fst.size : (fr.size || 0),
@@ -11411,7 +11685,7 @@ class LocalBrowsePlugin extends Plugin {
         // 为新链接生成文件指纹 title
         var newFingerprintTitle = '';
         try {
-            var newStat = fs && fs.statSync ? fs.statSync(newLocalPath) : null;
+            var newStat = await that._fsStat(newLocalPath).catch(function() { return null; });
             if (newStat) {
                 newFingerprintTitle = 'size=' + newStat.size + '&mtime=' + (newStat.mtime ? newStat.mtime.getTime() : 0);
             }
@@ -11447,8 +11721,10 @@ class LocalBrowsePlugin extends Plugin {
 
             // 准备多种可能的 URL 格式用于匹配
             var oldUrlVariants = [oldUrl];
-            // 编码版本（空格→%20，中文→UTF-8）
-            oldUrlVariants.push(that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/')));
+            // 编码版本（空格→%20，中文→UTF-8）— 先解码避免双重编码
+            var decodedOldPath = oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/');
+            try { decodedOldPath = decodeURIComponent(decodedOldPath); } catch(e) {}
+            oldUrlVariants.push(that.localPathToFileUrl(decodedOldPath));
             // 只编码空格版本（思源有时只编码空格）
             oldUrlVariants.push(oldUrl.replace(/ /g, '%20'));
             // 只编码中文版本
@@ -11525,7 +11801,9 @@ class LocalBrowsePlugin extends Plugin {
 
             // 方式3：编码版本替换
             if (!replaced) {
-                var oldEncoded = that.localPathToFileUrl(oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/'));
+                var decodedOldPath2 = oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/');
+                try { decodedOldPath2 = decodeURIComponent(decodedOldPath2); } catch(e) {}
+                var oldEncoded = that.localPathToFileUrl(decodedOldPath2);
                 var escapedEncoded = escapeRegex(oldEncoded);
                 var regex3 = new RegExp(escapedEncoded + '(#[^)"\\s]*)?(\\s+"[^"]*")?');
                 var testReplace3 = oldMarkdown.replace(regex3, newUrlWithTitle);
@@ -11597,6 +11875,1973 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
     }
+
+    // ==================== Assets Manager (内部资源管理) ====================
+
+    /**
+     * Tab 切换
+     */
+    _switchTab(tabName) {
+        var that = this;
+        that._activeTab = tabName;
+        try {
+            localStorage.setItem('cd-active-tab', tabName);
+        } catch (e) {}
+
+        var tabs = ['local', 'assets'];
+        tabs.forEach(function(t) {
+            var panel = document.getElementById('cd-panel-' + t);
+            var btn = document.querySelector('.cd-tab-btn[data-tab="' + t + '"]');
+            if (panel) {
+                panel.style.display = (t === tabName) ? 'flex' : 'none';
+            }
+            if (btn) {
+                if (t === tabName) {
+                    btn.style.color = 'var(--b3-theme-primary,#4285f4)';
+                    btn.style.borderBottomColor = 'var(--b3-theme-primary,#4285f4)';
+                    btn.classList.add('cd-tab-active');
+                } else {
+                    btn.style.color = 'var(--b3-theme-secondary,#999)';
+                    btn.style.borderBottomColor = 'transparent';
+                    btn.classList.remove('cd-tab-active');
+                }
+            }
+        });
+
+        // 将音频播放器移到当前活动面板内，统计栏上方（歌词面板保持在外部避免被裁切）
+        var audioBar = document.getElementById('cd-audio-bar');
+        var activePanel = document.getElementById('cd-panel-' + tabName);
+        if (activePanel) {
+            var statsBar = activePanel.querySelector('#cd-stats-bar, #cd-assets-stats-bar');
+            if (statsBar && audioBar) {
+                activePanel.insertBefore(audioBar, statsBar);
+            }
+        }
+
+        // 首次切换到 assets 面板时加载数据
+        if (tabName === 'assets' && !that._assetsLoaded) {
+            that._loadAssets();
+        }
+    }
+
+    /**
+     * 获取 assets 目录路径（供思源文件 API 使用）
+     * 思源 /api/file/readDir API 会把传入路径拼接到工作区根目录后
+     * 所以需要用 data/assets/ 才能指向正确的目录
+     */
+    _getAssetsPath() {
+        return 'data/assets/';
+    }
+
+    /**
+     * 加载 assets/ 目录文件列表
+     */
+    async _loadAssets() {
+        var that = this;
+        var listEl = document.getElementById('cd-assets-list');
+
+        // 辅助：思源 updated 字段 YYYYMMDDHHmmss → 毫秒时间戳
+        function parseSiyuanTime(ts) {
+            if (!ts) return 0;
+            if (typeof ts === 'number') return ts;
+            if (/^\d{14}$/.test(ts)) {
+                var y = ts.slice(0,4), m = ts.slice(4,6), d = ts.slice(6,8);
+                var h = ts.slice(8,10), mi = ts.slice(10,12), s = ts.slice(12,14);
+                var date = new Date(y+'-'+m+'-'+d+'T'+h+':'+mi+':'+s);
+                return isNaN(date.getTime()) ? 0 : date.getTime();
+            }
+            var date2 = new Date(ts);
+            return isNaN(date2.getTime()) ? 0 : date2.getTime();
+        }
+
+        // === 阶段0：localStorage 缓存秒开 ===
+        try {
+            var cached = localStorage.getItem('cd_assets_cache');
+            if (cached) {
+                var cacheData = JSON.parse(cached);
+                if (cacheData && cacheData.tree && cacheData.tree.length > 0) {
+                    that._assetsTree = cacheData.tree;
+                    that._assetsFileMap = cacheData.fileMap || {};
+                    that._assetBlockMap = cacheData.blockMap || {};
+                    that._assetsExpanded = new Set(cacheData.expanded || []);
+                    that._selectedDocId = cacheData.selectedDocId || null;
+                    that._assetsSortBy = cacheData.sortBy || 'time';
+                    that._assetsSortOrder = cacheData.sortOrder || 'desc';
+                    that._assetsNavStack = cacheData.navStack || [];
+                    that._assetsLoaded = true;
+                    that._assetsFilter = cacheData.filter || 'all';
+                    that._assetsExtFilter = cacheData.extFilter || null;
+                    that._assetsSizeFilter = cacheData.sizeFilter || 0;
+                    that._assetsSearch = '';
+                    that._updateAssetsFilterOptions();
+                    that._renderAssetsTree();
+                    that._bindAssetsEvents();
+                    // 缓存秒开后，后台静默刷新（保留展开/选中状态）
+                    that._refreshAssetsInBackground();
+                    return;
+                }
+            }
+        } catch (e) {
+            that._log('_loadAssets: cache read failed', e);
+        }
+
+        if (listEl) {
+            listEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">📦 加载文档资源树...</div>';
+        }
+
+        try {
+            // === 阶段1：并行 Promise.all 发5个请求 ===
+            var nbPromise = fetch('/api/notebook/lsNotebooks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include'
+            }).then(function(r) { return r.json(); });
+
+            var docPromise = fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: "SELECT id, content, parent_id, box, updated FROM blocks WHERE type = 'd' LIMIT 10000" }),
+                credentials: 'include'
+            }).then(function(r) { return r.json(); });
+
+            // 渠道A：assets 表关联
+            var channelAPromise = fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: "SELECT a.name, b.root_id, b.id AS block_id FROM assets AS a JOIN blocks AS b ON a.block_id = b.id LIMIT 100000" }),
+                credentials: 'include'
+            }).then(function(r) { return r.json(); });
+
+            // 渠道B：blocks 内容含 assets/ 路径
+            var channelBPromise = fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: "SELECT id, root_id, content FROM blocks WHERE content LIKE '%assets/%' LIMIT 100000" }),
+                credentials: 'include'
+            }).then(function(r) { return r.json(); });
+
+            // 资源文件读取
+            var assetsPath = that._getAssetsPath();
+            var filePromise;
+            if (fs && fs.readdirSync && fs.statSync) {
+                // 桌面版：用 fs 模块读取（同步，包装为 Promise）
+                filePromise = new Promise(function(resolve) {
+                    var fileMap = {};
+                    try {
+                        var dataDir = '';
+                        try {
+                            if (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) {
+                                dataDir = window.siyuan.config.system.dataDir;
+                            }
+                        } catch (e) {}
+                        if (dataDir) {
+                            var assetsDir = dataDir.replace(/\\/g, '/').replace(/\/+$/, '') + '/assets/';
+                            (function readDirRecursive(dirPath, basePath) {
+                                var items;
+                                try { items = fs.readdirSync(dirPath); } catch (e) { return; }
+                                items.forEach(function(item) {
+                                    if (item.charAt(0) === '.') return;
+                                    var fullPath = dirPath + '/' + item;
+                                    var relPath = basePath ? basePath + '/' + item : item;
+                                    try {
+                                        var st = fs.statSync(fullPath);
+                                        if (st.isDirectory()) {
+                                            readDirRecursive(fullPath, relPath);
+                                        } else {
+                                            fileMap[item] = {
+                                                name: item,
+                                                relPath: relPath,
+                                                size: st.size || 0,
+                                                updated: st.mtime ? st.mtime.getTime() : 0,
+                                                ext: (item.split('.').pop() || '').toLowerCase()
+                                            };
+                                        }
+                                    } catch (e) {}
+                                });
+                            })(assetsDir, '');
+                        }
+                    } catch (e) {}
+                    resolve(fileMap);
+                });
+            } else {
+                // Web/Docker 版回退
+                filePromise = fetch('/api/file/readDir', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: assetsPath }),
+                    credentials: 'include'
+                }).then(function(r) { return r.json(); }).then(function(data) {
+                    var fileMap = {};
+                    if (data.code === 0 && Array.isArray(data.data)) {
+                        data.data.forEach(function(f) {
+                            if (!f.name || f.name.charAt(0) === '.') return;
+                            var rawTime = f.updated || f.mtime || 0;
+                            var timeMs = rawTime;
+                            if (rawTime && rawTime < 10000000000) timeMs = rawTime * 1000;
+                            fileMap[f.name] = {
+                                name: f.name,
+                                relPath: f.name,
+                                size: f.size || 0,
+                                updated: timeMs,
+                                ext: (f.name.split('.').pop() || '').toLowerCase()
+                            };
+                        });
+                    }
+                    return fileMap;
+                }).catch(function() { return {}; });
+            }
+
+            var results = await Promise.all([nbPromise, docPromise, channelAPromise, channelBPromise, filePromise]);
+            var nbData = results[0];
+            var docData = results[1];
+            var channelAData = results[2];
+            var channelBData = results[3];
+            var fileMap = results[4];
+
+            // === 1. 解析笔记本列表 ===
+            var notebooks = {};
+            if (nbData.code === 0 && nbData.data && Array.isArray(nbData.data.notebooks)) {
+                nbData.data.notebooks.forEach(function(n) {
+                    if (!n.closed) {
+                        notebooks[n.id] = n.name || n.id;
+                    }
+                });
+            } else {
+                that._log('_loadAssets: lsNotebooks API failed', nbData);
+            }
+
+            // === 2. 解析文档列表 ===
+            var docMap = {};
+            var allDocs = [];
+            if (docData.code === 0 && Array.isArray(docData.data)) {
+                docData.data.forEach(function(d) {
+                    docMap[d.id] = {
+                        id: d.id,
+                        name: d.content || d.id,
+                        parent_id: d.parent_id,
+                        box: d.box,
+                        updated: parseSiyuanTime(d.updated),
+                        assets: []
+                    };
+                    allDocs.push(docMap[d.id]);
+                });
+            } else {
+                that._log('_loadAssets: blocks query failed', docData);
+            }
+
+            // === 3. 组装 assetFiles（fileMap → assetFiles，必须在渠道B之前） ===
+            var assetFiles = {};
+            Object.keys(fileMap).forEach(function(name) {
+                var f = fileMap[name];
+                var type = that._getAssetType(f.ext);
+                assetFiles[name] = {
+                    name: name,
+                    relPath: f.relPath || name,
+                    size: f.size,
+                    updated: f.updated,
+                    type: type,
+                    ext: f.ext
+                };
+            });
+
+            // === 4. 渠道A：assets 表关联 ===
+            var assetDocMap = {};
+            var assetBlockMap = {};
+            if (channelAData.code === 0 && Array.isArray(channelAData.data)) {
+                channelAData.data.forEach(function(row) {
+                    var docId = row.root_id;
+                    var blockId = row.block_id;
+                    var name = row.name || '';
+                    var basename = name.split('/').pop();
+                    if (!basename || !docId) return;
+                    if (!assetDocMap[docId]) assetDocMap[docId] = {};
+                    assetDocMap[docId][basename] = true;
+                    if (blockId) {
+                        assetBlockMap[basename] = blockId;
+                    }
+                });
+            } else {
+                that._log('_loadAssets: channel A (assets table) failed', channelAData);
+            }
+
+            // === 5. 渠道B：blocks 内容扫描（B1: assets/路径 + B2: href/src超链接） ===
+            if (channelBData.code === 0 && Array.isArray(channelBData.data)) {
+                channelBData.data.forEach(function(row) {
+                    var blockId = row.id;
+                    var rootId = row.root_id;
+                    var content = row.content || '';
+
+                    // B1: assets/路径匹配 — [text](assets/filename)
+                    var assetsPathRegex = /assets\/([^\s"'<>)}\]]+)/g;
+                    var match;
+                    while ((match = assetsPathRegex.exec(content)) !== null) {
+                        var filename = match[1];
+                        var basename = filename.split('/').pop();
+                        if (!basename) continue;
+                        // 仅关联实际存在的文件（fileMap 已在步骤3构建）
+                        if (fileMap[basename] || assetFiles[basename]) {
+                            if (!assetDocMap[rootId]) assetDocMap[rootId] = {};
+                            assetDocMap[rootId][basename] = true;
+                            if (blockId && !assetBlockMap[basename]) {
+                                assetBlockMap[basename] = blockId;
+                            }
+                        }
+                    }
+
+                    // B2: href=/src= + 文件名匹配 — 嵌入式图片、iframe
+                    var hrefSrcRegex = /(?:href|src)=["']([^"']+)["']/g;
+                    while ((match = hrefSrcRegex.exec(content)) !== null) {
+                        var url = match[1];
+                        var urlBasename = url.split('/').pop();
+                        if (!urlBasename) continue;
+                        // 跳过外部链接
+                        if (url.indexOf('http') === 0 || url.indexOf('//') === 0) continue;
+                        if (fileMap[urlBasename] || assetFiles[urlBasename]) {
+                            if (!assetDocMap[rootId]) assetDocMap[rootId] = {};
+                            assetDocMap[rootId][urlBasename] = true;
+                            if (blockId && !assetBlockMap[urlBasename]) {
+                                assetBlockMap[urlBasename] = blockId;
+                            }
+                        }
+                    }
+                });
+            } else {
+                that._log('_loadAssets: channel B (blocks scan) failed', channelBData);
+            }
+
+            // === 6. 把资源分配到对应文档 ===
+            Object.keys(assetDocMap).forEach(function(docId) {
+                var doc = docMap[docId];
+                if (!doc) return;
+                Object.keys(assetDocMap[docId]).forEach(function(name) {
+                    var file = assetFiles[name];
+                    if (file) {
+                        doc.assets.push(file);
+                    }
+                });
+            });
+
+            // === 7. 标记有资源（包括子文档有资源）的文档 ===
+            var hasAssets = {};
+            allDocs.forEach(function(doc) {
+                if (doc.assets.length > 0) {
+                    hasAssets[doc.id] = true;
+                }
+            });
+            function markAncestors(docId) {
+                var doc = docMap[docId];
+                if (!doc || !doc.parent_id || !docMap[doc.parent_id]) return;
+                var parent = docMap[doc.parent_id];
+                hasAssets[parent.id] = true;
+                markAncestors(parent.id);
+            }
+            Object.keys(hasAssets).forEach(function(id) {
+                markAncestors(id);
+            });
+
+            // === 8. 为每个 box 构建文档树 ===
+            var tree = [];
+            Object.keys(notebooks).forEach(function(boxId) {
+                var boxDocs = allDocs.filter(function(d) {
+                    return d.box === boxId && hasAssets[d.id];
+                });
+                if (boxDocs.length === 0) return;
+
+                var boxDocIds = {};
+                boxDocs.forEach(function(d) { boxDocIds[d.id] = true; });
+
+                // 找到根文档（parent_id 不在当前 box 的可见文档中）
+                var roots = boxDocs.filter(function(d) {
+                    return !d.parent_id || !boxDocIds[d.parent_id];
+                });
+
+                function buildTree(doc, depth) {
+                    var children = boxDocs.filter(function(d) {
+                        return d.parent_id === doc.id;
+                    }).map(function(d) {
+                        return buildTree(d, depth + 1);
+                    });
+                    return {
+                        type: 'doc',
+                        id: doc.id,
+                        name: doc.name,
+                        depth: depth,
+                        assets: doc.assets,
+                        updated: doc.updated || 0,
+                        children: children,
+                        expanded: false
+                    };
+                }
+
+                var docTree = roots.map(function(r) {
+                    return buildTree(r, 0);
+                });
+
+                // 统计资源数 及 各文档树最新更新时间
+                var totalAssets = 0;
+                function countAssets(node) {
+                    if (node.type === 'doc') {
+                        totalAssets += node.assets.length;
+                        node.children.forEach(countAssets);
+                    }
+                }
+                docTree.forEach(countAssets);
+
+                // 计算笔记本最新更新时间（取所有子文档的最大 updated）
+                var nbUpdated = 0;
+                function calcMaxUpdated(node) {
+                    var max = node.updated || 0;
+                    node.children.forEach(function(c) {
+                        var childMax = calcMaxUpdated(c);
+                        if (childMax > max) max = childMax;
+                    });
+                    node.updated = max;
+                    return max;
+                }
+                docTree.forEach(function(root) {
+                    var rootMax = calcMaxUpdated(root);
+                    if (rootMax > nbUpdated) nbUpdated = rootMax;
+                });
+
+                tree.push({
+                    type: 'notebook',
+                    id: boxId,
+                    name: notebooks[boxId],
+                    children: docTree,
+                    expanded: false,
+                    assetCount: totalAssets,
+                    updated: nbUpdated
+                });
+            });
+
+            that._assetsTree = tree;
+            that._assetsFileMap = assetFiles;
+            that._assetBlockMap = assetBlockMap;
+            that._assetsExpanded = new Set();
+            that._assetsNavStack = []; // 数据刷新后重置导航栈
+            that._assetsLoaded = true;
+            that._assetsFilter = 'all';
+            that._assetsExtFilter = null;
+            that._assetsSizeFilter = 0;
+            that._assetsSearch = '';
+
+            // 更新底部状态栏
+            var totalFiles = Object.keys(assetFiles).length;
+            var totalSize = Object.values(assetFiles).reduce(function(sum, f) { return sum + f.size; }, 0);
+            that._assetsTotalFiles = totalFiles;
+            that._assetsTotalSize = totalSize;
+            var statsText = document.getElementById('cd-assets-stats-text');
+            if (statsText) {
+                statsText.innerHTML = '共 <b>' + totalFiles + '</b> 个文件，<b>' + tree.length + '</b> 个笔记本，占用 <b>' + that._formatSize(totalSize) + '</b>';
+            }
+
+            // 如果树为空但文件存在，可能是 SQL 查询失败，显示调试信息和降级列表
+            if (tree.length === 0 && totalFiles > 0) {
+                var debugHtml = '<div style="padding:16px;color:var(--b3-theme-secondary,#999);font-size:12px">';
+                debugHtml += '<div style="margin-bottom:8px;color:var(--b3-theme-error,#d32f2f)">⚠️ 未能按文档树组织资源</div>';
+                debugHtml += '<div style="margin-bottom:4px">笔记本: ' + Object.keys(notebooks).length + ' 个</div>';
+                debugHtml += '<div style="margin-bottom:4px">文档: ' + allDocs.length + ' 个</div>';
+                debugHtml += '<div style="margin-bottom:4px">资源映射: ' + Object.keys(assetDocMap).length + ' 个文档</div>';
+                debugHtml += '<div style="margin-bottom:8px">文件: ' + totalFiles + ' 个</div>';
+                debugHtml += '<div style="color:var(--b3-theme-secondary,#999);font-size:11px">可能是 SQL 查询被限制，以下为全部资源列表：</div>';
+                debugHtml += '</div>';
+                var flatData = Object.values(assetFiles);
+                that._assetsData = flatData;
+                that._sortAssetsData();
+                listEl.innerHTML = debugHtml;
+                that._renderAssetsFlatList();
+                that._bindAssetsEvents();
+                return;
+            }
+
+            // 默认折叠：只显示笔记本层级
+            that._saveAssetsCache();
+            that._updateAssetsFilterOptions();
+            that._renderAssetsTree();
+            that._bindAssetsEvents();
+
+        } catch (e) {
+            that._error('_loadAssets error:', e);
+            if (listEl) listEl.innerHTML = '<div style="padding:20px;text-align:center;color:var(--b3-theme-error,#d32f2f)">❌ 加载失败: ' + (e.message || e) + '</div>';
+        }
+    }
+
+    /**
+     * 后台静默刷新资源数据（保留展开/选中状态）
+     */
+    async _refreshAssetsInBackground() {
+        var that = this;
+        try {
+            var savedExpanded = new Set(that._assetsExpanded);
+            var savedSelected = that._selectedDocId;
+            var savedNavStack = that._assetsNavStack.slice();
+
+            // 临时标记为未加载，重用 _loadAssets 的数据获取逻辑
+            that._assetsLoaded = false;
+            // 清除缓存避免再次秒开
+            localStorage.removeItem('cd_assets_cache');
+            await that._loadAssets();
+
+            // 恢复展开/选中/导航状态
+            that._assetsExpanded = savedExpanded;
+            that._selectedDocId = savedSelected;
+            that._assetsNavStack = savedNavStack;
+            that._saveAssetsCache();
+            that._renderAssetsTree();
+        } catch (e) {
+            that._log('_refreshAssetsInBackground error', e);
+        }
+    }
+
+    /**
+     * 保存资源缓存到 localStorage
+     */
+    _saveAssetsCache() {
+        try {
+            localStorage.setItem('cd_assets_cache', JSON.stringify({
+                tree: this._assetsTree,
+                fileMap: this._assetsFileMap || {},
+                blockMap: this._assetBlockMap || {},
+                expanded: Array.from(this._assetsExpanded || []),
+                selectedDocId: this._selectedDocId || null,
+                sortBy: this._assetsSortBy || 'time',
+                sortOrder: this._assetsSortOrder || 'desc',
+                navStack: this._assetsNavStack || [],
+                filter: this._assetsFilter || 'all',
+                extFilter: this._assetsExtFilter || null,
+                sizeFilter: this._assetsSizeFilter || 0,
+                ts: Date.now()
+            }));
+        } catch (e) {
+            this._log('_saveAssetsCache: save failed', e);
+        }
+    }
+
+    /**
+     * 更新类型统计数量（显示在下拉框后方，可点击筛选）
+     */
+    _updateAssetsFilterOptions() {
+        var that = this;
+        var map = this._assetsFileMap || {};
+        var counts = { image: 0, video: 0, audio: 0, doc: 0, other: 0 };
+        var bigFileCount = 0;
+        var BIG_THRESHOLD = that._bigFileThreshold;
+        Object.values(map).forEach(function(f) {
+            var t = f.type || 'other';
+            if (counts[t] !== undefined) counts[t]++;
+            else counts.other++;
+            if (f.size && f.size > BIG_THRESHOLD) bigFileCount++;
+        });
+        var statsEl = document.getElementById('cd-assets-type-stats');
+        if (!statsEl) return;
+        var items = [
+            { icon: '\ud83d\uddbc\ufe0f', key: 'image', label: '\u56fe\u7247' },
+            { icon: '\ud83c\udfac', key: 'video', label: '\u89c6\u9891' },
+            { icon: '\ud83c\udfb5', key: 'audio', label: '\u97f3\u9891' },
+            { icon: '\ud83d\udcc4', key: 'doc', label: '\u6587\u6863' },
+            { icon: '\ud83d\udce6', key: 'other', label: '\u5176\u4ed6' }
+        ];
+        var activeFilter = that._assetsFilter || 'all';
+
+        // 如果筛选了具体类型，显示格式标签
+        if (activeFilter !== 'all') {
+            var activeItem = items.find(function(it) { return it.key === activeFilter; });
+            if (activeItem) {
+                // 统计该类型下各后缀名分布（基于树中的资源，确保和树视图显示一致）
+                var extCounts = {};
+                function countExtInTree(node) {
+                    if (node.assets) {
+                        node.assets.forEach(function(a) {
+                            if ((a.type || 'other') === activeFilter) {
+                                var ext = a.ext || 'unknown';
+                                extCounts[ext] = (extCounts[ext] || 0) + 1;
+                            }
+                        });
+                    }
+                    if (node.children) {
+                        node.children.forEach(countExtInTree);
+                    }
+                }
+                if (that._assetsTree) {
+                    that._assetsTree.forEach(countExtInTree);
+                }
+                // 按数量从大到小排序，全部显示（超出宽度可横向滑动）
+                var extList = Object.keys(extCounts).map(function(e) { return { ext: e, count: extCounts[e] }; });
+                extList.sort(function(a, b) { return b.count - a.count; });
+                var activeExt = that._assetsExtFilter;
+                var extHtml = extList.map(function(e) {
+                    var isActiveExt = activeExt === e.ext;
+                    var bg = isActiveExt ? 'var(--b3-theme-primary,#4285f4)' : 'transparent';
+                    var fg = isActiveExt ? '#fff' : 'var(--b3-theme-on-background,#333)';
+                    var border = isActiveExt ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-border,#ddd)';
+                    return '<span class="cd-type-stat-btn cd-ext-stat-btn" data-ext="' + that.escapeHtml(e.ext) + '" style="display:inline-flex;align-items:center;gap:2px;cursor:pointer;padding:0 4px;border-radius:8px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';transition:all 0.15s;user-select:none;font-size:11px;vertical-align:middle">' +
+                        '<span style="font-weight:500">' + that.escapeHtml(e.ext.toUpperCase()) + '</span>' +
+                        '<span style="opacity:0.7">' + e.count + '</span>' +
+                        '</span>';
+                }).join('<span style="margin:0 2px;color:var(--b3-border,#ddd);vertical-align:middle;display:inline-block">|</span>');
+
+                statsEl.innerHTML = extHtml;
+                return;
+            }
+        }
+
+        // 全部类型：显示所有类型统计 + 大文件标签
+        var isBigActive = that._assetsSizeFilter > 0;
+        var bigBg = isBigActive ? 'var(--b3-theme-primary,#4285f4)' : 'transparent';
+        var bigFg = isBigActive ? '#fff' : 'var(--b3-theme-on-background,#333)';
+        var bigBorder = isBigActive ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-border,#ddd)';
+        var bigHtml = '<span class="cd-type-stat-btn cd-bigfile-stat-btn" data-big="1" style="display:inline-flex;align-items:center;gap:2px;cursor:pointer;padding:0 4px;border-radius:8px;border:1px solid ' + bigBorder + ';background:' + bigBg + ';color:' + bigFg + ';transition:all 0.15s;user-select:none;font-size:11px;vertical-align:middle" title="大于10MB的文件">' +
+            '<span style="font-size:12px">🐘</span>' +
+            '<span style="font-weight:600">' + bigFileCount + '</span>' +
+            '</span>';
+
+        var typeHtml = items.map(function(it) {
+            var isActive = activeFilter === it.key;
+            var bg = isActive ? 'var(--b3-theme-primary,#4285f4)' : 'transparent';
+            var fg = isActive ? '#fff' : 'var(--b3-theme-on-background,#333)';
+            var border = isActive ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-border,#ddd)';
+            return '<span class="cd-type-stat-btn" data-type="' + it.key + '" style="display:inline-flex;align-items:center;gap:1px;cursor:pointer;padding:0 3px;border-radius:8px;border:1px solid ' + border + ';background:' + bg + ';color:' + fg + ';transition:all 0.15s;user-select:none;vertical-align:middle;font-size:11px" title="' + it.label + '">' +
+                '<span style="font-size:12px">' + it.icon + '</span>' +
+                '<span style="font-weight:600">' + counts[it.key] + '</span>' +
+                '</span>';
+        }).join('<span style="margin:0 2px"></span>');
+
+        statsEl.innerHTML = typeHtml + '<span style="margin:0 2px;color:var(--b3-border,#ddd);vertical-align:middle;display:inline-block">|</span>' + bigHtml;
+
+        // 按需绑定滚轮横向滚动事件
+        if (!statsEl._wheelBound) {
+            statsEl._wheelBound = true;
+            statsEl.addEventListener('wheel', function(e) {
+                if (Math.abs(e.deltaY) > 0) {
+                    e.preventDefault();
+                    this.scrollLeft += e.deltaY;
+                }
+            }, { passive: false });
+        }
+    }
+
+    /**
+     * 用 fs.statSync 补充文件列表的大小（桌面版）
+     */
+    _enrichFileSizes(files) {
+        if (!files || !files.length) return;
+        if (!fs || !fs.statSync) return;
+        try {
+            var dataDir = '';
+            try {
+                if (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) {
+                    dataDir = window.siyuan.config.system.dataDir;
+                }
+            } catch (e) {}
+            if (!dataDir) return;
+            var assetsDir = dataDir.replace(/\\/g, '/').replace(/\/+$/, '') + '/assets/';
+            files.forEach(function(f) {
+                try {
+                    var st = fs.statSync(assetsDir + f.name);
+                    if (st && st.size) f.size = st.size;
+                } catch (e) {}
+            });
+        } catch (e) {}
+    }
+
+    /**
+     * 获取资源类型
+     */
+    _getAssetType(ext) {
+        var imageExts = ['jpg','jpeg','png','gif','svg','webp','bmp','ico','tiff'];
+        var videoExts = ['mp4','avi','mkv','mov','wmv','flv','webm','m4v','mpg','mpeg'];
+        var audioExts = ['mp3','wav','flac','ogg','aac','m4a','wma','ape'];
+        var docExts = ['pdf','doc','docx','xls','xlsx','ppt','pptx','txt','md','csv','json','xml','html','zip','rar','7z','tar','gz','epub','mobi','azw3','azw','djvu','rtf'];
+        if (imageExts.indexOf(ext) >= 0) return 'image';
+        if (videoExts.indexOf(ext) >= 0) return 'video';
+        if (audioExts.indexOf(ext) >= 0) return 'audio';
+        if (docExts.indexOf(ext) >= 0) return 'doc';
+        return 'other';
+    }
+
+    /**
+     * 格式化文件大小
+     */
+    _formatSize(bytes) {
+        if (bytes === 0) return '0 B';
+        var units = ['B','KB','MB','GB','TB'];
+        var i = Math.floor(Math.log(bytes) / Math.log(1024));
+        i = Math.min(i, units.length - 1);
+        return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+    }
+
+    /**
+     * 格式化时间
+     */
+    _formatTime(ts) {
+        if (!ts) return '';
+        var d = new Date(ts);
+        if (isNaN(d.getTime())) return '';
+        return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0') + ' ' +
+               String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0');
+    }
+
+    /**
+     * 对平铺 assets 数据排序（降级显示用）
+     */
+    _sortAssetsData() {
+        var that = this;
+        if (!that._assetsData) return;
+        var sortBy = that._assetsSortBy || 'time';
+        var order = that._assetsSortOrder || 'desc';
+        var mult = order === 'asc' ? 1 : -1;
+        that._assetsData.sort(function(a, b) {
+            var cmp = 0;
+            if (sortBy === 'name') {
+                cmp = a.name.localeCompare(b.name);
+            } else if (sortBy === 'size') {
+                cmp = (a.size || 0) - (b.size || 0);
+            } else if (sortBy === 'time') {
+                cmp = (a.updated || 0) - (b.updated || 0);
+            }
+            return cmp * mult;
+        });
+    }
+
+    /**
+     * 渲染平铺资源列表（降级显示用，当文档树构建失败时）
+     */
+    _renderAssetsFlatList() {
+        var that = this;
+        var listEl = document.getElementById('cd-assets-list');
+        if (!listEl || !that._assetsData) return;
+
+        var filtered = that._assetsData.filter(function(f) {
+            if (that._assetsFilter && that._assetsFilter !== 'all' && f.type !== that._assetsFilter) return false;
+            if (that._assetsExtFilter && f.ext !== that._assetsExtFilter) return false;
+            if (that._assetsSizeFilter > 0 && (!f.size || f.size <= that._assetsSizeFilter)) return false;
+            if (that._assetsSearch) {
+                var q = that._assetsSearch.toLowerCase();
+                return f.name.toLowerCase().indexOf(q) >= 0;
+            }
+            return true;
+        });
+
+        if (filtered.length === 0) {
+            listEl.innerHTML += '<div style="padding:40px 20px;text-align:center;color:var(--b3-theme-secondary,#999)">没有找到匹配的资源</div>';
+            return;
+        }
+
+        var html = '<div style="display:flex;flex-direction:column">';
+        filtered.forEach(function(f) {
+            var thumbHtml;
+            if (f.type === 'image') {
+                thumbHtml = '<img src="/assets/' + encodeURIComponent(f.name) + '" style="width:40px;height:40px;object-fit:cover;border-radius:3px;display:block;flex-shrink:0" loading="lazy" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'">' +
+                    '<span style="font-size:18px;margin-right:10px;flex-shrink:0;width:24px;text-align:center;display:none">🖼️</span>';
+            } else {
+                var icon = that._getAssetIcon(f.type, f.ext);
+                thumbHtml = '<span style="font-size:18px;margin-right:10px;flex-shrink:0;width:24px;text-align:center">' + icon + '</span>';
+            }
+            html += '<div class="cd-asset-item" data-name="' + that.escapeHtml(f.name) + '" data-type="' + f.type + '" style="display:flex;align-items:center;padding:6px 12px;border-bottom:1px solid var(--b3-border,#eee);cursor:pointer;transition:background 0.15s;user-select:none" onmouseenter="this.style.background=\'var(--b3-theme-hover,#e3f2fd)\'" onmouseleave="this.style.background=\'\'">' +
+                thumbHtml +
+                '<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--b3-theme-on-background,#333);margin-left:8px" title="' + that.escapeHtml(f.name) + '">' + that.escapeHtml(f.name) + '</span>' +
+                '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-right:12px;flex-shrink:0;min-width:60px;text-align:right">' + that._formatSize(f.size) + '</span>' +
+                '<span style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-right:12px;flex-shrink:0;min-width:80px;text-align:right">' + that._formatTime(f.updated) + '</span>' +
+                '</div>';
+        });
+        html += '</div>';
+        listEl.innerHTML += html;
+
+        // 绑定点击事件
+        var items = listEl.querySelectorAll('.cd-asset-item');
+        items.forEach(function(item) {
+            item.addEventListener('click', function(e) {
+                var name = this.getAttribute('data-name');
+                that._onAssetClick(name, e);
+            });
+            item.addEventListener('dblclick', function(e) {
+                var name = this.getAttribute('data-name');
+                that._onAssetDblClick(name);
+            });
+            item.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                var name = this.getAttribute('data-name');
+                that._showAssetContextMenu(name, e);
+            });
+        });
+    }
+
+    /**
+     * 对文档资源树排序
+     */
+    _sortAssetsTree() {
+        var that = this;
+        if (!that._assetsTree) return;
+        var sortBy = that._assetsSortBy || 'time';
+        var order = that._assetsSortOrder || 'desc';
+        var mult = order === 'asc' ? 1 : -1;
+
+        function sortDocs(docs) {
+            docs.sort(function(a, b) {
+                var cmp = 0;
+                if (sortBy === 'name') {
+                    cmp = a.name.localeCompare(b.name);
+                } else if (sortBy === 'size') {
+                    var sa = a.assets.reduce(function(s, f) { return s + (f.size || 0); }, 0);
+                    var sb = b.assets.reduce(function(s, f) { return s + (f.size || 0); }, 0);
+                    cmp = sa - sb;
+                } else if (sortBy === 'time') {
+                    var ta = a.assets.length > 0 ? Math.max.apply(null, a.assets.map(function(f) { return f.updated || 0; })) : 0;
+                    var tb = b.assets.length > 0 ? Math.max.apply(null, b.assets.map(function(f) { return f.updated || 0; })) : 0;
+                    cmp = ta - tb;
+                }
+                return cmp * mult;
+            });
+            docs.forEach(function(d) {
+                if (d.children && d.children.length > 0) sortDocs(d.children);
+            });
+        }
+
+        // 排序文档（笔记本固定按名称）
+        that._assetsTree.forEach(function(nb) {
+            if (nb.children && nb.children.length > 0) sortDocs(nb.children);
+        });
+    }
+
+    /**
+     * 获取当前导航位置的节点
+     */
+    _getCurrentAssetsNode() {
+        var that = this;
+        if (!that._assetsTree || that._assetsNavStack.length === 0) return null;
+        var last = that._assetsNavStack[that._assetsNavStack.length - 1];
+        return last.node || null;
+    }
+
+    /**
+     * 更新本地文件面包屑小房子状态（展开/折叠后动态调用）
+     */
+    _updateBreadcrumbHomeState() {
+        var homeEl = document.getElementById('cd-breadcrumb-home');
+        if (!homeEl) return;
+        var hasExpanded = this._expandedDirs && this._expandedDirs.size > 0;
+        var breadcrumbEl = document.getElementById('cd-breadcrumb');
+        // 判断当前是否在物理根目录
+        var isRootDir = false;
+        if (breadcrumbEl) {
+            // 没有子路径分隔符 → 在根目录
+            var pathSpans = breadcrumbEl.querySelectorAll('span[style*="font-weight"]');
+            isRootDir = pathSpans.length === 0;
+        }
+        if (hasExpanded || !isRootDir) {
+            homeEl.style.color = 'var(--b3-theme-primary,#4285f4)';
+            homeEl.style.cursor = 'pointer';
+            homeEl.style.textDecoration = 'underline';
+        } else {
+            homeEl.style.color = 'var(--b3-theme-secondary,#999)';
+            homeEl.style.cursor = 'default';
+            homeEl.style.textDecoration = '';
+        }
+    }
+
+    /**
+     * 更新内部资源面包屑
+     */
+    _updateAssetsBreadcrumb() {
+        var that = this;
+        var el = document.getElementById('cd-assets-breadcrumb');
+        if (!el) return;
+        el.innerHTML = '';
+        el.style.cursor = 'default';
+
+        // 根项（小房子）
+        var hasNav = that._assetsNavStack.length > 0;
+        var hasExpanded = that._assetsExpanded && that._assetsExpanded.size > 0;
+        var isRoot = !hasNav && !hasExpanded;
+        var homeIcon = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;display:inline-block;vertical-align:middle;fill:currentColor"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>';
+        var rootSpan = document.createElement('span');
+        rootSpan.innerHTML = homeIcon;
+        rootSpan.style.display = 'inline-block';
+        if (isRoot) {
+            // 全部折叠：灰色，不响应点击
+            rootSpan.style.color = 'var(--b3-theme-secondary,#999)';
+            rootSpan.style.cursor = 'default';
+        } else {
+            // 有展开：亮起，点击折叠一层
+            rootSpan.style.color = 'var(--b3-theme-primary,#4285f4)';
+            rootSpan.style.cursor = 'pointer';
+            rootSpan.style.textDecoration = 'underline';
+            rootSpan.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (that._assetsNavStack.length > 0) {
+                    that._assetsNavStack.pop();
+                } else if (that._assetsExpanded && that._assetsExpanded.size > 0) {
+                    var expandedArr = Array.from(that._assetsExpanded);
+                    that._assetsExpanded.delete(expandedArr[expandedArr.length - 1]);
+                }
+                that._renderAssetsTree();
+            });
+        }
+        el.appendChild(rootSpan);
+
+        that._assetsNavStack.forEach(function(item, idx) {
+            var sep = document.createElement('span');
+            sep.innerHTML = '<svg viewBox="0 0 24 24" style="width:12px;height:12px;display:inline-block;fill:currentColor;vertical-align:middle"><path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z"/></svg>';
+            sep.style.display = 'inline-block';
+            sep.style.margin = '0 5px';
+            sep.style.color = 'var(--b3-theme-primary,#4285f4)';
+            el.appendChild(sep);
+
+            var isLast = (idx === that._assetsNavStack.length - 1);
+            var span = document.createElement('span');
+            span.textContent = item.name;
+            span.style.display = 'inline-block';
+            if (isLast) {
+                span.style.fontWeight = 'bold';
+                span.style.color = 'var(--b3-theme-on-background,#333)';
+            } else {
+                span.style.cursor = 'pointer';
+                span.style.color = 'var(--b3-theme-primary,#4285f4)';
+                span.style.textDecoration = 'underline';
+                span.style.marginRight = '2px';
+                (function(targetIdx) {
+                    span.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        that._assetsNavStack = that._assetsNavStack.slice(0, targetIdx + 1);
+                        that._renderAssetsTree();
+                    });
+                })(idx);
+            }
+            el.appendChild(span);
+        });
+    }
+
+    /**
+     * 进入内部资源目录（笔记本或文档）
+     */
+    _enterAssetsDir(type, id, name, node) {
+        var that = this;
+        that._assetsNavStack.push({ type: type, id: id, name: name, node: node });
+        that._renderAssetsTree();
+    }
+
+    /**
+     * 返回内部资源上级目录
+     */
+    _goBackAssets() {
+        var that = this;
+        if (that._assetsNavStack.length > 0) {
+            that._assetsNavStack.pop();
+            that._renderAssetsTree();
+        }
+    }
+
+    /**
+     * 渲染文档资源树（路径导航模式）
+     */
+    _renderAssetsTree() {
+        var that = this;
+        // 防递归守卫：连续重置导航栈后最多递归 3 次
+        if (!that._renderTreeDepth) that._renderTreeDepth = 0;
+        that._renderTreeDepth++;
+        var isRecursive = that._renderTreeDepth > 1;
+        var listEl = document.getElementById('cd-assets-list');
+        if (!listEl || !that._assetsTree) return;
+
+        var hasFilter = (that._assetsFilter && that._assetsFilter !== 'all') || that._assetsExtFilter || that._assetsSizeFilter > 0;
+        var hasSearch = that._assetsSearch && that._assetsSearch.trim();
+
+        var totalAssets = 0;
+        var totalSize = 0;
+
+        var html = '<div style="display:flex;flex-direction:column;font-size:13px">';
+
+        // 统一的列表项样式（与本地文件列表 renderListBatch 一致）
+        var itemBaseStyle = 'display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--b3-border,#eee);transition:background 0.15s;font-size:13px;user-select:none';
+        var arrowWrapStyle = 'width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px;cursor:pointer;vertical-align:middle';
+        var iconBaseStyle = 'font-size:16px;margin-right:6px;flex-shrink:0';
+        var nameBaseStyle = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:var(--b3-theme-on-background,#333)';
+        var metaBaseStyle = 'font-size:11px;color:var(--b3-theme-secondary,#999);margin-left:8px;flex-shrink:0;white-space:nowrap';
+        var timeStyle = 'font-size:11px;color:#999;margin-left:8px;flex-shrink:0;white-space:nowrap';
+
+        // 与本地文件列表一致的 SVG 箭头
+        function svgArrow(rotated) {
+            return '<svg viewBox="0 0 32 32" style="width:10px;height:10px;color:var(--b3-theme-on-surface,#666);transition:transform 0.15s;fill:currentColor;pointer-events:none' + (rotated ? ';transform:rotate(90deg)' : '') + '"><path d="M21.964 16.874l-10.453 10.453c-0.737 0.737-1.942 0.737-2.678 0s-0.737-1.942 0-2.678l9.114-9.114-9.114-9.114c-0.737-0.737-0.737-1.942 0-2.678s1.942-0.737 2.678 0l10.453 10.453c0.369 0.369 0.553 0.861 0.553 1.339s-0.184 0.97-0.553 1.339z"></path></svg>';
+        }
+        var emptyArrow = '<span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px;vertical-align:middle"></span>';
+
+        // 辅助函数：过滤文档的资源
+        function filterAssets(nodeAssets) {
+            var va = nodeAssets.slice();
+            if (that._assetsFilter && that._assetsFilter !== 'all') {
+                va = va.filter(function(a) { return a.type === that._assetsFilter; });
+            }
+            if (that._assetsExtFilter) {
+                va = va.filter(function(a) { return a.ext === that._assetsExtFilter; });
+            }
+            if (that._assetsSizeFilter > 0) {
+                va = va.filter(function(a) { return a.size && a.size > that._assetsSizeFilter; });
+            }
+            if (hasSearch) {
+                var q = that._assetsSearch.toLowerCase();
+                va = va.filter(function(a) { return a.name.toLowerCase().indexOf(q) >= 0; });
+            }
+            return va;
+        }
+
+        // 辅助函数：检查节点（含后代）是否有可见资源
+        function nodeHasVisibleAssets(n) {
+            var va = filterAssets(n.assets || []);
+            if (va.length > 0) return true;
+            if (!n.children || n.children.length === 0) return false;
+            return n.children.some(nodeHasVisibleAssets);
+        }
+
+        // 辅助函数：计算节点（含后代）的可见资源总数
+        function countVisibleAssets(n) {
+            var count = filterAssets(n.assets || []).length;
+            if (n.children) {
+                n.children.forEach(function(c) { count += countVisibleAssets(c); });
+            }
+            return count;
+        }
+
+        // 渲染资源项
+        function renderAssetItem(asset, indent) {
+            totalAssets++;
+            if (asset.size) totalSize += asset.size;
+            var icon = that._getAssetIcon(asset.type, asset.ext);
+            return '<div class="cd-asset-file cd-asset-item" data-name="' + that.escapeHtml(asset.name) + '" data-type="' + asset.type + '" style="' + itemBaseStyle + ';padding-left:' + indent + 'px" onmouseenter="this.style.background=\'var(--b3-theme-hover,#e3f2fd)\'" onmouseleave="this.style.background=\'\'">' +
+                '<span style="width:22px;height:22px;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;margin-right:2px"></span>' +
+                '<span style="' + iconBaseStyle + '">' + icon + '</span>' +
+                '<span style="' + nameBaseStyle + ';margin-left:0" title="' + that.escapeHtml(asset.name) + '">' + that.escapeHtml(asset.name) + '</span>' +
+                '<span style="' + metaBaseStyle + ';min-width:50px;text-align:right">' + that._formatSize(asset.size) + '</span>' +
+                '<span style="' + timeStyle + '">' + that._formatTime(asset.updated) + '</span>' +
+                '</div>';
+        }
+
+        // 渲染文档项（作为文件夹）
+        function renderDocItem(node, indent, isExpandable) {
+            var visibleAssets = filterAssets(node.assets || []);
+            var hasVisibleChildren = node.children && node.children.length > 0 ? node.children.some(nodeHasVisibleAssets) : false;
+            if (visibleAssets.length === 0 && !hasVisibleChildren && (hasFilter || hasSearch)) return '';
+
+            var isExpanded = that._assetsExpanded.has('doc:' + node.id);
+            var hasChildren = node.children && node.children.length > 0;
+            var arrow = (isExpandable && (hasChildren || visibleAssets.length > 0))
+                ? '<span class="cd-asset-doc-arrow" data-doc="' + that.escapeHtml(node.id) + '" style="' + arrowWrapStyle + '">' + svgArrow(isExpanded) + '</span>'
+                : emptyArrow;
+
+            var timeStr = node.updated ? that._formatTime(node.updated) : '';
+
+            var html = '<div class="cd-asset-doc cd-asset-item" data-doc="' + that.escapeHtml(node.id) + '" data-expandable="' + (isExpandable ? '1' : '0') + '" style="' + itemBaseStyle + ';padding-left:' + indent + 'px" onmouseenter="this.style.background=\'var(--b3-theme-hover,#e3f2fd)\'" onmouseleave="this.style.background=\'\'">' +
+                arrow +
+                '<span style="' + iconBaseStyle + '">📁</span>' +
+                '<span style="' + nameBaseStyle + '">' + that.escapeHtml(node.name) + ' <span style="color:var(--b3-theme-secondary,#999);font-weight:400">(' + visibleAssets.length + ')</span></span>' +
+                (timeStr ? '<span style="' + timeStyle + '">' + timeStr + '</span>' : '') +
+                '</div>';
+
+            // 如果展开，在当前层级渲染资源和子文档
+            if (isExpanded && isExpandable) {
+                var childIndent = indent + 22;
+                visibleAssets.forEach(function(asset) {
+                    html += renderAssetItem(asset, childIndent);
+                });
+                if (node.children) {
+                    node.children.forEach(function(child) {
+                        html += renderDocItem(child, childIndent, true);
+                    });
+                }
+            }
+            return html;
+        }
+
+        var navDepth = that._assetsNavStack.length;
+
+        if (navDepth === 0) {
+            // === 根级：显示笔记本列表 ===
+            if (that._assetsCurrentView === 'icon') {
+                // 图标视图：笔记本平铺网格
+                html += '</div><div style="display:flex;flex-wrap:wrap;align-content:flex-start;padding:8px;gap:4px;overflow-y:auto">';
+                that._assetsTree.forEach(function(nb) {
+                    if ((hasFilter || hasSearch) && !nodeHasVisibleAssets(nb)) return;
+                    var displayCount = (hasFilter || hasSearch) ? countVisibleAssets(nb) : nb.assetCount;
+                    html += '<div class="cd-asset-icon-item cd-asset-icon-notebook" data-nb="' + that.escapeHtml(nb.id) + '" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:6px 4px;cursor:pointer;border-radius:4px;transition:background 0.15s;height:110px;width:80px;box-sizing:border-box;overflow:hidden">' +
+                        '<div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;flex-shrink:0"><span style="font-size:36px;line-height:1;display:block">📁</span></div>' +
+                        '<span style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + that.escapeHtml(nb.name) + '</span>' +
+                        '<span style="font-size:10px;color:var(--b3-theme-secondary,#999)">(' + displayCount + ')</span>' +
+                        '</div>';
+                });
+                html += '</div><div style="display:none">'; // 闭合外部容器（占位）
+            } else {
+                // 列表视图（默认）
+                that._assetsTree.forEach(function(nb) {
+                    if ((hasFilter || hasSearch) && !nodeHasVisibleAssets(nb)) return;
+                    var isExpanded = that._assetsExpanded.has('nb:' + nb.id);
+                    var hasChildren = nb.children && nb.children.length > 0;
+                    var arrow = hasChildren ? '<span class="cd-asset-arrow" data-nb="' + that.escapeHtml(nb.id) + '" style="' + arrowWrapStyle + '">' + svgArrow(isExpanded) + '</span>' : emptyArrow;
+                    var displayCount = (hasFilter || hasSearch) ? countVisibleAssets(nb) : nb.assetCount;
+                    var nbTimeStr = nb.updated ? that._formatTime(nb.updated) : '';
+                    html += '<div class="cd-asset-notebook cd-asset-item" data-nb="' + that.escapeHtml(nb.id) + '" data-expandable="' + (hasChildren ? '1' : '0') + '" style="' + itemBaseStyle + ';font-weight:600" onmouseenter="this.style.background=\'var(--b3-theme-hover,#e3f2fd)\'" onmouseleave="this.style.background=\'\'">' +
+                        arrow +
+                        '<span style="' + iconBaseStyle + '">📁</span>' +
+                        '<span style="' + nameBaseStyle + '">' + that.escapeHtml(nb.name) + ' <span style="color:var(--b3-theme-secondary,#999);font-weight:400">(' + displayCount + ')</span></span>' +
+                        (nbTimeStr ? '<span style="' + timeStyle + '">' + nbTimeStr + '</span>' : '') +
+                        '</div>';
+                    if (isExpanded && hasChildren) {
+                        nb.children.forEach(function(child) {
+                            html += renderDocItem(child, 12 + 22, true);
+                        });
+                    }
+                });
+            }
+        } else {
+            // === 笔记本级或文档级：显示当前节点下的内容 ===
+            var currentNode = that._getCurrentAssetsNode();
+            if (!currentNode) {
+                // 节点丢失，回退到根级
+                that._assetsNavStack = [];
+                if (that._renderTreeDepth <= 3) {
+                    that._renderAssetsTree();
+                }
+                return;
+            }
+
+            var children = currentNode.children || [];
+
+            if (that._assetsCurrentView === 'icon') {
+                // === 图标视图：平铺网格 ===
+                html += '</div><div style="display:flex;flex-wrap:wrap;align-content:flex-start;padding:8px;gap:4px;overflow-y:auto">';
+
+                // 子文档渲染为文件夹图标
+                children.forEach(function(child) {
+                    var visibleAssets = filterAssets(child.assets || []);
+                    var hasVisibleChildren = child.children && child.children.length > 0 ? child.children.some(nodeHasVisibleAssets) : false;
+                    if (visibleAssets.length === 0 && !hasVisibleChildren && (hasFilter || hasSearch)) return;
+                    html += '<div class="cd-asset-icon-item cd-asset-icon-dir" data-doc="' + that.escapeHtml(child.id) + '" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:6px 4px;cursor:pointer;border-radius:4px;transition:background 0.15s;height:110px;width:80px;box-sizing:border-box;overflow:hidden">' +
+                        '<div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;flex-shrink:0"><span style="font-size:36px;line-height:1;display:block">📁</span></div>' +
+                        '<span style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + that.escapeHtml(child.name) + '</span>' +
+                        '</div>';
+                });
+
+                // 资源文件渲染为图标
+                var currentAssets = filterAssets(currentNode.assets || []);
+                currentAssets.forEach(function(asset) {
+                    totalAssets++;
+                    if (asset.size) totalSize += asset.size;
+                    var iconHtml;
+                    if (asset.type === 'image') {
+                        iconHtml = '<div class="cd-thumb-wrap" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                            '<img src="/assets/' + encodeURIComponent(asset.name) + '" style="width:100%;height:100%;object-fit:cover;display:block" loading="lazy" onerror="this.style.display=\'none\';this.parentElement.querySelector(\'.cd-thumb-placeholder\').style.display=\'inline\'">' +
+                            '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999);display:none">🖼️</span>' +
+                            '</div>';
+                    } else {
+                        var icon = that._getAssetIcon(asset.type, asset.ext);
+                        iconHtml = '<span style="font-size:36px;line-height:1;display:block">' + icon + '</span>';
+                    }
+                    html += '<div class="cd-asset-icon-item cd-asset-icon-file" data-name="' + that.escapeHtml(asset.name) + '" data-type="' + asset.type + '" style="display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding:6px 4px;cursor:pointer;border-radius:4px;transition:background 0.15s;height:110px;width:80px;box-sizing:border-box;overflow:hidden">' +
+                        '<div style="width:56px;height:56px;display:flex;align-items:center;justify-content:center;margin-bottom:4px;flex-shrink:0">' + iconHtml + '</div>' +
+                        '<span style="font-size:11px;text-align:center;word-break:break-all;line-height:1.2;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;width:100%;flex-shrink:0">' + that.escapeHtml(asset.name) + '</span>' +
+                        '</div>';
+                });
+
+                html += '</div><div style="display:none">'; // 闭合外部容器（占位）
+            } else {
+                // === 列表视图（默认）===
+                // 先渲染子文档（作为文件夹项）
+                children.forEach(function(child) {
+                    html += renderDocItem(child, 12, true);
+                });
+
+                // 再渲染当前节点的资源
+                var currentAssets = filterAssets(currentNode.assets || []);
+                currentAssets.forEach(function(asset) {
+                    html += renderAssetItem(asset, 12);
+                });
+            }
+        }
+
+        // 空状态检测：兼容列表视图和图标视图
+        var isEmpty = false;
+        if (that._assetsCurrentView === 'icon') {
+            // 图标视图：检查是否有任何图标项被渲染
+            isEmpty = html.indexOf('cd-asset-icon-') === -1;
+        } else {
+            isEmpty = html === '<div style="display:flex;flex-direction:column;font-size:13px">';
+        }
+        if (isEmpty) {
+            if ((hasFilter || hasSearch) && navDepth > 0) {
+                // 当前位置没有匹配资源，自动回到根级查看全部
+                that._assetsNavStack = [];
+                if (that._renderTreeDepth <= 3) {
+                    that._renderAssetsTree();
+                }
+                return;
+            }
+            html += '<div style="padding:40px 20px;text-align:center;color:var(--b3-theme-secondary,#999)">没有找到资源</div>';
+        }
+
+        html += '</div>';
+        listEl.innerHTML = html;
+
+        // 更新面包屑
+        that._updateAssetsBreadcrumb();
+
+        // 更新底部状态栏
+        var statsText = document.getElementById('cd-assets-stats-text');
+        if (statsText) {
+            var nbCount = that._assetsTree.length;
+            var baseHtml = '';
+            if (that._assetsTotalFiles) {
+                baseHtml = '共 <b>' + that._assetsTotalFiles + '</b> 个文件，<b>' + nbCount + '</b> 个笔记本，占用 <b>' + that._formatSize(that._assetsTotalSize || 0) + '</b>';
+            }
+            if (hasFilter || hasSearch) {
+                baseHtml += ' · 当前显示 ' + totalAssets + ' 个资源';
+            }
+            if (navDepth > 0) {
+                baseHtml += ' · 当前位置: ' + that._assetsNavStack.map(function(s) { return s.name; }).join(' > ');
+            }
+            statsText.innerHTML = baseHtml || '📊 ' + nbCount + ' 个笔记本 · ' + totalAssets + ' 个资源 · 共 ' + that._formatSize(totalSize);
+        }
+
+        // 绑定笔记本项：箭头展开/折叠（零延迟），名称进入
+        listEl.querySelectorAll('.cd-asset-notebook').forEach(function(el) {
+            var nbId = el.getAttribute('data-nb');
+            var expandable = el.getAttribute('data-expandable') === '1';
+
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (!expandable) return;
+                // 判断点击的是箭头还是名称区域
+                var arrowEl = e.target.closest ? e.target.closest('.cd-asset-arrow') : null;
+                if (!arrowEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-asset-arrow')) {
+                    arrowEl = e.target.parentElement;
+                }
+                if (arrowEl) {
+                    // 点击箭头 → 展开/折叠（零延迟）
+                    that._toggleAssetsNode('nb:' + nbId, nbId);
+                } else {
+                    // 点击名称区域 → 进入笔记本
+                    var nb = that._assetsTree.find(function(n) { return n.id === nbId; });
+                    if (nb) {
+                        that._enterAssetsDir('notebook', nb.id, nb.name, nb);
+                    }
+                }
+            });
+
+            // 双击：进入笔记本（双击箭头时忽略）
+            el.addEventListener('dblclick', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var arrowEl = e.target.closest ? e.target.closest('.cd-asset-arrow') : null;
+                if (!arrowEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-asset-arrow')) {
+                    arrowEl = e.target.parentElement;
+                }
+                if (arrowEl) return;
+                var nb = that._assetsTree.find(function(n) { return n.id === nbId; });
+                if (nb) {
+                    that._enterAssetsDir('notebook', nb.id, nb.name, nb);
+                }
+            });
+        });
+
+        // 绑定图标视图中的笔记本项（点击进入）
+        listEl.querySelectorAll('.cd-asset-icon-notebook').forEach(function(el) {
+            var nbId = el.getAttribute('data-nb');
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var nb = that._assetsTree.find(function(n) { return n.id === nbId; });
+                if (nb) {
+                    that._enterAssetsDir('notebook', nb.id, nb.name, nb);
+                }
+            });
+            el.addEventListener('dblclick', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var nb = that._assetsTree.find(function(n) { return n.id === nbId; });
+                if (nb) {
+                    that._enterAssetsDir('notebook', nb.id, nb.name, nb);
+                }
+            });
+        });
+
+        // 绑定文档项：箭头展开/折叠（零延迟），名称进入
+        listEl.querySelectorAll('.cd-asset-doc').forEach(function(el) {
+            var docId = el.getAttribute('data-doc');
+
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                // 判断点击的是箭头还是名称区域
+                var arrowEl = e.target.closest ? e.target.closest('.cd-asset-doc-arrow') : null;
+                if (!arrowEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-asset-doc-arrow')) {
+                    arrowEl = e.target.parentElement;
+                }
+                if (arrowEl) {
+                    // 点击箭头 → 展开/折叠（零延迟）
+                    that._toggleAssetsNode('doc:' + docId);
+                } else {
+                    // 点击名称区域 → 进入文档
+                    var node = that._findDocNode(docId);
+                    if (node) {
+                        that._enterAssetsDir('doc', node.id, node.name, node);
+                    }
+                }
+            });
+
+            // 双击：进入文档（双击箭头时忽略）
+            el.addEventListener('dblclick', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var arrowEl = e.target.closest ? e.target.closest('.cd-asset-doc-arrow') : null;
+                if (!arrowEl && e.target.parentElement && e.target.parentElement.classList && e.target.parentElement.classList.contains('cd-asset-doc-arrow')) {
+                    arrowEl = e.target.parentElement;
+                }
+                if (arrowEl) return;
+                var node = that._findDocNode(docId);
+                if (node) {
+                    that._enterAssetsDir('doc', node.id, node.name, node);
+                }
+            });
+        });
+
+        // 绑定资源点击（单击延迟250ms，避免双击冲突）
+        listEl.querySelectorAll('.cd-asset-file').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                if (that._assetClickTimer) clearTimeout(that._assetClickTimer);
+                that._assetClickTimer = setTimeout(function() {
+                    that._onAssetClick(name, e);
+                }, 250);
+            });
+            el.addEventListener('dblclick', function(e) {
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                if (that._assetClickTimer) clearTimeout(that._assetClickTimer);
+                that._onAssetDblClick(name);
+            });
+            el.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                that._showAssetContextMenu(name, e);
+            });
+        });
+
+        // 绑定图标视图中的子文档文件夹项
+        listEl.querySelectorAll('.cd-asset-icon-dir').forEach(function(el) {
+            var docId = el.getAttribute('data-doc');
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var node = that._findDocNode(docId);
+                if (node) {
+                    that._enterAssetsDir('doc', node.id, node.name, node);
+                }
+            });
+            el.addEventListener('dblclick', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var node = that._findDocNode(docId);
+                if (node) {
+                    that._enterAssetsDir('doc', node.id, node.name, node);
+                }
+            });
+        });
+
+        // 绑定图标视图中的资源文件项
+        listEl.querySelectorAll('.cd-asset-icon-file').forEach(function(el) {
+            el.addEventListener('click', function(e) {
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                if (that._assetClickTimer) clearTimeout(that._assetClickTimer);
+                that._assetClickTimer = setTimeout(function() {
+                    that._onAssetClick(name, e);
+                }, 250);
+            });
+            el.addEventListener('dblclick', function(e) {
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                if (that._assetClickTimer) clearTimeout(that._assetClickTimer);
+                that._onAssetDblClick(name);
+            });
+            el.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var name = this.getAttribute('data-name');
+                that._showAssetContextMenu(name, e);
+            });
+        });
+
+        // 更新排序按钮文字
+        that._updateAssetsSortBtn();
+        that._syncExpandToggleBtn();
+
+        // 重置递归深度守卫
+        that._renderTreeDepth = 0;
+    }
+
+    /**
+     * 在资源树中查找指定 id 的文档节点
+     */
+    _findDocNode(docId, nodes) {
+        var that = this;
+        var searchNodes;
+        if (nodes) {
+            searchNodes = nodes;
+        } else if (that._assetsTree) {
+            searchNodes = [];
+            that._assetsTree.forEach(function(nb) {
+                if (nb.children) {
+                    nb.children.forEach(function(c) { searchNodes.push(c); });
+                }
+            });
+        } else {
+            searchNodes = [];
+        }
+        for (var i = 0; i < searchNodes.length; i++) {
+            var node = searchNodes[i];
+            if (node.id === docId) return node;
+            if (node.children && node.children.length > 0) {
+                var found = that._findDocNode(docId, node.children);
+                if (found) return found;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 更新内部资源排序按钮文字
+     */
+    _updateAssetsSortBtn(btn) {
+        var that = this;
+        if (!btn) btn = document.getElementById('cd-assets-sort-btn');
+        if (!btn) return;
+        var sortLabels = { name: '名称', size: '大小', time: '修改时间' };
+        var label = sortLabels[that._assetsSortBy || 'time'] || '名称';
+        var arrow = (that._assetsSortOrder || 'desc') === 'asc' ? '↑' : '↓';
+        btn.textContent = '⇅ ' + label + ' ' + arrow;
+    }
+
+    /**
+     * 显示内部资源排序菜单
+     */
+    _showAssetsSortMenu(targetBtn) {
+        var that = this;
+        var menu = document.getElementById('cd-context-menu');
+        if (!menu) return;
+
+        var items = [
+            { key: 'name', label: '名称' },
+            { key: 'size', label: '大小' },
+            { key: 'time', label: '修改时间' }
+        ];
+
+        menu.innerHTML = '';
+        items.forEach(function(item) {
+            var div = document.createElement('div');
+            var isActive = that._assetsSortBy === item.key;
+            var isAsc = that._assetsSortOrder === 'asc';
+            var arrow = isActive ? (isAsc ? ' ↑' : ' ↓') : '';
+            div.style.cssText = 'padding:6px 16px;cursor:pointer;font-size:13px;white-space:nowrap;color:' + (isActive ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-theme-on-background,#333)');
+            div.textContent = item.label + arrow;
+            div.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+            div.addEventListener('mouseleave', function() { this.style.background = ''; });
+            div.addEventListener('click', function() {
+                menu.style.display = 'none';
+                if (that._assetsSortBy === item.key) {
+                    that._assetsSortOrder = isAsc ? 'desc' : 'asc';
+                } else {
+                    that._assetsSortBy = item.key;
+                    that._assetsSortOrder = 'desc';
+                }
+                that._sortAssetsTree();
+                that._renderAssetsTree();
+            });
+            menu.appendChild(div);
+        });
+
+        var rect = targetBtn.getBoundingClientRect();
+        menu.style.display = 'block';
+        menu.style.left = rect.left + 'px';
+        menu.style.top = (rect.bottom + 2) + 'px';
+
+        var closeMenu = function() {
+            menu.style.display = 'none';
+            document.removeEventListener('click', closeMenu);
+        };
+        setTimeout(function() {
+            document.addEventListener('click', closeMenu);
+        }, 0);
+    }
+
+    /**
+     * 获取资源图标
+     */
+    _getAssetIcon(type, ext) {
+        if (type === 'doc' && ext) {
+            var e = ext.toLowerCase();
+            if (e === 'pdf') return '📕';
+            if (e === 'xls' || e === 'xlsx') return '📊';
+            if (e === 'ppt' || e === 'pptx') return '📊';
+            if (e === 'zip' || e === 'rar' || e === '7z' || e === 'tar' || e === 'gz') return '📦';
+            if (e === 'epub' || e === 'mobi' || e === 'azw3' || e === 'azw' || e === 'djvu') return '📖';
+            if (e === 'txt' || e === 'md' || e === 'csv' || e === 'json' || e === 'xml' || e === 'html' || e === 'rtf') return '📝';
+        }
+        var map = {
+            image: '🖼️', video: '🎬', audio: '🎵', doc: '📄', other: '📦'
+        };
+        return map[type] || '📦';
+    }
+
+    /**
+     * 展开/折叠资源树节点（同步 _assetsExpanded 和 node.expanded）
+     */
+    _toggleAssetsNode(key, nbId) {
+        var that = this;
+        var isExpanded = that._assetsExpanded.has(key);
+        if (isExpanded) {
+            that._assetsExpanded.delete(key);
+            // 记录用户主动折叠（筛选模式下尊重此选择）
+            if (!that._assetsUserCollapsed) that._assetsUserCollapsed = new Set();
+            that._assetsUserCollapsed.add(key);
+        } else {
+            that._assetsExpanded.add(key);
+            if (that._assetsUserCollapsed) that._assetsUserCollapsed.delete(key);
+        }
+        // 同步 node.expanded 属性（笔记本节点）
+        if (nbId && that._assetsTree) {
+            that._assetsTree.forEach(function(nb) {
+                if (nb.id === nbId) {
+                    nb.expanded = !isExpanded;
+                }
+            });
+        }
+        that._saveAssetsCache();
+        that._renderAssetsTree();
+        that._syncExpandToggleBtn();
+    }
+
+    /**
+     * 同步展开/折叠按钮图标与列表实际状态
+     */
+    _syncExpandToggleBtn() {
+        var btn = document.getElementById('cd-assets-expand-toggle');
+        if (!btn) return;
+        var expanded = this._assetsExpanded;
+        var anyExpanded = false;
+        if (this._assetsTree) {
+            this._assetsTree.forEach(function(nb) {
+                if (expanded.has('nb:' + nb.id)) anyExpanded = true;
+                if (nb.children) {
+                    nb.children.forEach(function(c) {
+                        if (expanded.has('doc:' + c.id)) anyExpanded = true;
+                    });
+                }
+            });
+        }
+        if (anyExpanded) {
+            btn.textContent = '⊖';
+            btn.title = '折叠全部';
+        } else {
+            btn.textContent = '⊕';
+            btn.title = '展开全部';
+        }
+    }
+
+    /**
+     * 绑定 Assets 面板事件
+     */
+    _bindAssetsEvents() {
+        var that = this;
+        if (that._assetsEventsBound) return;
+        that._assetsEventsBound = true;
+
+        // 注入类型统计栏滚动条隐藏样式（仅一次）
+        if (!document.getElementById('cd-type-stats-scroll-style')) {
+            var tsStyle = document.createElement('style');
+            tsStyle.id = 'cd-type-stats-scroll-style';
+            tsStyle.textContent = '#cd-assets-type-stats::-webkit-scrollbar{display:none}';
+            document.head.appendChild(tsStyle);
+        }
+
+        // 类型过滤（下拉框）
+        var filterSelect = document.getElementById('cd-assets-filter');
+        if (filterSelect) {
+            filterSelect.addEventListener('change', function() {
+                that._assetsFilter = this.value;
+                // 切换类型时清除扩展名和大文件筛选，避免"全部类型"时仍被之前的扩展名过滤
+                that._assetsExtFilter = null;
+                that._assetsSizeFilter = 0;
+                that._updateAssetsFilterOptions();
+                that._renderAssetsTree();
+            });
+        }
+
+        // 类型统计图标点击筛选
+        var typeStatsEl = document.getElementById('cd-assets-type-stats');
+        if (typeStatsEl) {
+            typeStatsEl.addEventListener('click', function(e) {
+                var btn = e.target.closest('.cd-type-stat-btn');
+                if (!btn) return;
+
+                // 点击格式标签
+                var ext = btn.getAttribute('data-ext');
+                if (ext) {
+                    if (that._assetsExtFilter === ext) {
+                        that._assetsExtFilter = null;
+                    } else {
+                        that._assetsExtFilter = ext;
+                    }
+                    that._updateAssetsFilterOptions();
+                    that._renderAssetsTree();
+                    return;
+                }
+
+                // 点击大文件标签
+                var isBig = btn.getAttribute('data-big');
+                if (isBig) {
+                    var BIG_THRESHOLD = that._bigFileThreshold;
+                    if (that._assetsSizeFilter > 0) {
+                        that._assetsSizeFilter = 0;
+                    } else {
+                        that._assetsSizeFilter = BIG_THRESHOLD;
+                    }
+                    that._updateAssetsFilterOptions();
+                    that._renderAssetsTree();
+                    return;
+                }
+
+                // 点击类型图标
+                var type = btn.getAttribute('data-type');
+                if (that._assetsFilter === type) {
+                    that._assetsFilter = 'all';
+                    that._assetsExtFilter = null;
+                } else {
+                    that._assetsFilter = type;
+                    that._assetsExtFilter = null;
+                }
+                if (filterSelect) filterSelect.value = that._assetsFilter;
+                that._updateAssetsFilterOptions();
+                that._renderAssetsTree();
+            });
+        }
+
+        // 搜索
+        var searchInput = document.getElementById('cd-assets-search');
+        var searchClear = document.getElementById('cd-assets-search-clear');
+        if (searchInput) {
+            searchInput.addEventListener('input', function() {
+                var q = this.value.trim();
+                that._assetsSearch = q;
+                if (searchClear) searchClear.style.display = q ? 'block' : 'none';
+                that._renderAssetsTree();
+            });
+        }
+        if (searchClear) {
+            searchClear.addEventListener('click', function() {
+                if (searchInput) {
+                    searchInput.value = '';
+                    that._assetsSearch = '';
+                    searchClear.style.display = 'none';
+                    that._renderAssetsTree();
+                }
+            });
+        }
+
+        // 展开/折叠全部按钮
+        var expandToggleBtn = document.getElementById('cd-assets-expand-toggle');
+        if (expandToggleBtn) {
+            expandToggleBtn.addEventListener('click', function() {
+                if (!that._assetsTree || that._assetsTree.length === 0) return;
+                var expanded = that._assetsExpanded;
+                // 收集所有已展开的 doc key
+                var expandedDocs = [];
+                function collectDocs(node) {
+                    if (node.type === 'doc' && expanded.has('doc:' + node.id)) {
+                        expandedDocs.push('doc:' + node.id);
+                    }
+                    if (node.children) node.children.forEach(collectDocs);
+                }
+                that._assetsTree.forEach(function(nb) {
+                    collectDocs(nb);
+                    nb.children.forEach(collectDocs);
+                });
+                // 按深度折叠：先折叠 doc，再折叠 nb，全部折叠后全部展开
+                if (expandedDocs.length > 0) {
+                    // 折叠所有 doc
+                    expandedDocs.forEach(function(k) { expanded.delete(k); });
+                } else {
+                    // 检查是否有 nb 展开
+                    var expandedNbs = that._assetsTree.filter(function(nb) {
+                        return expanded.has('nb:' + nb.id);
+                    });
+                    if (expandedNbs.length > 0) {
+                        // 折叠所有 nb
+                        that._assetsTree.forEach(function(nb) {
+                            expanded.delete('nb:' + nb.id);
+                        });
+                    } else {
+                        // 全部展开（nb + doc）
+                        that._assetsTree.forEach(function(nb) {
+                            expanded.add('nb:' + nb.id);
+                            nb.children.forEach(function(c) {
+                                expanded.add('doc:' + c.id);
+                            });
+                        });
+                    }
+                }
+                that._renderAssetsTree();
+            });
+        }
+
+        // 视图切换按钮
+        var viewToggleBtn = document.getElementById('cd-assets-view-toggle');
+        if (viewToggleBtn) {
+            viewToggleBtn.textContent = that._assetsCurrentView === 'icon' ? '⊞' : '☰';
+            viewToggleBtn.title = that._assetsCurrentView === 'icon' ? '切换为列表视图' : '切换为图标视图';
+            viewToggleBtn.addEventListener('click', function() {
+                that._assetsCurrentView = (that._assetsCurrentView === 'list') ? 'icon' : 'list';
+                this.textContent = that._assetsCurrentView === 'icon' ? '⊞' : '☰';
+                this.title = that._assetsCurrentView === 'icon' ? '切换为列表视图' : '切换为图标视图';
+                that._renderAssetsTree();
+            });
+        }
+
+        // 排序按钮
+        var sortBtn = document.getElementById('cd-assets-sort-btn');
+        if (sortBtn) {
+            that._updateAssetsSortBtn(sortBtn);
+            sortBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._showAssetsSortMenu(this);
+            });
+        }
+    }
+
+    /**
+     * 资源单击 - 预览图片
+     */
+    _onAssetClick(name, e) {
+        var that = this;
+        var asset = that._assetsFileMap && that._assetsFileMap[name];
+        if (!asset) return;
+
+        if (asset.type === 'image') {
+            // 预览图片
+            var preview = document.getElementById('cd-image-preview');
+            var img = document.getElementById('cd-preview-img');
+            var nameEl = document.getElementById('cd-preview-name');
+            if (preview && img) {
+                img.src = '/assets/' + encodeURIComponent(name);
+                if (nameEl) nameEl.textContent = name;
+                preview.style.display = 'block';
+                if (e && e.clientX !== undefined) {
+                    preview.style.left = (e.clientX + 20) + 'px';
+                    preview.style.top = (e.clientY - 100) + 'px';
+                }
+                // 3秒后自动隐藏
+                setTimeout(function() {
+                    preview.style.display = 'none';
+                }, 3000);
+            }
+        } else if (asset.type === 'audio') {
+            // 播放内部音频资源
+            var dataDir = '';
+            try {
+                if (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) {
+                    dataDir = window.siyuan.config.system.dataDir;
+                }
+            } catch (e) {}
+            if (dataDir) {
+                var sep = that._sep || (that.isWindows ? '\\' : '/');
+                var assetPath = dataDir + sep + 'assets' + sep + name.replace(/\//g, sep);
+                that.playAudio(assetPath, name);
+            }
+        }
+    }
+
+    /**
+     * 资源双击 - 打开引用文档
+     */
+    async _onAssetDblClick(name) {
+        var that = this;
+        try {
+            // 优先使用缓存中的 block_id 精确定位
+            var blockId = that._assetBlockMap && that._assetBlockMap[name];
+            if (blockId) {
+                window.open('siyuan://blocks/' + blockId);
+                return;
+            }
+
+            that.showToastMsg('正在查找引用文档...');
+
+            // 渠道A回退：查 assets 表获取 block_id
+            var escapedName = name.replace(/'/g, "''").replace(/\\/g, "\\\\");
+            var resp = await fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: "SELECT b.id AS block_id, b.root_id FROM assets AS a JOIN blocks AS b ON a.block_id = b.id WHERE a.name = '" + escapedName + "' OR a.name = 'assets/" + escapedName + "' LIMIT 1" }),
+                credentials: 'include'
+            });
+            var data = await resp.json();
+            if (data.code === 0 && data.data && data.data.length > 0) {
+                var row = data.data[0];
+                if (row.block_id) {
+                    window.open('siyuan://blocks/' + row.block_id);
+                } else if (row.root_id) {
+                    window.open('siyuan://blocks/' + row.root_id);
+                }
+                return;
+            }
+
+            // 渠道B回退：查 blocks 内容包含文件名
+            var bn = name.split('/').pop().replace(/'/g, "''").replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+            var resp2 = await fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: "SELECT id, root_id FROM blocks WHERE content LIKE '%" + bn + "%' AND type != 'd' LIMIT 1" }),
+                credentials: 'include'
+            });
+            var data2 = await resp2.json();
+            if (data2.code === 0 && data2.data && data2.data.length > 0) {
+                var blockRow = data2.data[0];
+                if (blockRow.id) {
+                    window.open('siyuan://blocks/' + blockRow.id);
+                } else if (blockRow.root_id) {
+                    window.open('siyuan://blocks/' + blockRow.root_id);
+                }
+                return;
+            }
+
+            that.showToastMsg('该资源未被任何文档引用');
+        } catch (e) {
+            that._error('_onAssetDblClick error:', e);
+        }
+    }
+
+    /**
+     * 资源右键菜单
+     */
+    _showAssetContextMenu(name, e) {
+        var that = this;
+        var menu = document.getElementById('cd-context-menu');
+        if (!menu) return;
+
+        var items = [
+            { label: '📋 打开文件', action: function() {
+                var dataDir = '';
+                try {
+                    if (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) {
+                        dataDir = window.siyuan.config.system.dataDir;
+                    }
+                } catch (e) {}
+                if (dataDir) {
+                    var asset = that._assetsFileMap && that._assetsFileMap[name];
+                    var relName = asset && asset.relPath ? asset.relPath : name;
+                    var fullPath;
+                    try {
+                        var path = require('path');
+                        fullPath = path.join(dataDir, 'assets', relName);
+                    } catch (e) {
+                        var sep = that._sep || '\\';
+                        fullPath = dataDir.replace(/[\/\\]+$/, '') + sep + 'assets' + sep + relName;
+                    }
+                    that._openAssetFile(fullPath);
+                } else {
+                    that.showToastMsg('无法获取 assets 路径');
+                }
+            } },
+            { label: '📂 打开文件位置', action: function() {
+                var dataDir = '';
+                try {
+                    if (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) {
+                        dataDir = window.siyuan.config.system.dataDir;
+                    }
+                } catch (e) {}
+                if (dataDir) {
+                    var asset = that._assetsFileMap && that._assetsFileMap[name];
+                    var relName = asset && asset.relPath ? asset.relPath : name;
+                    var fullPath;
+                    try {
+                        var path = require('path');
+                        fullPath = path.join(dataDir, 'assets', relName);
+                    } catch (e) {
+                        // path 模块不可用时手动拼接
+                        var sep = that._sep || '\\';
+                        fullPath = dataDir.replace(/[\/\\]+$/, '') + sep + 'assets' + sep + relName;
+                    }
+                    console.log('[localbrowse] openContainingFolder path:', fullPath);
+                    that.openContainingFolder(fullPath);
+                } else {
+                    that.showToastMsg('无法获取 assets 路径');
+                }
+            } },
+            { label: '📄 打开引用文档', action: function() { that._onAssetDblClick(name); } },
+            { label: '🗑️ 删除', action: function() { that._deleteAsset(name); }, danger: true }
+        ];
+
+        menu.innerHTML = '';
+        items.forEach(function(item) {
+            var div = document.createElement('div');
+            div.style.cssText = 'padding:6px 16px;cursor:pointer;font-size:13px;white-space:nowrap;color:' + (item.danger ? 'var(--b3-theme-error,#d32f2f)' : 'var(--b3-theme-on-background,#333)');
+            div.textContent = item.label;
+            div.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+            div.addEventListener('mouseleave', function() { this.style.background = ''; });
+            div.addEventListener('click', function() {
+                menu.style.display = 'none';
+                item.action();
+            });
+            menu.appendChild(div);
+        });
+
+        menu.style.display = 'block';
+        menu.style.left = e.clientX + 'px';
+        menu.style.top = e.clientY + 'px';
+
+        // 点击外部关闭
+        var closeMenu = function() {
+            menu.style.display = 'none';
+            document.removeEventListener('click', closeMenu);
+        };
+        setTimeout(function() {
+            document.addEventListener('click', closeMenu, { once: true });
+        }, 10);
+    }
+
+    /**
+     * 删除单个资源
+     */
+    async _deleteAsset(name) {
+        var that = this;
+        if (!confirm('确定要删除资源 "' + name + '" 吗？\n此操作不可恢复！')) return;
+
+        var assetsPath = that._getAssetsPath();
+        if (!assetsPath) {
+            that.showToastMsg('无法获取 assets 路径');
+            return;
+        }
+
+        try {
+            var resp = await fetch('/api/file/removeFile', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ path: assetsPath + name }),
+                credentials: 'include'
+            });
+            var data = await resp.json();
+            if (data.code === 0) {
+                that.showToastMsg('已删除: ' + name);
+                // 从文件映射中移除
+                if (that._assetsFileMap && that._assetsFileMap[name]) {
+                    delete that._assetsFileMap[name];
+                }
+                // 重新加载树以更新显示
+                that._assetsLoaded = false;
+                that._loadAssets();
+            } else {
+                that.showToastMsg('删除失败: ' + (data.msg || '未知错误'));
+            }
+        } catch (e) {
+            that._error('_deleteAsset error:', e);
+            that.showToastMsg('删除失败: ' + (e.message || e));
+        }
+    }
+
 }
 
 module.exports = LocalBrowsePlugin;

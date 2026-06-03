@@ -1,13 +1,13 @@
 {
   "name": "siyuan-plugin-localbrowse",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "displayName": {
     "default": "LocalBrowse",
     "zh_CN": "本地文件浏览器"
   },
   "description": {
-    "default": "After inserting local file links, this plugin supports: auto-fix broken links when files move, cross-platform and cross-device sync, all data stored locally - no cloud, no upload",
-    "zh_CN": "插入本地链接后，本插件支持：本地文件挪动位置后，支持失效链接自动修复，并且支持跨平台，跨设备同步，所有数据均保存在本地，无离线，不笔记。"
+    "default": "Local file browser: browse disk files and internal assets, insert links with one click, auto-repair broken links when files move, cross-device sync — no cloud upload needed",
+    "zh_CN": "本地文件浏览器：浏览磁盘文件与内部资源、一键插入链接、文件移动后自动修复失效链接、跨设备同步，无需上传云端。"
   },
   "author": "sqalei",
   "minAppVersion": "3.0.0",
