@@ -1,3 +1,18 @@
+## v0.8.1
+
+### 🐛 Bug 修复
+
+- **修复深度搜索结果中文件大小和修改时间缺失的问题**：`var item` 闭包变量在 for 循环中被共享，导致除每个目录最后一个匹配文件外，其他文件的 size/mtime 均为 undefined
+- **修复 Dock 面板长时间闲置后重建时图标视图崩溃的问题**：`_boundIconScroll` 在 destroy 时被设为 null，重建后 `addEventListener('scroll', null)` 抛出 TypeError
+- **修复列表视图下图片预览不显示文件大小和修改时间的问题**：查找文件信息时仅检查 `iconRenderState`，列表视图下该对象为 null
+- **修复启动时重复加载目录的问题**：路径恢复逻辑引用不存在的 `#cd-path` 元素，导致 `loadPathSettings` 异步回调始终触发多余的 `loadDirectory`（引入 `_lastRenderedPath` 追踪实际渲染路径）
+- **修复启动时滚动位置保存到错误路径的问题**：`_navigateToSyncRootOnLoad` 在 `loadDirectory` 前手动设置 `this.currentPath`，导致滚动位置被保存到错误的路径键下
+
+### ⚡ 性能优化
+
+- **优化启动加载：记住上次关闭时的目录**：打开插件时优先恢复上次浏览的目录，而非每次都导航到同步文件夹根目录
+- **减少启动时多余的目录加载**：路径恢复判断改用 `_lastRenderedPath` 和 `_pathRestoredFromSettings` 标志，避免异步竞态导致的重复 `loadDirectory` 调用
+
 ## v0.8.0
 
 ### ✨ 新功能
