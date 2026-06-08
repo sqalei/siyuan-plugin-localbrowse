@@ -389,3 +389,29 @@
         background: rgba(66, 133, 244, 0.15);
     }
 }
+
+/* ==================== Favorite Tree Panel ==================== */
+#cd-fav-tree-wrap {
+    flex-direction: column;
+}
+
+#cd-fav-tree {
+    scrollbar-width: thin;
+}
+
+#cd-fav-tree::-webkit-scrollbar {
+    width: 5px;
+}
+
+#cd-fav-tree::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+#cd-fav-tree::-webkit-scrollbar-thumb {
+    background: var(--b3-border, #ccc);
+    border-radius: 3px;
+}
+
+#cd-fav-tree::-webkit-scrollbar-thumb:hover {
+    background: var(--b3-theme-secondary, #999);
+}

@@ -39,6 +39,8 @@ class LocalBrowsePlugin extends Plugin {
         this.currentPath = '';
         this._pathRestoredFromSettings = false;  // loadPathSettings 是否成功恢复了上次路径（区分用户保存路径 vs 回退根路径）
         this._lastRenderedPath = '';  // 最后一次 loadDirectory 成功渲染的路径（用于判断是否需要重新导航）
+        this._savedEditorRange = null;  // 右键菜单弹出前保存的编辑器选区（用于在表格等场景恢复光标位置）
+        this._savedFocusBlockId = null;  // 右键菜单弹出前保存的光标所在块 ID（用于 API 方式插入）
         this.driveLetter = this.isWindows ? 'C' : '/';  // Windows: 盘符字母; macOS/Linux: 根路径或卷路径
         this.workspacePath = '';
         this.assetsPath = '';
@@ -47,7 +49,27 @@ class LocalBrowsePlugin extends Plugin {
         this.isDeepSearchMode = false; // 是否处于深度搜索模式
         this.preSearchPath = '';    // 深度搜索前所在的目录，用于返回
         this.availableDrives = [];  // 可用存储列表 [{value, label}]
-        this.favorites = [];        // 收藏的文件夹列表 [{path, name}]
+        this.favorites = [];        // 收藏的文件夹列表 [{path, name, groupId, pinToTop}]
+        this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }]; // 收藏分组（v2格式）
+        this._favSidebarVisible = false; // 收藏夹侧边栏是否显示（Step 2 新增）
+        this._favMenuOpen = false;      // 收藏树右键菜单是否打开（Step 3 修复）
+        this._favEditing = false;       // 收藏树是否正在编辑（Step 3 修复）
+        this._favKeepOpenUntil = 0;     // 收藏树面板保持打开到该时间戳（Step 3 修复）
+        this._favDragging = false;      // 是否正在拖拽收藏项（Step 3 拖拽修复）
+        this._dragGroupId = null;       // 正在拖拽的分组ID（分组排序用）
+        this._recentFolders = [];       // 最近访问的文件夹列表（最近访问快捷入口）
+        this._openSettings = {
+            folderOpenMode: 'localbrowser', // 文件夹打开方式（localbrowser=插件内打开, system=系统默认打开）
+            fileOpenMode: {                // 文件分类打开方式
+                document: 'siyuan',         // 文档类：pdf/doc/xls/ppt/txt 等（siyuan=思源笔记打开）
+                image: 'localbrowser',      // 图片类：jpg/png/gif/svg 等
+                media: 'siyuan',            // 音视频类：mp4/mp3/avi 等（siyuan=思源笔记打开）
+                code: 'localbrowser',       // 代码文本类：js/py/html/md/json 等
+                other: 'system'             // 其他未分类文件
+            },
+            extensionRules: {}             // 扩展名例外规则：{ '.pdf': 'system', '.png': 'localbrowser' }
+        };
+        this._lastOpenedFile = { path: '', time: 0 }; // system 模式打开文件时的去重标记
         this.fileDocMap = {};       // 文件路径 → 文档ID 映射（关联当前文档功能）
         this._selectedItems = [];   // 多选：当前选中的文件项 DOM 元素列表
         this._lastClickedItem = null; // 多选：上次点击的文件项，用于 Shift 范围选择
@@ -187,11 +209,40 @@ class LocalBrowsePlugin extends Plugin {
         this.loadSortSettings();
         this.loadDriveSettings();
         this.loadViewSettings();
+        this._loadOpenSettings();
         this.loadPathSettings();
         this.loadPathMap();
         this.loadSyncRoots();
         this.registerDock();
         this.registerEditorDropHandler();
+
+        // 监听全局 mousedown（捕获阶段），在焦点离开编辑器前保存选区
+        // 解决右键 dock 面板时焦点转移导致编辑器选区丢失的问题（表格等场景）
+        var that = this;
+        this._saveSelectionOnMouseDown = function(e) {
+            // 如果点击目标在编辑器内，不保存（编辑器自己会处理）
+            var inEditor = e.target && e.target.closest && e.target.closest('.protyle-wysiwyg');
+            if (inEditor) return;
+
+            // 点击在编辑器外：保存当前编辑器选区（如果存在）
+            try {
+                var sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) {
+                    var range = sel.getRangeAt(0);
+                    var container = range.commonAncestorContainer;
+                    var el = container && container.nodeType === 1 ? container : (container ? container.parentElement : null);
+                    if (el) {
+                        var wysiwyg = el.closest ? el.closest('.protyle-wysiwyg') : null;
+                        if (wysiwyg) {
+                            that._savedEditorRange = range.cloneRange();
+                            that._savedFocusBlockId = that.getFocusBlockId();
+                            that._log('_saveSelectionOnMouseDown: saved selection in editor, blockId=' + that._savedFocusBlockId);
+                        }
+                    }
+                }
+            } catch (err) {}
+        };
+        document.addEventListener('mousedown', this._saveSelectionOnMouseDown, true);
 
         // 链接指示灯初始化 + 自动检测
         var that = this;
@@ -249,6 +300,11 @@ class LocalBrowsePlugin extends Plugin {
         if (this._scrollEndTimer) {
             clearTimeout(this._scrollEndTimer);
             this._scrollEndTimer = null;
+        }
+        // 清理 mousedown 捕获监听器（保存编辑器选区）
+        if (this._saveSelectionOnMouseDown) {
+            document.removeEventListener('mousedown', this._saveSelectionOnMouseDown, true);
+            this._saveSelectionOnMouseDown = null;
         }
         // 清理图标渲染状态
         this.iconRenderState = null;
@@ -520,13 +576,18 @@ class LocalBrowsePlugin extends Plugin {
                 '<button class="cd-tab-btn' + (activeTab === 'assets' ? ' cd-tab-active' : '') + '" data-tab="assets" style="padding:6px 12px;font-size:12px;background:transparent;border:none;border-bottom:2px solid ' + (activeTab === 'assets' ? 'var(--b3-theme-primary,#4285f4)' : 'transparent') + ';color:' + (activeTab === 'assets' ? 'var(--b3-theme-primary,#4285f4)' : 'var(--b3-theme-secondary,#999)') + ';cursor:pointer;transition:all 0.2s;flex-shrink:0">📦 内部资源</button>' +
             '</div>' +
             // === 本地文件面板 ===
-            '<div id="cd-panel-local" style="display:' + (activeTab === 'local' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden">' +
+            '<div id="cd-panel-local" style="display:' + (activeTab === 'local' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden;position:relative">' +
                 '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px;height:28px">' +
                     '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
                     '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
+                    '<button id="cd-fav-tree-toggle" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;display:flex;align-items:center;justify-content:center" title="展开/收起收藏夹" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><polygon points="12 7 14 12 19 12.5 15.5 16 16.5 20.5 12 18 7.5 20.5 8.5 16 5 12.5 10 12" fill="currentColor"/></svg></button>' +
                     '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
                     '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
                     '<button id="cd-relink-btn" style="padding:4px 8px;font-size:14px;background:transparent;border:none;cursor:pointer;flex-shrink:0;opacity:0.6;transition:opacity 0.2s" title="点击修复失效链接" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">🔘</button>' +
+                '</div>' +
+                // === 收藏树悬浮面板 ===
+                '<div id="cd-fav-tree-wrap" style="display:none;position:absolute;top:30px;left:4px;right:4px;z-index:10;max-height:250px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,0.15);overflow:hidden;flex-direction:column">' +
+                    '<div id="cd-fav-tree" style="padding:2px 0;overflow-y:auto;flex:1;min-height:0"></div>' +
                 '</div>' +
                 '<div id="cd-syncroot-inline" style="margin-bottom:2px;padding:6px 8px;background:var(--b3-theme-surface,#f0f0f0);border-radius:4px;display:none;flex-shrink:0">' +
                     '<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">' +
@@ -553,10 +614,10 @@ class LocalBrowsePlugin extends Plugin {
                 '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
                     '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
                 '</div>' +
-                '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
-                    '<span id="cd-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📊 加载中...</span>' +
-                    '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
-                '</div>' +
+                    '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
+                        '<span id="cd-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">📊 加载中...</span>' +
+                        '<span id="cd-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
+                    '</div>' +
             '</div>' +
             // === 内部资源面板 ===
             '<div id="cd-panel-assets" style="display:' + (activeTab === 'assets' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden">' +
@@ -795,6 +856,120 @@ class LocalBrowsePlugin extends Plugin {
                     that.doRender(sorted, that.cachedPath, '', that.isDeepSearchMode);
                 } else {
                     that.loadDirectory(that.currentPath || that.getRootPath());
+                }
+            });
+        }
+
+        // 绑定收藏树展开/收起按钮：鼠标悬浮自动展开
+        var favTreeToggleBtn = el.querySelector('#cd-fav-tree-toggle');
+        var favTreeWrap = el.querySelector('#cd-fav-tree-wrap');
+        if (favTreeToggleBtn && favTreeWrap) {
+            favTreeToggleBtn.addEventListener('mouseenter', function() {
+                if (favTreeWrap.style.display === 'none') {
+                    favTreeWrap.style.display = 'flex';
+                    that._favSidebarVisible = true;
+                    that.renderFavTree();
+                }
+            });
+        }
+        // 鼠标离开收藏树面板后自动收起（但菜单打开、正在编辑或刚操作完时不收起）
+        if (favTreeWrap) {
+            favTreeWrap.addEventListener('mouseleave', function() {
+                if (that._favSidebarVisible && !that._favMenuOpen && !that._favEditing && !that._favDragging && Date.now() > that._favKeepOpenUntil) {
+                    favTreeWrap.style.display = 'none';
+                    that._favSidebarVisible = false;
+                }
+            });
+        }
+
+        // 在 favTreeWrap 容器上绑定全局拖拽接收（事件委托，只绑定一次）
+        // 绑定在 wrap 而非 tree 上，确保鼠标在面板任意位置都能触发
+        if (favTreeWrap) {
+            favTreeWrap.addEventListener('dragover', function(e) {
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                var tree = document.getElementById('cd-fav-tree');
+                var header = e.target.closest ? e.target.closest('.cd-fav-group-header') : null;
+                if (tree) {
+                    var allHeaders = tree.querySelectorAll('.cd-fav-group-header');
+                    for (var h = 0; h < allHeaders.length; h++) {
+                        allHeaders[h].style.background = '';
+                        allHeaders[h].style.border = '';
+                    }
+                }
+                if (header) {
+                    header.style.background = 'var(--b3-theme-primary-light,rgba(66,133,244,0.15))';
+                    header.style.border = '1px dashed var(--b3-theme-primary,#4285f4)';
+                }
+                that._favKeepOpenUntil = Date.now() + 2000;
+            });
+            favTreeWrap.addEventListener('dragleave', function(e) {
+                if (favTreeWrap.contains(e.relatedTarget)) return;
+                var tree = document.getElementById('cd-fav-tree');
+                if (tree) {
+                    var allHeaders = tree.querySelectorAll('.cd-fav-group-header');
+                    for (var h = 0; h < allHeaders.length; h++) {
+                        allHeaders[h].style.background = '';
+                        allHeaders[h].style.border = '';
+                    }
+                }
+            });
+            favTreeWrap.addEventListener('drop', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                var tree = document.getElementById('cd-fav-tree');
+                if (tree) {
+                    var allHeaders = tree.querySelectorAll('.cd-fav-group-header');
+                    for (var h = 0; h < allHeaders.length; h++) {
+                        allHeaders[h].style.background = '';
+                        allHeaders[h].style.border = '';
+                    }
+                }
+                var header = e.target.closest ? e.target.closest('.cd-fav-group-header') : null;
+                var groupId = header ? header.dataset.groupId : null;
+                // 如果 drop 在收藏项上，通过收藏项的 data-group-id 获取目标分组
+                if (!groupId) {
+                    var favEl = e.target.closest ? e.target.closest('[data-fav-path]') : null;
+                    if (favEl) {
+                        groupId = favEl.dataset.groupId;
+                    }
+                }
+
+                // 优先处理分组排序（拖拽分组头部）
+                if (that._dragGroupId && groupId && that._dragGroupId !== groupId) {
+                    var srcIdx = -1, tgtIdx = -1;
+                    for (var gi = 0; gi < that.favoriteGroups.length; gi++) {
+                        if (that.favoriteGroups[gi].id === that._dragGroupId) srcIdx = gi;
+                        if (that.favoriteGroups[gi].id === groupId) tgtIdx = gi;
+                    }
+                    if (srcIdx !== -1 && tgtIdx !== -1 && srcIdx !== tgtIdx) {
+                        var movedGroup = that.favoriteGroups.splice(srcIdx, 1)[0];
+                        that.favoriteGroups.splice(tgtIdx, 0, movedGroup);
+                        // 重新分配 order
+                        for (var oi = 0; oi < that.favoriteGroups.length; oi++) {
+                            that.favoriteGroups[oi].order = oi;
+                        }
+                        that.saveFavorites();
+                        that.renderFavorites();
+                    }
+                    that._dragGroupId = null;
+                    return;
+                }
+
+                // 处理收藏项移动到分组
+                var favPath = e.dataTransfer.getData('text/plain') || that._dragFavPath;
+                if (!favPath || !groupId) return;
+                var moved = false;
+                for (var fi = 0; fi < that.favorites.length; fi++) {
+                    if (that.favorites[fi].path === favPath) {
+                        that.favorites[fi].groupId = groupId;
+                        moved = true;
+                        break;
+                    }
+                }
+                if (moved) {
+                    that.saveFavorites();
+                    that.renderFavorites();
                 }
             });
         }
@@ -1068,6 +1243,43 @@ class LocalBrowsePlugin extends Plugin {
         this.currentPath = dirPath;
         this._lastRenderedPath = dirPath;
         this.savePathSettings();
+
+        // 记录最近访问的收藏文件夹（排除根目录，只记录已收藏的）
+        // 使用宽松匹配：忽略大小写和尾部反斜杠差异
+        var isFavPath = false;
+        var favItem = null;
+        if (dirPath && dirPath !== this.getRootPath() && dirPath !== '/') {
+            var normDir = dirPath.replace(/\\+$/, '').toLowerCase();
+            for (var fi = 0; fi < this.favorites.length; fi++) {
+                var normFav = this.favorites[fi].path.replace(/\\+$/, '').toLowerCase();
+                if (normFav === normDir) {
+                    isFavPath = true;
+                    favItem = this.favorites[fi];
+                    break;
+                }
+            }
+        }
+        if (isFavPath && favItem) {
+            // 去重：如果已存在则移到最前
+            var existingIdx = -1;
+            for (var ri = 0; ri < this._recentFolders.length; ri++) {
+                if (this._recentFolders[ri].path === favItem.path) {
+                    existingIdx = ri;
+                    break;
+                }
+            }
+            if (existingIdx !== -1) {
+                this._recentFolders.splice(existingIdx, 1);
+            }
+            this._recentFolders.unshift({ path: favItem.path, name: favItem.name });
+            // 最多保留 5 个
+            if (this._recentFolders.length > 5) {
+                this._recentFolders.length = 5;
+            }
+            // 刷新顶部快捷栏显示并持久化
+            this.renderFavorites();
+            this.saveFavorites();
+        }
 
         // 清理旧的渲染状态
         this.listRenderState = null;
@@ -2154,13 +2366,32 @@ class LocalBrowsePlugin extends Plugin {
             fileListEl.style.padding = '8px';
             fileListEl.style.alignItems = 'start';
 
+            // 预检测当前目录封面图（供音频文件缩略图使用）
+            var dirCoverPath = null;
+            try {
+                var fs = require('fs');
+                var path = require('path');
+                var coverNames = ['cover.jpg', 'cover.png', 'cover.jpeg', 'cover.webp',
+                    'folder.jpg', 'folder.png', 'folder.jpeg', 'folder.webp',
+                    'album.jpg', 'album.png', 'album.jpeg', 'album.webp',
+                    'front.jpg', 'front.png', 'front.jpeg', 'front.webp'];
+                for (var ci = 0; ci < coverNames.length; ci++) {
+                    var cp = path.join(currentPath, coverNames[ci]);
+                    if (fs.existsSync(cp)) {
+                        dirCoverPath = cp;
+                        break;
+                    }
+                }
+            } catch (e) {}
+
             // 保存状态用于滚动渲染
             that.iconRenderState = {
                 files: files,
                 currentPath: currentPath,
                 batchSize: 60,  // 每批渲染数量（图标较小，加大批量减少卡顿）
                 renderedCount: 0,
-                isLoading: false
+                isLoading: false,
+                dirCoverPath: dirCoverPath
             };
 
             // 初始渲染第一批
@@ -2730,8 +2961,22 @@ class LocalBrowsePlugin extends Plugin {
                     '</div>';
             }
         } else {
-            var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
-            iconHtml = '<span style="font-size:36px;line-height:1;display:block">' + icon + '</span>';
+            var isAudio = !f.isDir && that.isAudioFile(f.name);
+            var state = that.iconRenderState;
+            if (isAudio && state && state.dirCoverPath) {
+                // 音频文件：使用目录级封面图
+                iconHtml = '<div class="cd-thumb-wrap" data-src="' + that.escapeHtml(that.toFileUrl(state.dirCoverPath)) + '" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                    '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🎵</span>' +
+                    '</div>';
+            } else if (isAudio) {
+                // 音频文件：无目录封面，尝试内嵌封面（异步加载）
+                iconHtml = '<div class="cd-thumb-wrap" data-audio-path="' + that.escapeHtml(fullPath) + '" style="width:56px;height:56px;border-radius:4px;background:var(--b3-theme-surface,#f0f0f0);overflow:hidden;position:relative;flex-shrink:0;display:flex;align-items:center;justify-content:center">' +
+                    '<span class="cd-thumb-placeholder" style="font-size:20px;color:var(--b3-theme-secondary,#999)">🎵</span>' +
+                    '</div>';
+            } else {
+                var icon = f.isDir ? '📁' : that.getFileIcon(f.name);
+                iconHtml = '<span style="font-size:36px;line-height:1;display:block">' + icon + '</span>';
+            }
         }
 
         // 图片文件名后追加文件大小
@@ -2905,7 +3150,7 @@ class LocalBrowsePlugin extends Plugin {
                     // 记录鼠标位置，用于预览图定位
                     that._previewMousePos = { x: e.clientX, y: e.clientY };
                     // 图标视图：大图悬浮时懒加载缩略图
-                    if (that.currentView === 'icon' && !isDir) {
+                    if (that.currentView === 'icon' && item.dataset.isdir !== 'true') {
                         var thumbWrap = item.querySelector('.cd-thumb-wrap[data-large="1"]:not([data-loaded])');
                         if (thumbWrap) {
                             that.loadLargeThumbnail(thumbWrap);
@@ -3694,7 +3939,9 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         // 获取光标所在块 ID，用于精确定位插入位置
-        var focusBlockId = that.getFocusBlockId();
+        // 优先使用右键菜单弹出前保存的 block ID（异步文件操作后 getFocusBlockId 返回 null）
+        var focusBlockId = that._savedFocusBlockId || that.getFocusBlockId();
+        that._savedFocusBlockId = null;
 
         // 思源视频块格式：Type=NodeVideo，Data 为 <video> 标签（含 data-src 属性）
         // 必须用 dataType:"markdown"，让思源自动把 <video> 标签转为 NodeVideo（含 Data 字段）
@@ -3952,12 +4199,106 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 通过思源 API 插入 Markdown 内容（用于表格等 DOM 方式不可靠的场景）
+     * 使用 /api/block/insertBlock 在指定块后面插入新块
+     * @param {string} markdown - 要插入的 Markdown 文本
+     * @param {string} focusBlockId - 光标所在块的 ID（previousID）
+     * @param {Function} callback - 可选回调，参数为 boolean 表示是否成功
+     */
+    _insertMarkdownViaAPI(markdown, focusBlockId, callback) {
+        var that = this;
+        var docId = that.getCurrentDocId();
+
+        var params = {
+            data: markdown,
+            dataType: 'markdown'
+        };
+
+        if (focusBlockId) {
+            params.previousID = focusBlockId;
+        } else if (docId) {
+            params.parentID = docId;
+        } else {
+            that._log('_insertMarkdownViaAPI: no focusBlockId or docId');
+            if (callback) callback(false);
+            return;
+        }
+
+        that._log('_insertMarkdownViaAPI: inserting with previousID=' + focusBlockId + ', parentID=' + (docId || ''));
+
+        fetch('/api/block/insertBlock', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(params),
+            credentials: 'include'
+        }).then(function(resp) {
+            return resp.json();
+        }).then(function(data) {
+            if (data.code === 0) {
+                that._log('_insertMarkdownViaAPI: success');
+                that._savedFocusBlockId = null;
+                if (callback) callback(true);
+            } else {
+                that._log('_insertMarkdownViaAPI: API error: ' + (data.msg || ''));
+                if (callback) callback(false);
+            }
+        }).catch(function(e) {
+            that._log('_insertMarkdownViaAPI: fetch error: ' + e);
+            if (callback) callback(false);
+        });
+    }
+
+    /**
      * 尝试插入到编辑器（带重试，解决首次启动时编辑器尚未就绪的问题）
      * @param {string} text - 要插入的文本
      * @param {Function} callback - 可选回调，参数为 boolean 表示是否成功
      * @returns {boolean} - 同步返回首次尝试结果
      */
     tryInsertToEditor(text, callback) {
+        var that = this;
+
+        // 检测保存的选区是否在表格单元格内（td/th）
+        // 表格单元格需要行内插入，API 的 insertBlock 会创建新块插到单元格外，破坏表格结构
+        var inTableCell = false;
+        if (that._savedEditorRange) {
+            try {
+                var container = that._savedEditorRange.commonAncestorContainer;
+                var el = container && container.nodeType === 1 ? container : (container ? container.parentElement : null);
+                if (el) {
+                    var cell = el.closest ? el.closest('td, th') : null;
+                    inTableCell = !!cell;
+                }
+            } catch (e) {}
+        }
+
+        // 表格单元格强制使用 DOM 方式（行内插入）
+        // 非表格场景优先使用 API（更可靠，不受焦点转移影响）
+        if (that._savedFocusBlockId && !inTableCell) {
+            var savedBlockId = that._savedFocusBlockId;
+            that._savedFocusBlockId = null;
+            that._savedEditorRange = null;
+            that._insertMarkdownViaAPI(text, savedBlockId, function(apiSuccess) {
+                if (apiSuccess) {
+                    if (callback) callback(true);
+                    return;
+                }
+                // API 失败，降级到 DOM 方式（此时 _savedEditorRange 已清空，走无保存选区的逻辑）
+                that._tryInsertToEditorDOM(text, callback);
+            });
+            return;
+        }
+
+        // 表格单元格 或 没有保存 block ID：使用 DOM 方式
+        // _savedEditorRange 在 _tryInsertToEditorDOM 成功后才清除，失败则保留给重试
+        that._tryInsertToEditorDOM(text, callback);
+    }
+
+    /**
+     * 通过 DOM 操作尝试插入到编辑器（带重试）
+     * @param {string} text - 要插入的文本
+     * @param {Function} callback - 可选回调，参数为 boolean 表示是否成功
+     */
+    _tryInsertToEditorDOM(text, callback) {
         var that = this;
 
         // 内部：执行单次插入尝试
@@ -3997,9 +4338,19 @@ class LocalBrowsePlugin extends Plugin {
                 }
                 if (!protyle) return false;
 
+                // 先聚焦编辑器，然后恢复保存的选区（解决表格等场景光标丢失问题）
                 protyle.focus();
                 var selection = window.getSelection();
-                if (!selection || selection.rangeCount === 0) return false;
+                if (!selection) return false;
+
+                // 恢复右键菜单弹出前保存的编辑器选区（如表格单元格内的光标位置）
+                if (that._savedEditorRange && protyle.contains(that._savedEditorRange.commonAncestorContainer)) {
+                    selection.removeAllRanges();
+                    selection.addRange(that._savedEditorRange);
+                    that._savedEditorRange = null;  // 只用一次
+                }
+
+                if (selection.rangeCount === 0) return false;
 
                 var range = selection.getRangeAt(0);
 
@@ -4627,6 +4978,30 @@ class LocalBrowsePlugin extends Plugin {
         var menuEl = document.getElementById('cd-context-menu');
         if (!menuEl) return;
 
+        // 保存当前编辑器选区（右键菜单弹出前，光标可能在表格单元格内）
+        // 菜单点击后焦点转移到 dock 面板，selection 丢失，需要保存以便恢复
+        // 注：mousedown 捕获阶段已抢先保存选区（_saveSelectionOnMouseDown），此处仅在未保存时补充
+        if (!this._savedEditorRange) {
+            this._savedFocusBlockId = null;
+            try {
+                var sel = window.getSelection();
+                if (sel && sel.rangeCount > 0) {
+                    var range = sel.getRangeAt(0);
+                    // 检查选区是否在编辑器内
+                    var rangeNode = range.commonAncestorContainer;
+                    var rangeEl = rangeNode && rangeNode.nodeType === 1 ? rangeNode : (rangeNode ? rangeNode.parentElement : null);
+                    if (rangeEl) {
+                        var wysiwyg = rangeEl.closest ? rangeEl.closest('.protyle-wysiwyg') : null;
+                        if (wysiwyg) {
+                            that._savedEditorRange = range.cloneRange();
+                            // 同时保存光标所在的 block ID，用于 API 方式插入
+                            that._savedFocusBlockId = that.getFocusBlockId();
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+
         // 先关闭可能已打开的菜单
         that.hideContextMenu();
 
@@ -4986,10 +5361,15 @@ class LocalBrowsePlugin extends Plugin {
             var cleanUrl = href.split('#')[0];
             var localPath = that.fileUrlToLocalPath(cleanUrl);
 
-            // 文件夹链接：在插件面板中打开，不弹出系统资源管理器
+            // 文件夹链接处理：根据设置决定打开方式
             if (localPath) {
                 try {
                     if (fs && fs.statSync(localPath).isDirectory()) {
+                        // 如果设置为「电脑默认程序打开」，则不拦截，让系统处理
+                        if (that._openSettings.folderOpenMode === 'system') {
+                            return;
+                        }
+                        // 默认「本地文件浏览器打开」：在插件面板中打开
                         e.preventDefault();
                         e.stopPropagation();
                         e.stopImmediatePropagation();
@@ -5005,11 +5385,38 @@ class LocalBrowsePlugin extends Plugin {
                     // 路径不存在或无法访问，继续走文件逻辑
                 }
 
-                // 文件链接：在插件面板中同步定位到该文件
+                // 文件链接：根据设置决定打开方式
+                var fileMode = that._getFileOpenMode(localPath);
+                if (fileMode === 'system') {
+                    // 明确阻止默认行为后，用系统默认程序打开
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    // 同步在插件面板中定位到该文件所在位置
+                    that.locateFileInPanel(localPath);
+                    // 500ms 内同一文件防重复打开（避免与思源默认处理器冲突导致双开）
+                    var now = Date.now();
+                    if (that._lastOpenedFile.path === localPath && now - that._lastOpenedFile.time < 500) {
+                        return;
+                    }
+                    that._lastOpenedFile = { path: localPath, time: now };
+                    that.openFile(localPath);
+                    return;
+                }
+                if (fileMode === 'siyuan') {
+                    // 思源笔记打开：同步在插件面板中定位，然后不拦截，让思源自己处理
+                    that.locateFileInPanel(localPath);
+                    return;
+                }
+                // 插件内打开：阻止默认行为，在插件面板中同步定位到该文件
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
                 that.locateFileInPanel(localPath);
+                return;
             }
 
-            // 检查是否包含指纹信息（URL fragment 或 title 属性）
+            // localPath 无法解析时，检查是否包含指纹信息（URL fragment 或 title 属性）
             var hasFragmentFingerprint = (href.indexOf('#size=') !== -1 || href.indexOf('#mtime=') !== -1);
             var titleAttr = linkInfo.linkEl.getAttribute('title') || '';
             var hasTitleFingerprint = (titleAttr.indexOf('size=') !== -1 || titleAttr.indexOf('mtime=') !== -1);
@@ -5325,6 +5732,91 @@ class LocalBrowsePlugin extends Plugin {
         var ext = fileName.split('.').pop().toLowerCase();
         var audioExts = {'mp3':1,'wav':1,'flac':1,'aac':1,'ogg':1,'wma':1,'m4a':1,'ape':1,'opus':1,'aiff':1,'alac':1};
         return !!audioExts[ext];
+    }
+
+    /**
+     * 从音频文件（MP3）的 ID3v2 标签中提取专辑封面图
+     * @param {string} filePath - 音频文件本地路径
+     * @returns {string|null} 封面图的 data URL，或 null
+     */
+    extractAudioCover(filePath) {
+        try {
+            var fs = require('fs');
+            var path = require('path');
+            var ext = path.extname(filePath).toLowerCase();
+            // 目前只支持 MP3 (ID3v2)
+            if (ext !== '.mp3') return null;
+            // 读取前 512KB（封面通常在前部）
+            var fd = fs.openSync(filePath, 'r');
+            var buffer = Buffer.alloc(512 * 1024);
+            var bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+            fs.closeSync(fd);
+            // 检查 ID3 标识
+            if (bytesRead < 10 || buffer[0] !== 0x49 || buffer[1] !== 0x44 || buffer[2] !== 0x33) {
+                return null;
+            }
+            var majorVersion = buffer[3];
+            var flags = buffer[5];
+            var hasExtendedHeader = (flags & 0x40) !== 0;
+            // 标签大小（同步安全整数）
+            var tagSize = ((buffer[6] & 0x7F) << 21) |
+                          ((buffer[7] & 0x7F) << 14) |
+                          ((buffer[8] & 0x7F) << 7) |
+                          (buffer[9] & 0x7F);
+            var pos = 10;
+            var endPos = Math.min(10 + tagSize, bytesRead);
+            // 跳过扩展头部
+            if (hasExtendedHeader) {
+                var extSize = buffer.readUInt32BE(pos);
+                pos += 4 + extSize;
+            }
+            // 遍历帧
+            while (pos + 10 < endPos) {
+                var frameId = buffer.toString('ascii', pos, pos + 4);
+                var frameSize;
+                if (majorVersion === 4) {
+                    // ID3v2.4: 同步安全整数
+                    frameSize = ((buffer[pos+4] & 0x7F) << 21) |
+                                ((buffer[pos+5] & 0x7F) << 14) |
+                                ((buffer[pos+6] & 0x7F) << 7) |
+                                (buffer[pos+7] & 0x7F);
+                } else {
+                    // ID3v2.3: 大端序
+                    frameSize = buffer.readUInt32BE(pos + 4);
+                }
+                pos += 10;
+                if (frameId === 'APIC') {
+                    // 解析 APIC 帧
+                    var encoding = buffer[pos];
+                    var mimeStart = pos + 1;
+                    var mimeEnd = mimeStart;
+                    while (mimeEnd < pos + frameSize && buffer[mimeEnd] !== 0) mimeEnd++;
+                    var mimeType = buffer.toString('ascii', mimeStart, mimeEnd);
+                    // 跳过图片类型 (1 byte)
+                    var descStart = mimeEnd + 2;
+                    var descEnd = descStart;
+                    if (encoding === 1) {
+                        // UTF-16，查找 00 00 终止
+                        while (descEnd + 1 < pos + frameSize && !(buffer[descEnd] === 0 && buffer[descEnd+1] === 0)) {
+                            descEnd += 2;
+                        }
+                        descEnd += 2;
+                    } else {
+                        while (descEnd < pos + frameSize && buffer[descEnd] !== 0) descEnd++;
+                        descEnd++;
+                    }
+                    var imgData = buffer.slice(descEnd, pos + frameSize);
+                    var base64 = imgData.toString('base64');
+                    return 'data:' + mimeType + ';base64,' + base64;
+                }
+                pos += frameSize;
+                // 安全：防止异常数据导致无限循环
+                if (frameSize <= 0 || frameSize > 10 * 1024 * 1024) break;
+            }
+        } catch (e) {
+            // 解析失败，静默返回 null
+        }
+        return null;
     }
 
     /**
@@ -6134,7 +6626,7 @@ class LocalBrowsePlugin extends Plugin {
                 names.push(items[j].dataset.name);
             }
             that._log('_doLocateFile: not found after retries, fileName=', fileName, 'items=', items.length, 'sample names=', names.join(', '));
-            that.showToastMsg('未在当前列表中找到该音频');
+            that.showToastMsg('未在当前列表中找到该文件');
             return;
         }
 
@@ -8723,6 +9215,262 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 加载文件夹打开方式设置
+     */
+    _loadOpenSettings() {
+        var that = this;
+        try {
+            var saved = localStorage.getItem('cd_open_settings');
+            if (saved) {
+                var data = JSON.parse(saved);
+                if (data) {
+                    if (data.folderOpenMode) {
+                        that._openSettings.folderOpenMode = data.folderOpenMode;
+                    }
+                    if (data.fileOpenMode) {
+                        var categories = ['document', 'image', 'media', 'code', 'other'];
+                        categories.forEach(function(cat) {
+                            if (data.fileOpenMode[cat]) {
+                                that._openSettings.fileOpenMode[cat] = data.fileOpenMode[cat];
+                            }
+                        });
+                    }
+                    if (data.extensionRules && typeof data.extensionRules === 'object') {
+                        that._openSettings.extensionRules = data.extensionRules;
+                    }
+                }
+            }
+        } catch (e) {
+            that._error('load open settings error:', e);
+        }
+    }
+
+    /**
+     * 保存文件夹打开方式设置
+     */
+    _saveOpenSettings() {
+        var that = this;
+        try {
+            localStorage.setItem('cd_open_settings', JSON.stringify(this._openSettings));
+        } catch (e) {
+            that._error('save open settings error:', e);
+        }
+    }
+
+    /**
+     * 文件扩展名 → 分类映射表
+     */
+    _getFileCategory(ext) {
+        ext = (ext || '').toLowerCase().replace(/^\./, '');
+        if (!ext) return 'other';
+        var map = {
+            document: ['pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt', 'rtf', 'odt', 'ods', 'odp', 'pages', 'numbers', 'key', 'epub', 'mobi', 'azw3', 'csv', 'tsv'],
+            image: ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'tiff', 'tif', 'ico', 'raw', 'heic', 'heif', 'avif', 'apng'],
+            media: ['mp4', 'avi', 'mov', 'mkv', 'flv', 'wmv', 'webm', 'm4v', 'mpg', 'mpeg', '3gp', 'ts', 'mp3', 'wav', 'flac', 'aac', 'ogg', 'wma', 'm4a', 'opus', 'wma', 'aiff'],
+            code: ['js', 'ts', 'jsx', 'tsx', 'py', 'java', 'cpp', 'c', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php', 'html', 'htm', 'css', 'scss', 'less', 'sass', 'styl', 'json', 'xml', 'yaml', 'yml', 'md', 'markdown', 'sql', 'sh', 'bash', 'bat', 'cmd', 'ps1', 'vue', 'svelte', 'dart', 'kt', 'swift', 'r', 'pl', 'lua', 'groovy', 'scala', 'elm', 'fs', 'fsx', 'clj', 'cljs', 'ex', 'exs', 'erl', 'hrl', 'elm', 'coffee', 'litcoffee', 'asm', 's', 'v', 'sv', 'vhd', 'vhdl', 'tex', 'latex', 'bib', 'dockerfile', 'makefile', 'cmake', 'gradle', 'ini', 'conf', 'cfg', 'properties', 'env', 'toml', 'lock', 'gitignore', 'npmignore', 'editorconfig']
+        };
+        for (var cat in map) {
+            if (map[cat].indexOf(ext) !== -1) return cat;
+        }
+        return 'other';
+    }
+
+    /**
+     * 根据文件路径判断打开方式
+     * @returns {string} 'localbrowser' | 'system' | 'siyuan'
+     */
+    _getFileOpenMode(filePath) {
+        if (!filePath) return 'system';
+        var ext = require('path').extname(filePath).toLowerCase();
+        // 优先查扩展名例外规则
+        if (ext && this._openSettings.extensionRules && this._openSettings.extensionRules[ext] !== undefined) {
+            return this._openSettings.extensionRules[ext];
+        }
+        // 再查分类设置
+        var category = this._getFileCategory(ext);
+        return this._openSettings.fileOpenMode[category] || 'system';
+    }
+
+    /**
+     * 创建设置面板的小节标题
+     */
+    _createSettingSectionTitle(text) {
+        var div = document.createElement('div');
+        div.style.cssText = 'font-size:13px;font-weight:600;margin:16px 0 8px 0;color:var(--b3-theme-on-background,#333);border-bottom:1px solid var(--b3-border,#eee);padding-bottom:4px';
+        div.textContent = text;
+        return div;
+    }
+
+    /**
+     * 创建设置下拉框行
+     */
+    _createSettingSelectRow(labelText, selectId, options, currentValue, onChange) {
+        var row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;gap:12px;margin-bottom:10px;flex-wrap:wrap';
+
+        var label = document.createElement('label');
+        label.style.cssText = 'font-weight:500;white-space:nowrap;width:76px;text-align:right';
+        label.textContent = labelText;
+        row.appendChild(label);
+
+        var select = document.createElement('select');
+        select.id = selectId;
+        select.style.cssText = 'padding:4px 8px;font-size:13px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;flex:1;min-width:160px';
+        options.forEach(function(opt) {
+            var option = document.createElement('option');
+            option.value = opt.value;
+            option.textContent = opt.text;
+            select.appendChild(option);
+        });
+        select.value = currentValue;
+        select.addEventListener('change', function() {
+            onChange(this.value);
+        });
+        row.appendChild(select);
+        return row;
+    }
+
+    /**
+     * 渲染扩展名例外规则表格到容器
+     */
+    _renderExtRules(container) {
+        var that = this;
+        container.innerHTML = '';
+        var rules = that._openSettings.extensionRules || {};
+        var exts = Object.keys(rules);
+        if (exts.length === 0) {
+            var empty = document.createElement('div');
+            empty.style.cssText = 'font-size:12px;color:var(--b3-theme-secondary,#999);padding:8px 0;text-align:center';
+            empty.textContent = '暂无例外规则';
+            container.appendChild(empty);
+            return;
+        }
+        // 表头
+        var header = document.createElement('div');
+        header.style.cssText = 'display:flex;gap:8px;padding:4px 8px;font-size:11px;color:var(--b3-theme-secondary,#999);border-bottom:1px solid var(--b3-border,#eee)';
+        header.innerHTML = '<span style="width:80px">扩展名</span><span style="flex:1">打开方式</span><span style="width:40px"></span>';
+        container.appendChild(header);
+        // 规则行
+        exts.forEach(function(ext) {
+            var mode = rules[ext];
+            var row = document.createElement('div');
+            row.style.cssText = 'display:flex;gap:8px;padding:6px 8px;align-items:center;font-size:13px;border-bottom:1px solid var(--b3-border,#f5f5f5)';
+            var modeText = mode === 'localbrowser' ? '在插件本地浏览器中打开' : (mode === 'siyuan' ? '思源笔记默认打开' : '使用电脑默认程序打开');
+            row.innerHTML = '<span style="width:80px;font-family:monospace">' + ext + '</span>' +
+                '<span style="flex:1">' + modeText + '</span>';
+            var delBtn = document.createElement('button');
+            delBtn.textContent = '删除';
+            delBtn.style.cssText = 'width:40px;padding:2px 0;font-size:11px;background:transparent;color:var(--b3-theme-error,#f56c6c);border:1px solid var(--b3-theme-error,#f56c6c);border-radius:3px;cursor:pointer';
+            delBtn.addEventListener('click', function() {
+                delete that._openSettings.extensionRules[ext];
+                that._saveOpenSettings();
+                that._renderExtRules(container);
+            });
+            row.appendChild(delBtn);
+            container.appendChild(row);
+        });
+    }
+
+    /**
+     * 打开插件设置面板
+     */
+    openSetting() {
+        var that = this;
+        // 创建设置面板容器
+        var settingPanel = document.createElement('div');
+        settingPanel.id = 'cd-setting-panel';
+        settingPanel.style.cssText = 'padding:16px;font-size:13px;color:var(--b3-theme-on-background,#333);max-width:520px;overflow-y:auto;max-height:70vh';
+
+        // 标题
+        var title = document.createElement('div');
+        title.style.cssText = 'font-size:15px;font-weight:600;margin-bottom:12px;color:var(--b3-theme-primary,#4285f4)';
+        title.textContent = '本地文件浏览器设置';
+        settingPanel.appendChild(title);
+
+        // === 文件夹打开方式 ===
+        settingPanel.appendChild(that._createSettingSectionTitle('📁 文件夹打开方式'));
+        var folderRow = that._createSettingSelectRow('打开方式', 'cd-folder-mode', [
+            { value: 'localbrowser', text: '插件默认' },
+            { value: 'system', text: '电脑默认' }
+        ], that._openSettings.folderOpenMode, function(val) {
+            that._openSettings.folderOpenMode = val;
+            that._saveOpenSettings();
+        });
+        settingPanel.appendChild(folderRow);
+        var folderDesc = document.createElement('div');
+        folderDesc.style.cssText = 'font-size:11px;color:var(--b3-theme-secondary,#999);margin:-4px 0 8px 0';
+        folderDesc.textContent = '设置点击文档中插入的文件夹链接时的默认打开方式';
+        settingPanel.appendChild(folderDesc);
+
+        // === 视频打开方式 ===
+        settingPanel.appendChild(that._createSettingSectionTitle('🎬 视频打开方式'));
+        var mediaRow = that._createSettingSelectRow('打开方式', 'cd-media-mode', [
+            { value: 'siyuan', text: '思源默认' },
+            { value: 'system', text: '电脑默认' }
+        ], that._openSettings.fileOpenMode.media, function(val) {
+            that._openSettings.fileOpenMode.media = val;
+            that._saveOpenSettings();
+        });
+        settingPanel.appendChild(mediaRow);
+        var mediaDesc = document.createElement('div');
+        mediaDesc.style.cssText = 'font-size:11px;color:var(--b3-theme-secondary,#999);margin:-4px 0 8px 0';
+        mediaDesc.textContent = '设置点击文档中插入的视频链接时的默认打开方式';
+        settingPanel.appendChild(mediaDesc);
+
+        // 使用思源 API 打开对话框
+        if (typeof siyuanApi.Dialog === 'function') {
+            var dialog = new siyuanApi.Dialog({
+                title: 'LocalBrowse 设置',
+                content: settingPanel.outerHTML,
+                width: '460px',
+                height: 'auto'
+            });
+            // 重新绑定所有事件（因为 outerHTML 重建了 DOM）
+            setTimeout(function() {
+                var dEl = dialog.element;
+                // 文件夹打开方式
+                var folderSel = dEl.querySelector('#cd-folder-mode');
+                if (folderSel) {
+                    folderSel.value = that._openSettings.folderOpenMode;
+                    folderSel.addEventListener('change', function() {
+                        that._openSettings.folderOpenMode = this.value;
+                        that._saveOpenSettings();
+                    });
+                }
+                // 视频打开方式
+                var mediaSel = dEl.querySelector('#cd-media-mode');
+                if (mediaSel) {
+                    mediaSel.value = that._openSettings.fileOpenMode.media;
+                    mediaSel.addEventListener('change', function() {
+                        that._openSettings.fileOpenMode.media = this.value;
+                        that._saveOpenSettings();
+                    });
+                }
+            }, 0);
+        } else {
+            // 降级：用简单的确认对话框
+            document.body.appendChild(settingPanel);
+            settingPanel.style.position = 'fixed';
+            settingPanel.style.top = '50%';
+            settingPanel.style.left = '50%';
+            settingPanel.style.transform = 'translate(-50%,-50%)';
+            settingPanel.style.background = 'var(--b3-theme-background,#fff)';
+            settingPanel.style.border = '1px solid var(--b3-border,#ddd)';
+            settingPanel.style.borderRadius = '8px';
+            settingPanel.style.boxShadow = '0 8px 32px rgba(0,0,0,0.2)';
+            settingPanel.style.zIndex = '9999';
+            settingPanel.style.maxWidth = '460px';
+            settingPanel.style.width = '90%';
+
+            var closeBtn = document.createElement('button');
+            closeBtn.textContent = '关闭';
+            closeBtn.style.cssText = 'margin-top:16px;padding:6px 16px;font-size:13px;background:var(--b3-theme-primary,#4285f4);color:#fff;border:none;border-radius:4px;cursor:pointer;width:100%';
+            closeBtn.addEventListener('click', function() { settingPanel.remove(); });
+            settingPanel.appendChild(closeBtn);
+        }
+    }
+
+    /**
      * 从 data.json 加载文件-文档关联映射（按平台隔离）
      * 存储格式: { "win32": { "C:\\path\\to\\file": "20240101docId", ... }, "darwin": {...}, "linux": {...} }
      */
@@ -8975,64 +9723,133 @@ class LocalBrowsePlugin extends Plugin {
      * 从 data.json 加载收藏夹（按平台隔离）
      * 存储格式: { "win32": [...], "darwin": [...], "linux": [...] }
      */
+    /**
+     * 加载收藏夹（兼容多种旧格式，自动迁移到 v2）
+     * v2 格式：{ "win32": {items:[...], groups:[...], _version:2}, ... }
+     */
     loadFavorites() {
         var that = this;
         try {
             if (typeof this.loadData === 'function') {
                 this.loadData('favorites').then(function(data) {
-                    that.favorites = that._extractPlatformFavorites(data);
-                    that.renderFavorites();
+                    that._applyFavoriteData(data);
+                    that._checkFavoritesValidity();
                 }).catch(function() {
                     that.favorites = [];
+                    that.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+                    that.renderFavorites();
                 });
             } else {
                 var saved = localStorage.getItem('cd_favorites');
                 if (saved) {
                     try {
-                        var parsed = JSON.parse(saved);
-                        that.favorites = that._extractPlatformFavorites(parsed);
+                        that._applyFavoriteData(JSON.parse(saved));
+                        that._checkFavoritesValidity();
                     } catch (e) {
                         that.favorites = [];
+                        that.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+                        that.renderFavorites();
                     }
+                } else {
+                    that.favorites = [];
+                    that.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+                    that.renderFavorites();
                 }
-                that.renderFavorites();
             }
         } catch (e) {
             this.favorites = [];
+            this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
         }
     }
 
     /**
-     * 从存储数据中解析当前平台的收藏夹（兼容旧格式纯数组）
+     * 应用收藏数据（兼容多种旧格式），仅修改内存，不自动保存
      */
-    _extractPlatformFavorites(data) {
-        // 旧格式兼容：纯数组 → 归到当前平台
+    _applyFavoriteData(data) {
+        var that = this;
+        // 格式1: 纯数组 [{path, name}] — 最旧格式
         if (Array.isArray(data)) {
-            return data;
+            this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+            this.favorites = this._migrateOldFavorites(data);
+            this._recentFolders = [];
+            this.renderFavorites();
+            return;
         }
-        // 新格式：按平台分组的字典
-        if (data && typeof data === 'object' && Array.isArray(data[this.platform])) {
-            return data[this.platform];
+        // 格式2: { "win32": [...], ... } — 旧平台隔离格式（数组值）
+        if (data && typeof data === 'object' && !data._version && !data.items) {
+            var platformData = data[this.platform];
+            if (Array.isArray(platformData)) {
+                this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+                this.favorites = this._migrateOldFavorites(platformData);
+                this._recentFolders = [];
+                this.renderFavorites();
+                return;
+            }
         }
-        return [];
+        // 格式3: { "win32": {items:[...], groups:[...]}, ... } — v2 平台隔离格式
+        if (data && typeof data === 'object') {
+            var pData = data[this.platform];
+            if (pData && typeof pData === 'object' && Array.isArray(pData.items)) {
+                this.favoriteGroups = Array.isArray(pData.groups) ? pData.groups : [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+                this.favorites = pData.items;
+                this._recentFolders = (Array.isArray(pData.recentFolders) ? pData.recentFolders : []).filter(function(r) {
+                    return that.favorites.some(function(f) { return f.path === r.path; });
+                });
+                this.renderFavorites();
+                return;
+            }
+        }
+        // 格式4: { items: [...], groups: [...] } — 直接存储（无平台隔离）
+        if (data && typeof data === 'object' && Array.isArray(data.items)) {
+            this.favoriteGroups = Array.isArray(data.groups) ? data.groups : [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+            this.favorites = data.items;
+            this._recentFolders = (Array.isArray(data.recentFolders) ? data.recentFolders : []).filter(function(r) {
+                return that.favorites.some(function(f) { return f.path === r.path; });
+            });
+            this.renderFavorites();
+            return;
+        }
+        this.favorites = [];
+        this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }];
+        this._recentFolders = [];
+        this.renderFavorites();
     }
 
     /**
-     * 保存收藏夹到 data.json（按平台隔离）
+     * 将旧格式收藏项迁移为新格式（添加 groupId 和 pinToTop）
+     */
+    _migrateOldFavorites(arr) {
+        var result = [];
+        for (var i = 0; i < arr.length; i++) {
+            var item = arr[i];
+            if (typeof item === 'object' && item.path) {
+                result.push({
+                    path: item.path,
+                    name: item.name || item.path.split(/[\\\\/]/).pop() || item.path,
+                    groupId: item.groupId || 'default',
+                    pinToTop: item.pinToTop || false
+                });
+            }
+        }
+        return result;
+    }
+
+    /**
+     * 保存收藏夹到 data.json（v2 格式，按平台隔离）
+     * 注意：本方法只负责持久化，不触发渲染。调用方需自行决定是否重渲染。
+     * v2 格式：{ "win32": {items:[...], groups:[...], _version:2}, ... }
      */
     saveFavorites() {
         var that = this;
         try {
-            // 先读取现有数据，更新当前平台部分，保留其他平台
+            var platformData = { items: this.favorites, groups: this.favoriteGroups, recentFolders: this._recentFolders, _version: 2 };
             var fullData = {};
             if (typeof this.loadData === 'function') {
-                // 异步读取 → 合并 → 保存
                 this.loadData('favorites').then(function(existing) {
-                    fullData = that._mergePlatformFavorites(existing, that.favorites);
+                    fullData = that._mergePlatformFavoritesV2(existing, platformData);
                     return that.saveData('favorites', fullData);
                 }).catch(function() {
-                    // 读取失败时直接构造新数据
-                    fullData[that.platform] = that.favorites;
+                    fullData[that.platform] = platformData;
                     return that.saveData('favorites', fullData);
                 }).catch(function(e) {
                     that._error('save favorites failed:', e);
@@ -9041,41 +9858,35 @@ class LocalBrowsePlugin extends Plugin {
                 var saved = localStorage.getItem('cd_favorites');
                 if (saved) {
                     try {
-                        fullData = that._mergePlatformFavorites(JSON.parse(saved), that.favorites);
+                        fullData = that._mergePlatformFavoritesV2(JSON.parse(saved), platformData);
                     } catch (e) {
-                        fullData = {};
-                        fullData[that.platform] = that.favorites;
+                        fullData[that.platform] = platformData;
                     }
                 } else {
-                    fullData[that.platform] = that.favorites;
+                    fullData[that.platform] = platformData;
                 }
                 localStorage.setItem('cd_favorites', JSON.stringify(fullData));
             }
         } catch (e) {
             that._error('save favorites error:', e);
         }
-        this.renderFavorites();
     }
 
     /**
-     * 将当前平台收藏合并到完整数据中，保留其他平台不变
+     * v2 格式合并：保留其他平台数据，更新当前平台为 v2 结构
      */
-    _mergePlatformFavorites(existing, currentFavs) {
+    _mergePlatformFavoritesV2(existing, currentPlatformData) {
         var fullData = {};
-        if (Array.isArray(existing)) {
-            // 旧格式迁移：纯数组归到当前平台
-            fullData[this.platform] = existing;
-        } else if (existing && typeof existing === 'object') {
-            // 新格式：复制现有各平台数据
+        if (existing && typeof existing === 'object') {
             var platforms = ['win32', 'darwin', 'linux'];
             for (var i = 0; i < platforms.length; i++) {
                 var p = platforms[i];
-                if (Array.isArray(existing[p])) {
+                if (existing[p]) {
                     fullData[p] = existing[p];
                 }
             }
         }
-        fullData[this.platform] = currentFavs;
+        fullData[this.platform] = currentPlatformData;
         return fullData;
     }
 
@@ -9089,20 +9900,21 @@ class LocalBrowsePlugin extends Plugin {
 
         list.innerHTML = '';
 
-        if (!this.favorites || this.favorites.length === 0) {
+        // 只显示最近浏览的收藏项（最多5个）
+        var recentFavs = this._recentFolders;
+        if (!recentFavs || recentFavs.length === 0) {
             return;
         }
 
-        for (var i = 0; i < this.favorites.length; i++) {
-            var fav = this.favorites[i];
+        for (var i = 0; i < recentFavs.length; i++) {
+            var fav = recentFavs[i];
             var btn = document.createElement('div');
             btn.style.cssText = 'display:inline-flex;align-items:center;gap:3px;padding:2px 6px;font-size:10px;background:var(--b3-theme-surface,#f0f0f0);border:1px solid var(--b3-border,#ddd);border-radius:10px;cursor:pointer;white-space:nowrap;max-width:100px;overflow:hidden;text-overflow:ellipsis;transition:background 0.15s;flex-shrink:0;user-select:none';
             btn.title = fav.path;
             btn.draggable = true;
-            btn.dataset.favIndex = i;
             btn.innerHTML = '<span style="font-size:10px">⭐</span><span style="overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(fav.name) + '</span>';
 
-            (function(favPath, favName, btnEl) {
+            (function(favPath, btnEl) {
                 btnEl.addEventListener('click', function() {
                     that.loadDirectory(favPath);
                 });
@@ -9112,122 +9924,804 @@ class LocalBrowsePlugin extends Plugin {
                 btnEl.addEventListener('mouseleave', function() {
                     this.style.background = 'var(--b3-theme-surface,#f0f0f0)';
                 });
-                btnEl.addEventListener('contextmenu', function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    that.removeFavorite(favPath);
-                });
-
-                // 拖拽排序
+                // 拖拽到分组
                 btnEl.addEventListener('dragstart', function(e) {
                     this.style.opacity = '0.4';
                     e.dataTransfer.effectAllowed = 'move';
                     e.dataTransfer.setData('text/plain', favPath);
-                    that._dragFavIndex = parseInt(this.dataset.favIndex, 10);
-                    that._dragSrcBtn = this;
+                    that._dragFavPath = favPath;
+                    that._favDragging = true;
+                    // 拖拽开始时自动展开收藏树面板
+                    var treeWrap = document.getElementById('cd-fav-tree-wrap');
+                    if (treeWrap && treeWrap.style.display === 'none') {
+                        treeWrap.style.display = 'flex';
+                        that._favSidebarVisible = true;
+                    }
                 });
                 btnEl.addEventListener('dragend', function(e) {
                     this.style.opacity = '';
-                    that._dragFavIndex = null;
-                    that._dragSrcBtn = null;
-                    that._dragOverTarget = null;
-                    // 清除所有视觉指示器
-                    var allBtns = list.querySelectorAll('[data-fav-index]');
-                    for (var k = 0; k < allBtns.length; k++) {
-                        allBtns[k].classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
-                    }
+                    that._dragFavPath = null;
+                    that._favDragging = false;
                 });
-                btnEl.addEventListener('dragover', function(e) {
-                    e.preventDefault();
-                    e.dataTransfer.dropEffect = 'move';
-                    if (that._dragFavIndex === null || !that._dragSrcBtn || that._dragSrcBtn === this) return;
-                    // 节流：如果目标没变，不做任何操作
-                    if (that._dragOverTarget === this) return;
-                    that._dragOverTarget = this;
-                    var targetIndex = parseInt(this.dataset.favIndex, 10);
-                    var srcIndex = parseInt(that._dragSrcBtn.dataset.favIndex, 10);
-                    // 清除所有视觉指示器
-                    var allBtns = list.querySelectorAll('[data-fav-index]');
-                    for (var k = 0; k < allBtns.length; k++) {
-                        allBtns[k].classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
-                    }
-                    // 只添加视觉指示器，不移动 DOM（避免频繁布局抖动）
-                    if (targetIndex < srcIndex) {
-                        this.classList.add('cd-fav-drag-before');
-                    } else {
-                        this.classList.add('cd-fav-drag-after');
-                    }
-                });
-                btnEl.addEventListener('dragleave', function(e) {
-                    // 延迟清除，避免鼠标在按钮内部微动时频繁闪烁
-                    var btn = this;
-                    setTimeout(function() {
-                        if (that._dragOverTarget !== btn) {
-                            btn.classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
-                        }
-                    }, 50);
-                });
-                btnEl.addEventListener('drop', function(e) {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    var targetIndex = parseInt(this.dataset.favIndex, 10);
-                    var srcIndex = parseInt(that._dragSrcBtn.dataset.favIndex, 10);
-                    // 清除视觉指示器
-                    this.classList.remove('cd-fav-drag-before', 'cd-fav-drag-after');
-                    that._dragOverTarget = null;
-                    if (srcIndex === targetIndex) return;
-                    // 移动 DOM 元素
-                    var listEl = document.getElementById('cd-favorites-list');
-                    if (targetIndex < srcIndex) {
-                        listEl.insertBefore(that._dragSrcBtn, this);
-                    } else {
-                        listEl.insertBefore(that._dragSrcBtn, this.nextSibling);
-                    }
-                    // 按 DOM 顺序的 title 路径匹配重建 favorites 数组
-                    var allBtns = listEl.querySelectorAll('[data-fav-index]');
-                    var orderedFavs = [];
-                    for (var n = 0; n < allBtns.length; n++) {
-                        var btnPath = allBtns[n].title;
-                        for (var p = 0; p < that.favorites.length; p++) {
-                            if (that.favorites[p].path === btnPath) {
-                                orderedFavs.push(that.favorites[p]);
-                                break;
-                            }
-                        }
-                    }
-                    if (orderedFavs.length === that.favorites.length) {
-                        that.favorites = orderedFavs;
-                        that.saveFavorites();
-                    }
-                    // 更新 data-fav-index 为新顺序
-                    var finalBtns = listEl.querySelectorAll('[data-fav-index]');
-                    for (var q = 0; q < finalBtns.length; q++) {
-                        finalBtns[q].dataset.favIndex = q;
-                    }
-                });
-            })(fav.path, fav.name, btn);
+            })(fav.path, btn);
 
             list.appendChild(btn);
         }
+        // 同步渲染收藏树（如果面板已展开）
+        this.renderFavTree();
+    }
+
+    /**
+     * 检查收藏夹路径有效性，给失效项标记 _exists = false；
+     * 对失效项尝试在常见位置自动查找同名文件夹并修复路径
+     */
+    _checkFavoritesValidity() {
+        var that = this;
+        try {
+            var fs = require('fs');
+            var changed = false;
+            var fixCount = 0;
+            var failCount = 0;
+            for (var i = 0; i < that.favorites.length; i++) {
+                var fav = that.favorites[i];
+                var exists = false;
+                try {
+                    exists = fs.existsSync(fav.path);
+                } catch (e) {
+                    exists = false;
+                }
+                if (!exists) {
+                    // 路径失效，尝试自动修复
+                    var fixedPath = that._tryAutoFixFavoritePath(fav.path);
+                    if (fixedPath && fs.existsSync(fixedPath)) {
+                        fav.path = fixedPath;
+                        if (fav._exists !== true) {
+                            fav._exists = true;
+                            changed = true;
+                        }
+                        fixCount++;
+                        that.showToastMsg('收藏路径已自动修复：' + fav.name);
+                        continue;
+                    }
+                    if (fav._exists !== false) {
+                        fav._exists = false;
+                        changed = true;
+                        failCount++;
+                    }
+                } else if (fav._exists === false) {
+                    fav._exists = true;
+                    changed = true;
+                }
+            }
+            if (changed) {
+                that.saveFavorites();
+                that.renderFavorites();
+                that.renderFavTree();
+            }
+            if (failCount > 0) {
+                that.showToastMsg('有 ' + failCount + ' 个收藏路径已失效且无法自动修复，请手动重新收藏');
+            }
+        } catch (e) {
+            that._error('check favorites validity error:', e);
+        }
+    }
+
+    /**
+     * 尝试在常见位置查找同名文件夹，自动修复失效的收藏路径
+     * @param {string} oldPath - 失效的原路径
+     * @returns {string|null} 修复后的路径，或 null
+     */
+    _tryAutoFixFavoritePath(oldPath) {
+        var that = this;
+        try {
+            var fs = require('fs');
+            var path = require('path');
+            var os = require('os');
+            var dirName = path.basename(oldPath);
+            if (!dirName) return null;
+
+            var candidates = [];
+            var searched = new Set();
+
+            // 辅助函数：搜索直接子目录
+            function addCandidate(dir) {
+                if (!dir || searched.has(dir)) return;
+                searched.add(dir);
+                var target = path.join(dir, dirName);
+                try {
+                    if (fs.existsSync(target) && fs.statSync(target).isDirectory()) {
+                        candidates.push(target);
+                    }
+                } catch (e) {}
+            }
+
+            // 辅助函数：搜索直接子目录 + 子目录的子目录（一层深度）
+            function addCandidateDeep(dir) {
+                if (!dir || searched.has(dir)) return;
+                // 先搜直接子目录
+                addCandidate(dir);
+                // 再搜子目录下的子目录
+                try {
+                    var entries = fs.readdirSync(dir);
+                    for (var i = 0; i < entries.length; i++) {
+                        var entry = entries[i];
+                        if (entry === dirName) continue; // 已在 addCandidate 中搜索过
+                        var subDir = path.join(dir, entry);
+                        try {
+                            if (fs.statSync(subDir).isDirectory()) {
+                                addCandidate(subDir);
+                            }
+                        } catch (e) {}
+                    }
+                } catch (e) {}
+            }
+
+            // 1. 旧路径的父目录（同级移动，支持嵌套一层）
+            var parentDir = path.dirname(oldPath);
+            addCandidateDeep(parentDir);
+
+            // 2. 旧路径的祖父目录（向上移动一层，支持嵌套一层）
+            var grandParentDir = path.dirname(parentDir);
+            if (grandParentDir !== parentDir) {
+                addCandidateDeep(grandParentDir);
+            }
+
+            // 3. 曾祖父目录（向上移动两层，仅直接子目录）
+            var greatGrandParent = path.dirname(grandParentDir);
+            if (greatGrandParent !== grandParentDir) {
+                addCandidate(greatGrandParent);
+            }
+
+            // 4. 常见用户目录
+            var homeDir = os.homedir();
+            addCandidate(homeDir);
+            addCandidate(path.join(homeDir, 'Desktop'));
+            addCandidate(path.join(homeDir, 'Documents'));
+            addCandidate(path.join(homeDir, 'Downloads'));
+            addCandidate(path.join(homeDir, 'Music'));
+            addCandidate(path.join(homeDir, 'Pictures'));
+            addCandidate(path.join(homeDir, 'Videos'));
+
+            // 5. Windows 各盘符根目录 / macOS/Linux 根目录
+            if (process.platform === 'win32') {
+                for (var c = 67; c <= 90; c++) { // C: 到 Z:
+                    var drive = String.fromCharCode(c) + ':\\';
+                    addCandidate(drive);
+                }
+            } else {
+                addCandidate('/');
+                addCandidate('/home');
+                addCandidate('/Users');
+            }
+
+            that._log('auto-fix search for', dirName, 'found', candidates.length, 'candidates:', candidates);
+
+            // 只返回唯一匹配；多个匹配时无法确定，返回 null
+            if (candidates.length === 1) {
+                that._log('auto-fix favorite path:', oldPath, '→', candidates[0]);
+                return candidates[0];
+            }
+            return null;
+        } catch (e) {
+            that._error('try auto fix favorite path error:', e);
+            return null;
+        }
+    }
+    /**
+     * 渲染收藏树面板（按分组展示收藏）
+     */
+    renderFavTree() {
+        var that = this;
+        var tree = document.getElementById('cd-fav-tree');
+        if (!tree) return;
+        tree.innerHTML = '';
+
+        if ((!this.favorites || this.favorites.length === 0) && (!this.favoriteGroups || this.favoriteGroups.length === 0)) {
+            tree.innerHTML = '<div style="padding:8px;font-size:11px;color:var(--b3-theme-secondary,#999);text-align:center">右键文件夹收藏</div>';
+            return;
+        }
+
+        // 按分组组织
+        var groupsMap = {};
+        for (var g = 0; g < this.favoriteGroups.length; g++) {
+            var grp = this.favoriteGroups[g];
+            groupsMap[grp.id] = { group: grp, items: [] };
+        }
+        for (var i = 0; i < this.favorites.length; i++) {
+            var fav = this.favorites[i];
+            var gid = fav.groupId || 'default';
+            if (!groupsMap[gid]) {
+                groupsMap[gid] = { group: { id: gid, name: gid, expanded: true, order: 99 }, items: [] };
+            }
+            groupsMap[gid].items.push(fav);
+        }
+
+        var sortedGroups = [];
+        for (var key in groupsMap) {
+            if (groupsMap.hasOwnProperty(key)) {
+                sortedGroups.push(groupsMap[key]);
+            }
+        }
+        sortedGroups.sort(function(a, b) { return (a.group.order || 0) - (b.group.order || 0); });
+
+        var currentPath = this.currentPath || '';
+
+        for (var gi = 0; gi < sortedGroups.length; gi++) {
+            var gData = sortedGroups[gi];
+            var group = gData.group;
+            var items = gData.items;
+
+            var groupHeader = document.createElement('div');
+            groupHeader.className = 'cd-fav-group-header';
+            groupHeader.dataset.groupId = group.id;
+            groupHeader.draggable = true;
+            groupHeader.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 2px;font-size:11px;color:var(--b3-theme-primary,#4285f4);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s';
+            var arrowSvg = '<svg width="8" height="8" viewBox="0 0 8 8" style="transition:transform 0.15s;color:var(--b3-theme-primary,#4285f4)"><path d="M1 2L6 4L1 6Z" fill="currentColor"/></svg>';
+            groupHeader.innerHTML = '<span style="font-size:9px;width:12px;text-align:center;display:inline-block;color:var(--b3-theme-primary,#4285f4)">' + (group.expanded !== false ? '<span style="display:inline-block;transform:rotate(90deg)">' + arrowSvg + '</span>' : arrowSvg) + '</span><span style="flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(group.name) + '</span><span style="font-size:9px;color:var(--b3-theme-primary,#4285f4);opacity:0.7">' + items.length + '</span>';
+            tree.appendChild(groupHeader);
+
+            var itemsContainer = document.createElement('div');
+            itemsContainer.style.cssText = 'padding-left:12px;' + (group.expanded !== false ? '' : 'display:none');
+
+            // 分组头部点击：折叠/展开 + 右键菜单 + 拖拽排序
+            (function(g, header, container) {
+                header.addEventListener('click', function() {
+                    var isExpanded = g.expanded !== false;
+                    g.expanded = !isExpanded;
+                    container.style.display = isExpanded ? 'none' : 'block';
+                    var arrowWrap = header.querySelector('span:first-child');
+                    var arrow = arrowWrap ? arrowWrap.querySelector('span, svg') : null;
+                    if (arrowWrap) {
+                        if (isExpanded) {
+                            arrowWrap.innerHTML = arrowSvg;
+                        } else {
+                            arrowWrap.innerHTML = '<span style="display:inline-block;transform:rotate(90deg)">' + arrowSvg + '</span>';
+                        }
+                    }
+                    that.saveFavorites();
+                });
+                header.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e8e8e8)'; });
+                header.addEventListener('mouseleave', function() { this.style.background = ''; });
+                header.addEventListener('contextmenu', function(e) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    that._showGroupContextMenu(e, g, header);
+                });
+                // 分组拖拽排序
+                header.addEventListener('dragstart', function(e) {
+                    this.style.opacity = '0.4';
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', g.id);
+                    that._dragGroupId = g.id;
+                    that._favDragging = true;
+                });
+                header.addEventListener('dragend', function(e) {
+                    this.style.opacity = '';
+                    that._dragGroupId = null;
+                    that._favDragging = false;
+                });
+            })(group, groupHeader, itemsContainer);
+
+            for (var fi = 0; fi < items.length; fi++) {
+                var favItem = items[fi];
+                var isActive = currentPath === favItem.path;
+                var isInvalid = favItem._exists === false;
+                var itemEl = document.createElement('div');
+                itemEl.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 4px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.1s;user-select:none;' + (isActive ? 'background:var(--b3-theme-hover,#e3f2fd);color:var(--b3-theme-primary,#4285f4);font-weight:500;' : (isInvalid ? 'color:var(--b3-theme-secondary,#999);opacity:0.6;' : 'color:var(--b3-theme-on-background,#333);'));
+                itemEl.title = isInvalid ? '路径已失效：' + favItem.path : favItem.path;
+                itemEl.draggable = true;
+                itemEl.dataset.favPath = favItem.path;
+                itemEl.dataset.groupId = group.id;
+                itemEl.innerHTML = '<span style="font-size:9px;flex-shrink:0">' + (favItem.pinToTop ? '📌' : (isInvalid ? '⚠️' : '⭐')) + '</span><span style="overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(favItem.name) + '</span>';
+
+                (function(fav, el, invalid) {
+                    var fp = fav.path;
+                    el.addEventListener('click', function() {
+                        if (invalid) {
+                            that.showToastMsg('路径已失效，请重新收藏');
+                            return;
+                        }
+                        that.loadDirectory(fp);
+                        // 点击后收起收藏树面板
+                        var wrap = document.getElementById('cd-fav-tree-wrap');
+                        if (wrap) {
+                            wrap.style.display = 'none';
+                            that._favSidebarVisible = false;
+                        }
+                    });
+                    el.addEventListener('mouseenter', function() { if (that.currentPath !== fp) this.style.background = 'var(--b3-theme-surface,#f5f5f5)'; });
+                    el.addEventListener('mouseleave', function() { if (that.currentPath !== fp) this.style.background = ''; });
+                    el.addEventListener('contextmenu', function(e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        that._showFavContextMenu(e, fav);
+                    });
+                    // 拖拽移动收藏项到分组 / 同分组排序
+                    el.addEventListener('dragstart', function(e) {
+                        this.style.opacity = '0.4';
+                        e.dataTransfer.effectAllowed = 'move';
+                        e.dataTransfer.setData('text/plain', fp);
+                        that._dragFavPath = fp;
+                        that._dragFavGroupId = group.id;
+                        that._favDragging = true;
+                    });
+                    el.addEventListener('dragend', function(e) {
+                        this.style.opacity = '';
+                        that._dragFavPath = null;
+                        that._dragFavGroupId = null;
+                        that._favDragging = false;
+                        // 清除所有排序指示器
+                        var allItems = tree.querySelectorAll('[data-fav-path]');
+                        for (var ii = 0; ii < allItems.length; ii++) {
+                            allItems[ii].style.borderTop = '';
+                            allItems[ii].style.borderBottom = '';
+                        }
+                    });
+                    // 同分组排序：dragover 显示插入位置
+                    el.addEventListener('dragover', function(e) {
+                        e.preventDefault();
+                        if (!that._dragFavPath || that._dragFavPath === fp) return;
+                        // 只处理同分组排序
+                        if (that._dragFavGroupId !== group.id) return;
+                        e.dataTransfer.dropEffect = 'move';
+                        var rect = this.getBoundingClientRect();
+                        var midY = rect.top + rect.height / 2;
+                        var isBefore = e.clientY < midY;
+                        // 清除所有指示器
+                        var allItems = tree.querySelectorAll('[data-fav-path]');
+                        for (var ii = 0; ii < allItems.length; ii++) {
+                            allItems[ii].style.borderTop = '';
+                            allItems[ii].style.borderBottom = '';
+                        }
+                        // 当前项显示插入线
+                        if (isBefore) {
+                            this.style.borderTop = '2px solid var(--b3-theme-primary,#4285f4)';
+                        } else {
+                            this.style.borderBottom = '2px solid var(--b3-theme-primary,#4285f4)';
+                        }
+                    });
+                    // 同分组排序：drop 调整顺序
+                    el.addEventListener('drop', function(e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (!that._dragFavPath || that._dragFavPath === fp) return;
+                        // 只处理同分组排序
+                        if (that._dragFavGroupId !== group.id) return;
+                        // 清除指示器
+                        var allItems = tree.querySelectorAll('[data-fav-path]');
+                        for (var ii = 0; ii < allItems.length; ii++) {
+                            allItems[ii].style.borderTop = '';
+                            allItems[ii].style.borderBottom = '';
+                        }
+                        var rect = this.getBoundingClientRect();
+                        var midY = rect.top + rect.height / 2;
+                        var isBefore = e.clientY < midY;
+                        // 在 favorites 数组中找到源和目标的索引
+                        var srcIdx = -1, tgtIdx = -1;
+                        for (var fi = 0; fi < that.favorites.length; fi++) {
+                            if (that.favorites[fi].path === that._dragFavPath) srcIdx = fi;
+                            if (that.favorites[fi].path === fp) tgtIdx = fi;
+                        }
+                        if (srcIdx === -1 || tgtIdx === -1 || srcIdx === tgtIdx) return;
+                        // 移动元素
+                        var movedFav = that.favorites.splice(srcIdx, 1)[0];
+                        if (srcIdx < tgtIdx && !isBefore) {
+                            // 源在目标前，插入到目标后
+                            that.favorites.splice(tgtIdx, 0, movedFav);
+                        } else if (srcIdx > tgtIdx && isBefore) {
+                            // 源在目标后，插入到目标前
+                            that.favorites.splice(tgtIdx, 0, movedFav);
+                        } else if (srcIdx < tgtIdx && isBefore) {
+                            // 源在目标前，插入到目标前
+                            that.favorites.splice(tgtIdx - 1, 0, movedFav);
+                        } else {
+                            // srcIdx > tgtIdx && !isBefore，插入到目标后
+                            that.favorites.splice(tgtIdx + 1, 0, movedFav);
+                        }
+                        that.saveFavorites();
+                        that.renderFavorites();
+                    });
+                })(favItem, itemEl, isInvalid);
+
+                itemsContainer.appendChild(itemEl);
+            }
+            tree.appendChild(itemsContainer);
+        }
+        // 新建分组按钮
+        var addGroupBtn = document.createElement('div');
+        addGroupBtn.style.cssText = 'display:flex;align-items:center;gap:4px;padding:4px 6px;font-size:11px;color:var(--b3-theme-secondary,#999);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s;margin-top:2px';
+        addGroupBtn.innerHTML = '<span style="font-size:11px">➕</span><span>新建分组</span>';
+        addGroupBtn.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e8e8e8)'; });
+        addGroupBtn.addEventListener('mouseleave', function() { this.style.background = ''; });
+        addGroupBtn.addEventListener('click', function() {
+            // 使用内联输入框替代 prompt（Electron 不支持 prompt）
+            that._favEditing = true;
+            var inputWrap = document.createElement('div');
+            inputWrap.style.cssText = 'display:flex;align-items:center;gap:4px;padding:3px 6px';
+            var input = document.createElement('input');
+            input.type = 'text';
+            input.placeholder = '输入名称后回车保存';
+            input.style.cssText = 'flex:1;font-size:11px;padding:2px 4px;border:1px solid var(--b3-theme-primary,#4285f4);border-radius:3px;outline:none;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333)';
+            inputWrap.appendChild(input);
+            addGroupBtn.style.display = 'none';
+            addGroupBtn.parentNode.insertBefore(inputWrap, addGroupBtn.nextSibling);
+
+            // 延迟 focus，确保 DOM 已更新
+            requestAnimationFrame(function() {
+                input.focus();
+            });
+
+            var _confirmed = false;
+            function doConfirm() {
+                if (_confirmed) return;
+                _confirmed = true;
+                var name = input.value.trim();
+                if (name) {
+                    inputWrap.remove();
+                    addGroupBtn.style.display = '';
+                    that._favEditing = false;
+                    that._favKeepOpenUntil = Date.now() + 2000;
+                    that.addGroup(name);
+                } else {
+                    inputWrap.remove();
+                    addGroupBtn.style.display = '';
+                    that._favEditing = false;
+                }
+            }
+            function doCancel() {
+                if (_confirmed) return;
+                _confirmed = true;
+                that._favEditing = false;
+                inputWrap.remove();
+                addGroupBtn.style.display = '';
+            }
+
+            function handleKey(ev) {
+                var isEnter = ev.key === 'Enter' || ev.code === 'Enter' || ev.keyCode === 13 || ev.which === 13;
+                var isEsc = ev.key === 'Escape' || ev.code === 'Escape' || ev.keyCode === 27 || ev.which === 27;
+                if (isEnter) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    doConfirm();
+                    return true;
+                }
+                if (isEsc) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    doCancel();
+                    return true;
+                }
+                return false;
+            }
+
+            input.addEventListener('keydown', handleKey);
+            // blur 时自动保存（点击面板外部也生效）
+            input.addEventListener('blur', function(ev) {
+                // 延迟判断，避免在点击其他元素时误触发
+                setTimeout(function() {
+                    if (!_confirmed) doConfirm();
+                }, 150);
+            });
+        });
+        tree.appendChild(addGroupBtn);
+    }
+
+    /**
+     * 显示收藏项的右键菜单
+     */
+    _showFavContextMenu(e, favItem) {
+        var that = this;
+        that._favMenuOpen = true;
+        // 关闭已存在的菜单
+        var oldMenu = document.getElementById('cd-fav-context-menu');
+        if (oldMenu) oldMenu.remove();
+
+        var menu = document.createElement('div');
+        menu.id = 'cd-fav-context-menu';
+        menu.style.cssText = 'position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:4px 0;font-size:12px;min-width:140px;user-select:none';
+
+        var items = [];
+        // 置顶/取消置顶
+        items.push({
+            label: favItem.pinToTop ? '📌 取消置顶' : '📌 置顶收藏',
+            action: function() {
+                favItem.pinToTop = !favItem.pinToTop;
+                that.saveFavorites();
+                that.renderFavorites();
+            }
+        });
+        // 移动到其他分组
+        var currentGroupId = favItem.groupId || 'default';
+        if (that.favoriteGroups && that.favoriteGroups.length > 1) {
+            items.push({
+                label: '📂 移动到分组',
+                submenu: that.favoriteGroups.filter(function(g) { return g.id !== currentGroupId; }).map(function(g) {
+                    return {
+                        label: that.escapeHtml(g.name),
+                        action: function() {
+                            favItem.groupId = g.id;
+                            that.saveFavorites();
+                            that.renderFavorites();
+                        }
+                    };
+                })
+            });
+        }
+        // 移除收藏
+        items.push({
+            label: '🗑️ 移除收藏',
+            action: function() {
+                that.removeFavorite(favItem.path);
+            }
+        });
+
+        function createMenuItem(itemDef) {
+            var itemEl = document.createElement('div');
+            itemEl.style.cssText = 'padding:6px 12px;cursor:pointer;white-space:nowrap;color:var(--b3-theme-on-background,#333);transition:background 0.1s;display:flex;align-items:center;gap:4px';
+            itemEl.textContent = itemDef.label;
+            itemEl.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+            itemEl.addEventListener('mouseleave', function() { this.style.background = ''; });
+            itemEl.addEventListener('click', function(ev) {
+                ev.stopPropagation();
+                if (itemDef.action) itemDef.action();
+                menu.remove();
+            });
+            return itemEl;
+        }
+
+        for (var i = 0; i < items.length; i++) {
+            var def = items[i];
+            if (def.submenu && def.submenu.length > 0) {
+                // 带子菜单的项
+                var parentItem = document.createElement('div');
+                parentItem.style.cssText = 'position:relative';
+                var trigger = document.createElement('div');
+                trigger.style.cssText = 'padding:6px 12px;cursor:pointer;white-space:nowrap;color:var(--b3-theme-on-background,#333);transition:background 0.1s;display:flex;align-items:center;gap:4px';
+                trigger.innerHTML = '<span style="flex:1">' + def.label + '</span><span style="font-size:9px;color:var(--b3-theme-secondary,#999)">▶</span>';
+                trigger.addEventListener('mouseenter', function() {
+                    this.style.background = 'var(--b3-theme-hover,#e3f2fd)';
+                    sub.style.display = 'block';
+                });
+                trigger.addEventListener('mouseleave', function() {
+                    this.style.background = '';
+                });
+                var sub = document.createElement('div');
+                sub.style.cssText = 'position:absolute;top:0;left:100%;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:4px 0;font-size:12px;min-width:120px;display:none';
+                for (var j = 0; j < def.submenu.length; j++) {
+                    sub.appendChild(createMenuItem(def.submenu[j]));
+                }
+                parentItem.addEventListener('mouseleave', function() { sub.style.display = 'none'; });
+                parentItem.appendChild(trigger);
+                parentItem.appendChild(sub);
+                menu.appendChild(parentItem);
+            } else {
+                menu.appendChild(createMenuItem(def));
+            }
+            if (i < items.length - 1) {
+                var sep = document.createElement('div');
+                sep.style.cssText = 'margin:2px 8px;height:1px;background:var(--b3-border,#eee)';
+                menu.appendChild(sep);
+            }
+        }
+
+        document.body.appendChild(menu);
+        var rect = menu.getBoundingClientRect();
+        var x = e.clientX, y = e.clientY;
+        if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+        if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+
+        function closeMenu() { that._favMenuOpen = false; menu.remove(); }
+        setTimeout(function() {
+            document.addEventListener('click', closeMenu, { once: true });
+            document.addEventListener('keydown', function escHandler(ev) { if (ev.key === 'Escape') { closeMenu(); document.removeEventListener('keydown', escHandler); } });
+        }, 10);
+    }
+
+    /**
+     * 显示分组的右键菜单
+     */
+    _showGroupContextMenu(e, group, headerEl) {
+        var that = this;
+        that._favMenuOpen = true;
+        var oldMenu = document.getElementById('cd-fav-context-menu');
+        if (oldMenu) oldMenu.remove();
+
+        var menu = document.createElement('div');
+        menu.id = 'cd-fav-context-menu';
+        menu.style.cssText = 'position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:4px 0;font-size:12px;min-width:140px;user-select:none';
+
+        var items = [];
+        items.push({
+            label: '✏️ 重命名',
+            action: function() {
+                // 使用内联输入框替代 prompt（Electron 不支持 prompt）
+                that._favEditing = true;
+                var oldHtml = headerEl.innerHTML;
+                headerEl.innerHTML = '';
+                var input = document.createElement('input');
+                input.type = 'text';
+                input.value = group.name;
+                input.style.cssText = 'flex:1;font-size:11px;padding:2px 4px;border:1px solid var(--b3-theme-primary,#4285f4);border-radius:3px;outline:none;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333)';
+                headerEl.appendChild(input);
+                requestAnimationFrame(function() {
+                    input.focus();
+                    input.select();
+                });
+
+                var _confirmed = false;
+                function doConfirm() {
+                    if (_confirmed) return;
+                    _confirmed = true;
+                    var newName = input.value.trim();
+                    if (newName) {
+                        headerEl.innerHTML = oldHtml;
+                        that._favEditing = false;
+                        that._favKeepOpenUntil = Date.now() + 2000;
+                        that.renameGroup(group.id, newName);
+                    } else {
+                        headerEl.innerHTML = oldHtml;
+                        that._favEditing = false;
+                    }
+                }
+                function doCancel() {
+                    if (_confirmed) return;
+                    _confirmed = true;
+                    that._favEditing = false;
+                    headerEl.innerHTML = oldHtml;
+                }
+                function handleKey(ev) {
+                    var isEnter = ev.key === 'Enter' || ev.code === 'Enter' || ev.keyCode === 13 || ev.which === 13;
+                    var isEsc = ev.key === 'Escape' || ev.code === 'Escape' || ev.keyCode === 27 || ev.which === 27;
+                    if (isEnter) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        doConfirm();
+                        return true;
+                    }
+                    if (isEsc) {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                        doCancel();
+                        return true;
+                    }
+                    return false;
+                }
+                input.addEventListener('keydown', handleKey);
+                // blur 时自动保存（点击面板外部也生效）
+                input.addEventListener('blur', function(ev) {
+                    setTimeout(function() {
+                        if (!_confirmed) doConfirm();
+                    }, 150);
+                });
+            }
+        });
+        // 统计该分组下的收藏数量
+        var count = 0;
+        for (var i = 0; i < that.favorites.length; i++) {
+            if ((that.favorites[i].groupId || 'default') === group.id) count++;
+        }
+        if (count === 0 && group.id !== 'default') {
+            items.push({
+                label: '🗑️ 删除分组',
+                action: function() {
+                    if (confirm('确定要删除分组 "' + group.name + '" 吗？')) {
+                        that.deleteGroup(group.id);
+                    }
+                }
+            });
+        }
+
+        for (var j = 0; j < items.length; j++) {
+            (function(itemDef, isLast) {
+                var itemEl = document.createElement('div');
+                itemEl.style.cssText = 'padding:6px 12px;cursor:pointer;white-space:nowrap;color:var(--b3-theme-on-background,#333);transition:background 0.1s;display:flex;align-items:center;gap:4px';
+                itemEl.textContent = itemDef.label;
+                itemEl.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+                itemEl.addEventListener('mouseleave', function() { this.style.background = ''; });
+                itemEl.addEventListener('click', function(ev) {
+                    ev.stopPropagation();
+                    itemDef.action();
+                    menu.remove();
+                });
+                menu.appendChild(itemEl);
+                if (!isLast) {
+                    var sep = document.createElement('div');
+                    sep.style.cssText = 'margin:2px 8px;height:1px;background:var(--b3-border,#eee)';
+                    menu.appendChild(sep);
+                }
+            })(items[j], j === items.length - 1);
+        }
+
+        document.body.appendChild(menu);
+        var rect = menu.getBoundingClientRect();
+        var x = e.clientX, y = e.clientY;
+        if (x + rect.width > window.innerWidth) x = window.innerWidth - rect.width - 4;
+        if (y + rect.height > window.innerHeight) y = window.innerHeight - rect.height - 4;
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+
+        function closeMenu() { that._favMenuOpen = false; menu.remove(); }
+        setTimeout(function() {
+            document.addEventListener('click', closeMenu, { once: true });
+            document.addEventListener('keydown', function escHandler(ev) { if (ev.key === 'Escape') { closeMenu(); document.removeEventListener('keydown', escHandler); } });
+        }, 10);
+    }
+
+    /**
+     * 添加新分组
+     */
+    addGroup(name) {
+        var id = 'group_' + Date.now();
+        var order = this.favoriteGroups.length;
+        this.favoriteGroups.push({ id: id, name: name, expanded: true, order: order });
+        this.saveFavorites();
+        this.renderFavorites();
+    }
+
+    /**
+     * 重命名分组
+     */
+    renameGroup(groupId, newName) {
+        for (var i = 0; i < this.favoriteGroups.length; i++) {
+            if (this.favoriteGroups[i].id === groupId) {
+                this.favoriteGroups[i].name = newName;
+                this.saveFavorites();
+                this.renderFavorites();
+                return;
+            }
+        }
+    }
+
+    /**
+     * 删除分组（仅当分组为空时）
+     */
+    deleteGroup(groupId) {
+        var idx = -1;
+        for (var i = 0; i < this.favoriteGroups.length; i++) {
+            if (this.favoriteGroups[i].id === groupId) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx === -1) return;
+        // 将该分组下的收藏移到 default
+        for (var j = 0; j < this.favorites.length; j++) {
+            if ((this.favorites[j].groupId || 'default') === groupId) {
+                this.favorites[j].groupId = 'default';
+            }
+        }
+        this.favoriteGroups.splice(idx, 1);
+        // 重新排序 order
+        for (var k = 0; k < this.favoriteGroups.length; k++) {
+            this.favoriteGroups[k].order = k;
+        }
+        this.saveFavorites();
+        this.renderFavorites();
     }
 
     /**
      * 检查路径是否已收藏
      */
     isFavorite(dirPath) {
+        if (!dirPath) return false;
+        var normDir = dirPath.replace(/\\+$/, '').toLowerCase();
         for (var i = 0; i < this.favorites.length; i++) {
-            if (this.favorites[i].path === dirPath) return true;
+            var normFav = this.favorites[i].path.replace(/\\+$/, '').toLowerCase();
+            if (normFav === normDir) return true;
         }
         return false;
     }
 
     /**
-     * 添加收藏
+     * 添加收藏（v2 格式：包含 groupId 和 pinToTop）
      */
     addFavorite(dirPath, dirName) {
         if (this.isFavorite(dirPath)) return;
-        this.favorites.push({ path: dirPath, name: dirName });
+        this.favorites.push({ path: dirPath, name: dirName, groupId: 'default', pinToTop: false });
         this.saveFavorites();
+        this.renderFavorites();
         this.loadDirectory(this.currentPath);
     }
 
@@ -9235,15 +10729,26 @@ class LocalBrowsePlugin extends Plugin {
      * 移除收藏
      */
     removeFavorite(dirPath) {
-        var removed = null;
+        if (!dirPath) return;
+        var normDir = dirPath.replace(/\\+$/, '').toLowerCase();
+        var removed = false;
         for (var i = this.favorites.length - 1; i >= 0; i--) {
-            if (this.favorites[i].path === dirPath) {
-                removed = this.favorites[i].name;
+            var normFav = this.favorites[i].path.replace(/\\+$/, '').toLowerCase();
+            if (normFav === normDir) {
                 this.favorites.splice(i, 1);
+                removed = true;
             }
         }
         if (removed) {
+            // 同步从最近访问中移除（宽松匹配）
+            for (var ri = this._recentFolders.length - 1; ri >= 0; ri--) {
+                var normRecent = this._recentFolders[ri].path.replace(/\\+$/, '').toLowerCase();
+                if (normRecent === normDir) {
+                    this._recentFolders.splice(ri, 1);
+                }
+            }
             this.saveFavorites();
+            this.renderFavorites();
             this.loadDirectory(this.currentPath);
         }
     }
@@ -9590,7 +11095,8 @@ class LocalBrowsePlugin extends Plugin {
      */
     loadVisibleThumbnails(container) {
         if (!container) return;
-        var wraps = container.querySelectorAll('.cd-thumb-wrap[data-src]:not([data-loaded]):not([data-large])');
+        // 同时加载图片缩略图和音频内嵌封面
+        var wraps = container.querySelectorAll('.cd-thumb-wrap[data-src]:not([data-loaded]):not([data-large]), .cd-thumb-wrap[data-audio-path]:not([data-loaded])');
         if (wraps.length === 0) return;
 
         var containerRect = container.getBoundingClientRect();
@@ -9635,6 +11141,34 @@ class LocalBrowsePlugin extends Plugin {
 
             wrap.dataset.loaded = '1';
             that._thumbLoading++;
+
+            var audioPath = wrap.dataset.audioPath;
+            if (audioPath) {
+                // 异步提取音频内嵌封面，避免阻塞图片缩略图队列
+                setTimeout(function() {
+                    var coverUrl = that.extractAudioCover(audioPath);
+                    if (coverUrl && wrap.parentNode) {
+                        var img = document.createElement('img');
+                        img.src = coverUrl;
+                        img.decoding = 'async';
+                        img.style.cssText = 'width:100%;height:100%;object-fit:cover;display:block;opacity:0;transition:opacity 0.15s';
+                        img.onload = function() {
+                            this.style.opacity = '1';
+                        };
+                        var placeholder = wrap.querySelector('.cd-thumb-placeholder');
+                        if (placeholder) {
+                            wrap.replaceChild(img, placeholder);
+                        } else {
+                            wrap.innerHTML = '';
+                            wrap.appendChild(img);
+                        }
+                    }
+                    that._thumbLoading--;
+                    that._processThumbQueue();
+                }, 0);
+                continue;
+            }
+
             var src = wrap.dataset.src;
             var img = document.createElement('img');
             img.src = src;

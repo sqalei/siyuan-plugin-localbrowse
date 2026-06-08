@@ -1,6 +1,6 @@
 ## Overview
 
-**LocalBrowse** is a SiYuan Note desktop plugin that provides a local file browser in the right Dock panel. It supports browsing, searching, bookmarking, one-click file link insertion, automatic broken link repair, and cross-device sync folder functionality.
+**LocalBrowse** is a SiYuan Note desktop plugin that provides a local file browser in the right Dock panel. It supports browsing, searching, bookmarking, one-click file link insertion, automatic broken link repair, and cross-device sync folder functionality. Starting from v0.9.0, bookmarks have been fully rebuilt into a "Top Quick Bar + Floating Tree Groups" multi-level structure with group management and path auto-repair.
 
 - **Platforms**: Windows / macOS / Linux desktop SiYuan Note (v3.0.0+)
 - **License**: GPL-3.0
@@ -33,7 +33,7 @@ Note: `LocalBrowseSync` is fixed. Select the parent folder of your sync disk (e.
 
 ### 5. Bookmark Folders
 
-Right-click a folder → "Add Bookmark". Click the bookmark tag at the top for one-click navigation.
+Right-click a folder → "Add Bookmark". Bookmarked folders appear in the top quick bar (last 5 visited). Hover over the ⭐📁 button on the toolbar to expand the full bookmark tree panel, supporting group management and drag-and-drop sorting.
 
 ### 6. Broken Link Auto-Repair
 
@@ -109,10 +109,41 @@ Automatically detects all available storage. Switch quickly via the top-left dro
 
 ### ⭐ Bookmarks
 
-- **Add Bookmark**: Right-click a folder → "Add Bookmark"
-- **Remove Bookmark**: Right-click a bookmarked folder → "Remove Bookmark"
-- **Reorder**: Drag bookmark tags
-- **Quick Navigation**: Click a bookmark tag to jump directly
+Starting from v0.9.0, bookmarks have been upgraded from flat tags to a "Top Quick Bar + Floating Tree Groups" multi-level structure.
+
+#### Top Quick Bar
+
+The toolbar area displays the 5 most recently visited bookmarked folders for one-click quick access.
+
+#### Floating Bookmark Tree Panel
+
+Hover over the ⭐📁 button on the toolbar to automatically expand the `#cd-fav-tree-wrap` floating panel, showing the complete bookmark group tree. The panel auto-hides when the mouse moves away.
+
+#### Group Management
+
+- **Create/Rename/Delete Group**: Right-click a group name to open the menu
+- **Collapse/Expand**: Click the arrow before a group to toggle its expanded state
+- **Group Name Color**: Automatically follows the SiYuan theme primary color (`var(--b3-theme-primary)`)
+
+#### Drag-and-Drop Operations
+
+- **Bookmark → Group**: Drag a bookmark item to another group to move it across groups
+- **Group Reordering**: Drag group names to adjust group order
+- **Intra-group Sorting**: Drag bookmark items to adjust their order within the same group
+
+#### Bookmark Path Auto-Repair
+
+When a folder is moved or renamed, the plugin automatically detects it on startup and searches for a same-name folder by priority to repair the path:
+
+1. Parent directory of the old path and its subdirectories (supports one-level nesting)
+2. Grandparent directory of the old path and its subdirectories
+3. Great-grandparent directory (direct subdirectories only)
+4. Common user directories (Desktop/Documents/Downloads/Music/Pictures/Videos)
+5. Windows drive letter root directories
+
+**Unique Match Principle**: Auto-repair only occurs when exactly 1 match is found. Multiple matches preserve the original path to avoid false matches. Toast feedback is provided for both success and failure.
+
+> 💡 Flat bookmarks from older versions are automatically preserved in the default group.
 
 ### 📊 Sorting
 
@@ -127,9 +158,18 @@ Click the ☰ / ⊞ button on the toolbar to switch:
 
 Preference is saved automatically.
 
----
+### ⚙️ Settings
 
-### 🔗 Broken Link Repair
+Click the ⚙️ gear icon at the bottom-right of the plugin card to open the settings panel:
+
+| Setting | Options | Default |
+|---------|---------|---------|
+| 📁 Folder Open Mode | Plugin Default / System Default | Plugin Default |
+| 🎬 Video Open Mode | SiYuan Default / System Default | SiYuan Default |
+
+- **Plugin Default**: Locate and open the folder in the plugin panel
+- **System Default**: Open with the system default application
+- **SiYuan Default**: Let SiYuan Note handle the opening
 
 The plugin automatically detects `file:///` local links in the current document. The toolbar indicator light shows status:
 
@@ -209,7 +249,7 @@ Double-click any audio file to play. Built-in music player features:
 - **Playback Controls**: Play/pause, previous/next track, seekable progress bar
 - **Volume Control**: Adjustable volume slider with persistent settings
 - **Real-time Lyrics**: Auto-searches for .lrc lyric files, synchronized highlighting, click to seek
-- **Cover Art**: Auto-extracts MP3 embedded cover art, preloads covers during browsing
+- **Cover Art**: Auto-extracts MP3 embedded cover art, preloads covers during browsing; in icon view audio files display directory cover images first (cover.jpg / folder.jpg etc.), falling back to embedded MP3 cover extraction
 - **Immersive Experience**: Blurred cover art as lyrics background with crossfade transition animations
 - **Playlist**: Auto-detects all audio files in the current directory, continuous folder playback
 - **Preload Optimization**: Preloads next track audio and cover art for instant switching
@@ -284,6 +324,21 @@ A: Ensure the file exists on accessible storage. For mounted cloud drives, confi
 ---
 
 ## Changelog
+
+### v0.9.0
+
+**⭐ Bookmarks Rebuilt + Settings Panel + Audio Cover + Path Auto-Repair**
+
+- ⭐ Bookmarks upgraded from flat tags to "Top Quick Bar + Floating Tree Groups" multi-level structure
+- 📁 Floating bookmark tree panel: hover ⭐📁 button to auto-expand, supports group collapse/expand
+- 🏷️ Group management: create/rename/delete groups, group name color follows SiYuan theme
+- 🖱️ Drag-and-drop: move bookmarks across groups, reorder groups, intra-group sorting
+- 📍 Recent visits: top quick bar shows the 5 most recently visited bookmarked folders
+- ⚙️ New settings panel: folder/video open mode (plugin default / system default / SiYuan default)
+- 🎵 Audio file cover display: icon view shows directory cover first, falls back to MP3 ID3v2 embedded cover
+- 🔧 Bookmark path auto-repair: automatically searches for same-name folders after folder moves
+- 🐛 Fixed system mode opening files twice (500ms deduplication)
+- 🐛 Fixed document link clicks not syncing location to the plugin panel
 
 ### v0.8.0
 
