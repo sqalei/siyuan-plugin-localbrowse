@@ -48,6 +48,9 @@ class LocalBrowsePlugin extends Plugin {
         this.cachedPath = '';       // 当前缓存对应的目录路径
         this.isDeepSearchMode = false; // 是否处于深度搜索模式
         this.preSearchPath = '';    // 深度搜索前所在的目录，用于返回
+        this._searchHistory = [];   // 搜索历史 [{ query, results, searchedDirs, isStopped, starred, timestamp }]，最多10条
+        this._starredSearches = []; // 收藏的搜索记录，永久保留直到手动删除
+        this._searchHistoryDropdown = null; // 搜索历史下拉框 DOM 引用
         this.availableDrives = [];  // 可用存储列表 [{value, label}]
         this.favorites = [];        // 收藏的文件夹列表 [{path, name, groupId, pinToTop}]
         this.favoriteGroups = [{ id: 'default', name: '未分组', expanded: true, order: 0 }]; // 收藏分组（v2格式）
@@ -57,7 +60,9 @@ class LocalBrowsePlugin extends Plugin {
         this._favKeepOpenUntil = 0;     // 收藏树面板保持打开到该时间戳（Step 3 修复）
         this._favDragging = false;      // 是否正在拖拽收藏项（Step 3 拖拽修复）
         this._dragGroupId = null;       // 正在拖拽的分组ID（分组排序用）
+        this._flashFavGroupId = null;   // 拖拽收藏项到分组后需要闪烁高亮的目标分组ID
         this._recentFolders = [];       // 最近访问的文件夹列表（最近访问快捷入口）
+        this._audioCoverCache = {};     // 音频封面图缓存 {filePath_mtimeMs: dataUrl}
         this._openSettings = {
             folderOpenMode: 'localbrowser', // 文件夹打开方式（localbrowser=插件内打开, system=系统默认打开）
             fileOpenMode: {                // 文件分类打开方式
@@ -111,7 +116,7 @@ class LocalBrowsePlugin extends Plugin {
         this._lrcLines = [];       // 解析后的歌词行 [{time, text}, ...]
         this._lrcActiveIndex = -1; // 当前高亮歌词行索引
         this._lrcExpanded = false; // 歌词面板是否展开
-        this._lastAudioHighlight = null; // 文件列表中上次高亮的音频项
+        this._lastLocateHighlight = null; // 文件列表中上次高亮的定位项
         this._audioPlayerClosed = false; // 用户是否手动关闭了播放器（关闭后下次启动不再恢复）
         this._audioPlayMode = parseInt(localStorage.getItem('cd_audio_mode') || '0', 10) || 0; // 播放模式：0=随机播放，1=列表循环，2=单曲循环
         this._audioShouldAutoPlay = false; // 设置 src 后 canplay 时是否自动播放（恢复状态时不自动播放）
@@ -120,6 +125,27 @@ class LocalBrowsePlugin extends Plugin {
         if (isNaN(this._savedVolume) || this._savedVolume < 0 || this._savedVolume > 1) {
             this._savedVolume = 0.8; // 默认音量
         }
+        // 视频播放器状态（与音频播放器相同的机制）
+        this._videoPlayerClosed = false; // 用户是否手动关闭了视频播放器
+        this._videoCurrentPath = null;   // 当前播放视频的本地路径
+        this._videoCurrentName = null;   // 当前播放视频的文件名
+        this._flvPlayer = null;          // mpegts.js FLV 播放器实例
+        this._isFlvMode = false;         // 当前是否为 FLV 模式
+        this._flvPlayTimer = null;       // FLV 自动播放超时定时器
+        this._videoAvSyncTimer = null;   // 音视频同步定时器
+        this._isAvSyncing = false;       // 标记 A/V 同步中，防止播放按钮闪烁
+        this._videoSpeedPresets = [0.5, 0.75, 1, 1.25, 1.5, 2]; // 播放速度预设列表
+        this._loopSegMarkStart = null;   // 循环片段：两步标记的起点时间（秒），null 表示未标记（视频/音频共享，互斥播放）
+        this._loopPlayStart = null;      // 循环片段：播放循环起点（秒），从 URL ?t=start-end 解析（视频/音频共享）
+        this._loopPlayEnd = null;        // 循环片段：播放循环终点（秒），到达后自动跳回起点（视频/音频共享）
+        // 音频播放器专用循环状态（与视频互斥，但独立状态避免切换时残留）
+        this._audioLoopSegMarkStart = null;  // 音频循环片段标记起点
+        this._audioLoopPlayStart = null;     // 音频播放循环起点
+        this._audioLoopPlayEnd = null;       // 音频播放循环终点
+        this._audioSeekOnLoad = null;        // 音频加载后跳转的时间点（从 ?t=seconds 参数）
+        this._docHighlightLastIdx = -1;     // 文档中当前高亮的字幕片段索引（-1 表示无）
+        this._docSegmentsCache = null;       // 缓存文档片段列表 { mediaPath, segments }
+        this._docSegmentsCacheTimer = null;  // 缓存刷新定时器
         // 预加载缓存：提前准备下一首的封面、歌词，切歌时瞬间切换
         this._preloadData = null; // {path, nextIdx, coverUrl, coverIsBlob, coverBlurUrl, lrcLines, lrcTitle, lrcArtist}
         this._playlistBuildSeq = 0; // 播放列表构建版本号，防止异步回调覆盖
@@ -213,6 +239,7 @@ class LocalBrowsePlugin extends Plugin {
         this.loadPathSettings();
         this.loadPathMap();
         this.loadSyncRoots();
+        this._loadSearchHistory();
         this.registerDock();
         this.registerEditorDropHandler();
 
@@ -291,6 +318,11 @@ class LocalBrowsePlugin extends Plugin {
             clearTimeout(this._previewTimer);
             this._previewTimer = null;
         }
+        // 清理图片单击预览延迟计时器
+        if (this._imageClickTimer) {
+            clearTimeout(this._imageClickTimer);
+            this._imageClickTimer = null;
+        }
         // 清理滚动防抖计时器
         if (this._scrollTimer) {
             clearTimeout(this._scrollTimer);
@@ -348,6 +380,10 @@ class LocalBrowsePlugin extends Plugin {
         if (this._linkClickInterceptor) {
             document.removeEventListener('click', this._linkClickInterceptor, true);
             this._linkClickInterceptor = null;
+        }
+        if (this._windowVideoInterceptor) {
+            window.removeEventListener('click', this._windowVideoInterceptor, true);
+            this._windowVideoInterceptor = null;
         }
         // 清理拖拽源引用
         this._dragSource = null;
@@ -415,6 +451,23 @@ class LocalBrowsePlugin extends Plugin {
             this._audioEl.src = '';
             this._audioEl = null;
         }
+        // 保存视频播放器状态（如果用户没有手动关闭）
+        if (this._videoCurrentPath && !this._videoPlayerClosed) {
+            var vName = this._videoCurrentName;
+            if (!vName) {
+                var sep2 = this._sep;
+                var lastSep2 = this._videoCurrentPath.lastIndexOf(sep2);
+                if (lastSep2 < 0) {
+                    var altSep2 = (sep2 === '\\' || sep2 === '\\\\') ? '/' : '\\';
+                    var altIdx2 = this._videoCurrentPath.lastIndexOf(altSep2);
+                    if (altIdx2 > lastSep2) lastSep2 = altIdx2;
+                }
+                vName = lastSep2 >= 0 ? this._videoCurrentPath.substring(lastSep2 + 1) : this._videoCurrentPath;
+            }
+            this._saveVideoState(this._videoCurrentPath, vName);
+        }
+        // 清理视频播放器
+        if (this._closeVideoPlayer) this._closeVideoPlayer();
         // 清理 loading 延迟定时器
         if (this._audioLoadTimer) {
             clearTimeout(this._audioLoadTimer);
@@ -561,8 +614,9 @@ class LocalBrowsePlugin extends Plugin {
         // 导致平台被错误检测为 win32。Dock 面板渲染时重新检测并修正。
         this._correctPlatformIfNeeded();
 
-        // DOM 重建后需要重新绑定事件
-        this._audioEventsBound = false;
+            // DOM 重建后需要重新绑定事件
+            this._audioEventsBound = false;
+            this._videoEventsBound = false;
 
         var that = this;
         var el = this.dockPanel.element;
@@ -611,7 +665,7 @@ class LocalBrowsePlugin extends Plugin {
                     '<div id="cd-breadcrumb" style="flex:1;padding:0 0 0 8px;font-size:12px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:none;display:flex;align-items:center"></div>' +
                     '<button id="cd-sort-btn" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;white-space:nowrap" title="排序" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⇅ 名称</button>' +
                 '</div>' +
-                '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
+                '<div id="cd-file-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0;transition:padding-bottom 0.3s ease">' +
                     '<div style="padding:20px;text-align:center;color:#999">Loading...</div>' +
                 '</div>' +
                     '<div id="cd-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
@@ -642,12 +696,67 @@ class LocalBrowsePlugin extends Plugin {
                     '<div id="cd-assets-breadcrumb" style="flex:1;padding:0 0 0 8px;font-size:12px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:transparent;border:none;display:flex;align-items:center"></div>' +
                     '<button id="cd-assets-sort-btn" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;white-space:nowrap" title="排序" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">⇅ 名称</button>' +
                 '</div>' +
-                '<div id="cd-assets-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0">' +
+                '<div id="cd-assets-list" style="flex:1;overflow-y:auto;border:1px solid var(--b3-border,#e0e0e0);border-radius:4px;background:var(--b3-theme-background,#fff);min-height:0;transition:padding-bottom 0.3s ease">' +
                     '<div style="padding:20px;text-align:center;color:#999">切换到「内部资源」标签以查看</div>' +
                 '</div>' +
                 '<div id="cd-assets-stats-bar" style="padding:6px 10px;font-size:11px;color:var(--b3-theme-secondary,#999);flex-shrink:0;display:flex;align-items:center;gap:12px;border-top:1px solid var(--b3-border,#eee);min-height:20px;white-space:nowrap;overflow:hidden">' +
                     '<span id="cd-assets-stats-text" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis">加载中...</span>' +
                     '<span id="cd-assets-platform-badge" title="' + this.platformName + '" style="margin-left:auto;font-size:10px;font-weight:600;letter-spacing:0.3px;color:rgba(190,190,190,0.8);cursor:default;text-shadow:0 -1px 0 rgba(0,0,0,0.4)">' + this.platformName + '</span>' +
+                '</div>' +
+            '</div>' +
+            // === 视频播放栏（底部，和音频播放器互斥） ===
+            '<div id="cd-video-bar" style="display:none;flex-shrink:0;border-top:1px solid var(--b3-border,#eee);background:var(--b3-theme-background,#fff);flex-direction:column;width:100%;position:relative;z-index:5;transform:translateZ(0)">' +
+                '<div id="cd-video-wrap" style="position:relative;background:#000;cursor:pointer;flex-shrink:0;overflow:hidden;height:350px;min-height:150px;width:100%">' +
+                    '<div id="cd-video-resize-handle" style="position:absolute;top:0;left:0;right:0;height:6px;cursor:ns-resize;z-index:20;background:transparent;transition:background 0.2s" onmouseover="this.style.background=\'var(--b3-theme-primary,#4285f4)\'" onmouseout="this.style.background=\'transparent\'"></div>' +
+                    '<video id="cd-video-el" style="position:absolute;top:0;left:0;width:100%;height:100%;outline:none;background:#000;object-fit:contain;-webkit-object-fit:contain" preload="auto"></video>' +
+                    '<div id="cd-video-play-overlay" style="position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;transition:opacity 0.3s">' +
+                        '<svg viewBox="0 0 24 24" width="48" height="48" style="opacity:0.8"><polygon points="8,5 19,12 8,19" fill="#fff"/></svg>' +
+                    '</div>' +
+                '</div>' +
+                '<div style="padding:4px 10px;display:flex;align-items:center;gap:6px">' +
+                    '<span id="cd-video-rewind" class="cd-video-btn" title="快退5秒"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-play" class="cd-video-btn cd-video-btn-play" title="播放/暂停"><svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-forward" class="cd-video-btn" title="快进5秒"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-name" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333);cursor:pointer" title="定位到文件位置">未播放</span>' +
+                    '<span id="cd-video-sub-toggle" class="cd-video-btn" title="字幕开关"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H5V6h14v12zM7 10h2v2H7v2h4v-2H9v-2h2V8H7v2zm6 0h2v2h-2v2h4v-2h-2v-2h2V8h-4v2z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-timestamp" class="cd-video-btn" title="插入时间戳到笔记"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-loop-seg" class="cd-video-btn" title="循环片段：1️⃣点击标记起点"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-screenshot" class="cd-video-btn" title="截图并插入到笔记"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M12 15.2a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4zM9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-chapters" class="cd-video-btn" title="一键转换：文档里的时间→视频时间戳"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z" fill="currentColor"/></svg></span>' +
+                    '<div id="cd-video-speed-wrap" style="display:flex;align-items:center;flex-shrink:0;position:relative">' +
+                        '<span id="cd-video-speed" class="cd-video-btn cd-video-btn-speed" title="播放速度">1x</span>' +
+                        '<div id="cd-video-speed-popup" style="position:absolute;bottom:16px;left:50%;transform:translateX(-50%);width:80px;height:0;opacity:0;transition:height 0.2s,opacity 0.2s;overflow:hidden;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.12);z-index:30;display:flex;flex-direction:column;align-items:stretch">' +
+                            '<div class="cd-speed-opt" data-speed="0.5" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;transition:background 0.15s">0.5x</div>' +
+                            '<div class="cd-speed-opt" data-speed="0.75" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;transition:background 0.15s">0.75x</div>' +
+                            '<div class="cd-speed-opt" data-speed="1" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;font-weight:bold;transition:background 0.15s">1x</div>' +
+                            '<div class="cd-speed-opt" data-speed="1.25" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;transition:background 0.15s">1.25x</div>' +
+                            '<div class="cd-speed-opt" data-speed="1.5" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;transition:background 0.15s">1.5x</div>' +
+                            '<div class="cd-speed-opt" data-speed="2" style="padding:4px 8px;font-size:11px;cursor:pointer;text-align:center;white-space:nowrap;transition:background 0.15s">2x</div>' +
+                            '<div style="border-top:1px solid var(--b3-border,#e0e0e0);margin:2px 4px"></div>' +
+                            '<div style="display:flex;align-items:center;justify-content:center;gap:0;padding:2px 4px">' +
+                                '<span id="cd-video-speed-down" style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;cursor:pointer;border-radius:3px;transition:background 0.15s;font-size:14px;font-weight:bold;color:var(--b3-theme-on-background,#333);user-select:none" title="减慢0.05x">−</span>' +
+                                '<span id="cd-video-speed-fine" style="flex:1;text-align:center;font-size:10px;color:var(--b3-theme-secondary,#999);white-space:nowrap"></span>' +
+                                '<span id="cd-video-speed-up" style="display:inline-flex;align-items:center;justify-content:center;width:20px;height:20px;cursor:pointer;border-radius:3px;transition:background 0.15s;font-size:14px;font-weight:bold;color:var(--b3-theme-on-background,#333);user-select:none" title="加快0.05x">+</span>' +
+                            '</div>' +
+                        '</div>' +
+                    '</div>' +
+                    '<div id="cd-video-volume-wrap" style="display:flex;align-items:center;flex-shrink:0;position:relative">' +
+                        '<span id="cd-video-volume-btn" class="cd-video-btn" title="静音/恢复"><svg viewBox="0 0 24 24" width="14" height="14"><path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" fill="currentColor"/></svg></span>' +
+                        '<div id="cd-video-volume-popup" style="position:absolute;bottom:24px;left:50%;transform:translateX(-50%);width:28px;height:0;opacity:0;transition:height 0.2s,opacity 0.2s;overflow:hidden;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:4px;box-shadow:0 2px 8px rgba(0,0,0,0.12);z-index:30;display:flex;align-items:center;justify-content:center">' +
+                            '<input id="cd-video-volume-slider" type="range" min="0" max="100" value="100" style="width:80px;height:4px;cursor:pointer;accent-color:var(--b3-theme-primary,#4285f4);margin:0;padding:0;transform:rotate(-90deg)">' +
+                        '</div>' +
+                    '</div>' +
+                    '<span id="cd-video-fullscreen" class="cd-video-btn" title="全屏"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" fill="currentColor"/></svg></span>' +
+                    '<span id="cd-video-close" class="cd-video-btn" title="关闭视频"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z" fill="currentColor"/></svg></span>' +
+                '</div>' +
+                '<div style="padding:0 10px 4px;display:flex;align-items:center;gap:8px">' +
+                    '<span id="cd-video-time-current" style="font-size:10px;color:var(--b3-theme-secondary,#999);flex-shrink:0;white-space:nowrap;min-width:36px;text-align:right">0:00</span>' +
+                    '<div id="cd-video-progress-wrap" style="flex:1;height:3px;background:var(--b3-border,#e0e0e0);border-radius:2px;cursor:pointer;position:relative">' +
+                        '<div id="cd-video-progress" style="position:absolute;top:0;left:0;height:100%;background:var(--b3-theme-primary,#4285f4);border-radius:2px;width:0%;pointer-events:none"></div>' +
+                        '<div id="cd-video-progress-thumb" style="position:absolute;top:50%;left:0;width:8px;height:8px;background:#fff;border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 2px rgba(0,0,0,0.3);pointer-events:none;opacity:0;transition:opacity 0.2s,left 0.1s linear"></div>' +
+                        '<div id="cd-video-progress-tip" style="position:absolute;bottom:8px;left:0;transform:translateX(-50%);font-size:10px;color:#fff;background:rgba(0,0,0,0.75);padding:2px 6px;border-radius:3px;pointer-events:none;opacity:0;transition:opacity 0.15s;white-space:nowrap;z-index:5"></div>' +
+                    '</div>' +
+                    '<span id="cd-video-time-total" style="font-size:10px;color:var(--b3-theme-secondary,#999);flex-shrink:0;white-space:nowrap;min-width:36px">0:00</span>' +
                 '</div>' +
             '</div>' +
             // === 共享音频播放器 ===
@@ -669,6 +778,8 @@ class LocalBrowsePlugin extends Plugin {
                     '<span id="cd-audio-mode" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="随机播放"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M10.59 9.17L5.41 4 4 5.41l5.17 5.17 1.42-1.41zM14.5 4l2.04 2.04L4 18.59 5.41 20 17.96 7.46 20 9.5V4h-5.5zm.33 9.41l-1.41 1.41 3.13 3.13L14.5 20H20v-5.5l-2.04 2.04-3.13-3.13z" fill="currentColor"/></svg></span>' +
                     '<span id="cd-audio-name" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333);cursor:pointer" title="打开所在文件夹">未播放</span>' +
                     '<span id="cd-audio-lrc-toggle" class="cd-audio-lrc-btn" style="cursor:pointer;font-size:11px;opacity:0.35;flex-shrink:0;transition:opacity 0.2s,color 0.2s" title="歌词">词</span>' +
+                    '<span id="cd-audio-timestamp" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="插入时间戳"><svg viewBox="0 0 24 24" width="12" height="12"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none"/><path d="M12 7v5l3 3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg></span>' +
+                    '<span id="cd-audio-loop-seg" class="cd-audio-btn" style="width:24px;height:24px;padding:0" title="循环片段：1️⃣点击标记起点"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M17 1l4 4-4 4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M3 11V9a4 4 0 014-4h14M7 23l-4-4 4-4" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/><path d="M21 13v2a4 4 0 01-4 4H3" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg></span>' +
                     '<span id="cd-audio-time" style="font-size:10px;color:var(--b3-theme-secondary,#999);flex-shrink:0;white-space:nowrap">0:00/0:00</span>' +
                     '<span id="cd-audio-vol-icon" style="cursor:pointer;font-size:12px;flex-shrink:0" title="静音">🔊</span>' +
                     '<input id="cd-audio-vol" type="range" min="0" max="100" value="80" style="width:50px;height:3px;flex-shrink:0;cursor:pointer;accent-color:var(--b3-theme-primary,#4285f4)">' +
@@ -866,6 +977,8 @@ class LocalBrowsePlugin extends Plugin {
         if (favTreeToggleBtn && favTreeWrap) {
             favTreeToggleBtn.addEventListener('mouseenter', function() {
                 if (favTreeWrap.style.display === 'none') {
+                    // 打开收藏夹面板时，关闭搜索历史下拉框（避免重叠）
+                    that._hideSearchHistory();
                     favTreeWrap.style.display = 'flex';
                     that._favSidebarVisible = true;
                     that.renderFavTree();
@@ -968,6 +1081,7 @@ class LocalBrowsePlugin extends Plugin {
                     }
                 }
                 if (moved) {
+                    that._flashFavGroupId = groupId;
                     that.saveFavorites();
                     that.renderFavorites();
                 }
@@ -983,13 +1097,19 @@ class LocalBrowsePlugin extends Plugin {
             });
         });
 
-        // 初始化时把音频播放器放入当前活动面板（默认 local），放在统计栏上方
-        var initAudioBar = document.getElementById('cd-audio-bar');
+        // 初始化时把视频播放栏和音频播放器放入当前活动面板（默认 local），放在统计栏上方
         var initPanel = document.getElementById('cd-panel-' + (that._activeTab || 'local'));
         if (initPanel) {
             var initStats = initPanel.querySelector('#cd-stats-bar, #cd-assets-stats-bar');
-            if (initStats && initAudioBar) {
-                initPanel.insertBefore(initAudioBar, initStats);
+            var initVideoBar = document.getElementById('cd-video-bar');
+            var initAudioBar = document.getElementById('cd-audio-bar');
+            if (initStats) {
+                if (initVideoBar) {
+                    initPanel.insertBefore(initVideoBar, initStats);
+                }
+                if (initAudioBar) {
+                    initPanel.insertBefore(initAudioBar, initStats);
+                }
             }
         }
 
@@ -1077,6 +1197,8 @@ class LocalBrowsePlugin extends Plugin {
             searchInput.addEventListener('input', function() {
                 var query = this.value.trim();
                 if (clearBtn) clearBtn.style.display = query ? 'block' : 'none';
+                // 输入时关闭历史下拉框
+                that._hideSearchHistory();
                 // 防抖 200ms，大目录下避免每次按键都触发全量过滤
                 if (that._searchDebounceTimer) {
                     clearTimeout(that._searchDebounceTimer);
@@ -1090,6 +1212,17 @@ class LocalBrowsePlugin extends Plugin {
                     var query = this.value.trim();
                     if (query) {
                         that.startDeepSearch(query);
+                    }
+                }
+            });
+            // 点击搜索框时切换历史记录下拉框（搜索框为空时）
+            searchInput.addEventListener('click', function() {
+                if (!this.value.trim() && that._searchHistory.length > 0) {
+                    // 已显示则收起，未显示则展开
+                    if (that._searchHistoryDropdown) {
+                        that._hideSearchHistory();
+                    } else {
+                        that._showSearchHistory();
                     }
                 }
             });
@@ -1187,6 +1320,11 @@ class LocalBrowsePlugin extends Plugin {
 
         // 恢复上次音频播放器状态（如果用户没有手动关闭）
         this._restoreAudioState();
+
+        // 恢复上次视频播放器状态（如果用户没有手动关闭）
+        if (!this._videoPlayerClosed) {
+            this._restoreVideoState();
+        }
 
         // 渲染收藏夹（DOM 已就绪）
         this.renderFavorites();
@@ -1306,6 +1444,8 @@ class LocalBrowsePlugin extends Plugin {
             this.cachedPath = '';
             this.isDeepSearchMode = false;
         }
+        // 注意：不清除 _searchHistory，让搜索框可以显示历史记录
+        // 只有用户主动点搜索历史项后才由历史功能管理
         if (clearBtn) clearBtn.style.display = 'none';
         // 搜索框始终显示（根目录也可搜索）
         if (searchWrap) {
@@ -1399,6 +1539,8 @@ class LocalBrowsePlugin extends Plugin {
 
             // 初始化小房子状态
             this._updateBreadcrumbHomeState();
+
+            // 如果有保存的搜索状态，显示「返回搜索结果」按钮
         }
 
         fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">正在加载...</div>';
@@ -1910,6 +2052,9 @@ class LocalBrowsePlugin extends Plugin {
 
         if (!fileListEl) return;
 
+        // 关闭搜索历史下拉框
+        that._hideSearchHistory();
+
         // 如果正在搜索，先取消上一次
         if (this._deepSearchAbort) {
             this._deepSearchAbort.cancelled = true;
@@ -1932,6 +2077,10 @@ class LocalBrowsePlugin extends Plugin {
         that._searchIsCancelled = false;
         var currentSearchedDirs = 0;
         var currentMatchedFiles = 0;
+        // 存储到实例上，供停止按钮访问
+        that._deepSearchPartialResults = partialResults;
+        that._deepSearchCurrentQuery = query;
+        that._deepSearchSearchedDirs = 0;
 
         var pendingRender = false;
 
@@ -1961,9 +2110,11 @@ class LocalBrowsePlugin extends Plugin {
 
         function onPartialResult(items, searchedDirs, matchedFiles) {
             if (that._searchIsCancelled) return;
-            partialResults = partialResults.concat(items);
+            // 用 push 而非 concat，原地修改数组，确保 that._deepSearchPartialResults 引用不变
+            for (var pi = 0; pi < items.length; pi++) { partialResults.push(items[pi]); }
             currentSearchedDirs = searchedDirs || currentSearchedDirs;
             currentMatchedFiles = matchedFiles || currentMatchedFiles;
+            that._deepSearchSearchedDirs = currentSearchedDirs;
             scheduleRender();
         }
 
@@ -1979,9 +2130,19 @@ class LocalBrowsePlugin extends Plugin {
             // 如果已取消，且用户已经通过 loadDirectory 导航走了（不在深度搜索模式），则不再更新 UI
             if (wasCancelled || that._searchIsCancelled) {
                 if (that.isDeepSearchMode) {
-                    // 用户还没导航走，显示"已取消"状态
-                    that.renderSearchBreadcrumb(query, false, 0);
-                    fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">搜索已取消</div>';
+                    // 用户点了停止按钮，保留已有结果显示
+                    var stoppedResults = that._deepSearchPartialResults || partialResults;
+                    that.cachedFiles = stoppedResults;
+                    that.cachedPath = that.currentPath;
+                    // 保存到搜索历史
+                    that._addSearchHistory(query, stoppedResults, that._deepSearchSearchedDirs, true);
+                    if (stoppedResults.length === 0) {
+                        that.renderSearchBreadcrumb(query, false, 0, 0, true);
+                        fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">搜索已停止，未找到结果</div>';
+                    } else {
+                        that.renderSearchBreadcrumb(query, false, stoppedResults.length, that._deepSearchSearchedDirs, true);
+                        that.doRender(stoppedResults, that.currentPath, query, true);
+                    }
                 }
                 return;
             }
@@ -1990,6 +2151,9 @@ class LocalBrowsePlugin extends Plugin {
             that.cachedFiles = finalResults;
             that.cachedPath = that.currentPath;
             that.isDeepSearchMode = true;
+
+            // 保存到搜索历史
+            that._addSearchHistory(query, finalResults, that._deepSearchSearchedDirs, false);
 
             if (finalResults.length === 0) {
                 that.renderSearchBreadcrumb(query, false, 0);
@@ -2002,9 +2166,304 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 添加搜索历史记录（去重，最多保留10条）
+     */
+    _addSearchHistory(query, results, searchedDirs, isStopped) {
+        if (!query || !results) return;
+        // 去重：同一关键词更新结果
+        for (var i = this._searchHistory.length - 1; i >= 0; i--) {
+            if (this._searchHistory[i].query === query) {
+                this._searchHistory.splice(i, 1);
+            }
+        }
+        this._searchHistory.unshift({
+            query: query,
+            results: results.slice(), // 浅拷贝
+            resultCount: results.length,
+            searchedDirs: searchedDirs || 0,
+            isStopped: !!isStopped,
+            starred: this._isSearchStarred(query),
+            timestamp: Date.now()
+        });
+        // 最多保留10条（收藏的也会被挤掉，但收藏夹里的独立保存不受影响）
+        if (this._searchHistory.length > 10) {
+            this._searchHistory.length = 10;
+        }
+        // 持久化搜索历史
+        this._saveSearchHistory();
+    }
+
+    /**
+     * 显示搜索历史下拉框
+     */
+    _showSearchHistory() {
+        var that = this;
+        if (this._searchHistory.length === 0) return;
+
+        // 移除已有的下拉框
+        this._hideSearchHistory();
+
+        // 打开搜索历史时，关闭收藏夹面板（避免重叠）
+        var favTreeWrap = document.getElementById('cd-fav-tree-wrap');
+        if (favTreeWrap && favTreeWrap.style.display !== 'none') {
+            favTreeWrap.style.display = 'none';
+            this._favSidebarVisible = false;
+        }
+
+        var searchWrap = document.getElementById('cd-search-wrap');
+        var searchInput = document.getElementById('cd-search');
+        if (!searchWrap || !searchInput) return;
+
+        var dropdown = document.createElement('div');
+        dropdown.id = 'cd-search-history';
+        dropdown.style.cssText = 'position:absolute;left:0;right:0;top:28px;z-index:10;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,0.15);max-height:280px;overflow-y:auto;font-size:12px';
+
+        var headerRow = document.createElement('div');
+        headerRow.style.cssText = 'padding:6px 10px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--b3-border,#eee)';
+        headerRow.innerHTML = '<span style="color:var(--b3-theme-secondary,#999);font-size:11px">搜索历史</span><span id="cd-clear-search-history" style="color:var(--b3-theme-error,#e53935);cursor:pointer;font-size:11px">清空</span>';
+        dropdown.appendChild(headerRow);
+
+        for (var i = 0; i < this._searchHistory.length; i++) {
+            (function(item) {
+                var row = document.createElement('div');
+                row.style.cssText = 'padding:6px 10px;cursor:pointer;display:flex;align-items:center;gap:6px;border-bottom:1px solid var(--b3-border,#f5f5f5);transition:background 0.15s';
+                row.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,rgba(0,0,0,0.06))'; });
+                row.addEventListener('mouseleave', function() { this.style.background = 'transparent'; });
+
+                var countText = item.resultCount + ' 个结果';
+                if (item.isStopped) countText += '（已停止）';
+
+                var starIcon = document.createElement('span');
+                starIcon.style.cssText = 'flex-shrink:0;cursor:pointer;font-size:13px;width:18px;text-align:center;user-select:none';
+                starIcon.textContent = item.starred ? '★' : '☆';
+                starIcon.style.color = item.starred ? '#ffa726' : 'var(--b3-theme-secondary,#999)';
+                starIcon.title = item.starred ? '取消收藏' : '收藏该搜索';
+                starIcon.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    that._toggleSearchStar(item.query);
+                    // 更新图标
+                    var newStarred = false;
+                    for (var k = 0; k < that._searchHistory.length; k++) {
+                        if (that._searchHistory[k].query === item.query) {
+                            newStarred = that._searchHistory[k].starred;
+                            break;
+                        }
+                    }
+                    starIcon.textContent = newStarred ? '★' : '☆';
+                    starIcon.style.color = newStarred ? '#ffa726' : 'var(--b3-theme-secondary,#999)';
+                    starIcon.title = newStarred ? '取消收藏' : '收藏该搜索';
+                    // 更新收藏夹树
+                    that.renderFavTree();
+                });
+
+                var querySpan = document.createElement('span');
+                querySpan.style.cssText = 'flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333)';
+                querySpan.textContent = item.query;
+
+                var countSpan = document.createElement('span');
+                countSpan.style.cssText = 'flex-shrink:0;color:var(--b3-theme-secondary,#999);font-size:11px';
+                countSpan.textContent = countText;
+
+                row.appendChild(starIcon);
+                row.appendChild(querySpan);
+                row.appendChild(countSpan);
+
+                row.addEventListener('click', function(e) {
+                    // 如果点击的是星号，不触发行点击
+                    if (e.target === starIcon) return;
+                    e.stopPropagation();
+                    // 恢复该条搜索结果
+                    that.isDeepSearchMode = true;
+                    that.cachedFiles = item.results;
+                    that.cachedPath = that.currentPath;
+                    that._deepSearchCurrentQuery = item.query;
+                    that._deepSearchSearchedDirs = item.searchedDirs || 0;
+                    // 更新搜索框
+                    if (searchInput) { searchInput.value = item.query; searchInput.disabled = false; }
+                    var cb = document.getElementById('cd-clear-search');
+                    if (cb) cb.style.display = 'inline';
+                    // 渲染搜索结果
+                    that.renderSearchBreadcrumb(item.query, false, item.results.length, item.searchedDirs, item.isStopped);
+                    that.doRender(item.results, that.currentPath, item.query, true);
+                    that._hideSearchHistory();
+                });
+                dropdown.appendChild(row);
+            })(this._searchHistory[i]);
+        }
+
+        searchWrap.appendChild(dropdown);
+        this._searchHistoryDropdown = dropdown;
+
+        // 清空按钮（保留已收藏的搜索记录）
+        var clearHistoryBtn = dropdown.querySelector('#cd-clear-search-history');
+        if (clearHistoryBtn) {
+            clearHistoryBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._searchHistory = [];
+                that._saveSearchHistory();
+                that._hideSearchHistory();
+            });
+        }
+
+        // 点击其他区域关闭
+        setTimeout(function() {
+            that._searchHistoryClickOutside = function(e) {
+                if (dropdown && !dropdown.contains(e.target) && e.target !== searchInput) {
+                    that._hideSearchHistory();
+                }
+            };
+            document.addEventListener('mousedown', that._searchHistoryClickOutside);
+        }, 0);
+    }
+
+    /**
+     * 隐藏搜索历史下拉框
+     */
+    _hideSearchHistory() {
+        if (this._searchHistoryDropdown) {
+            this._searchHistoryDropdown.remove();
+            this._searchHistoryDropdown = null;
+        }
+        if (this._searchHistoryClickOutside) {
+            document.removeEventListener('mousedown', this._searchHistoryClickOutside);
+            this._searchHistoryClickOutside = null;
+        }
+    }
+
+    /**
+     * 从 data.json 加载搜索历史
+     */
+    _loadSearchHistory() {
+        var that = this;
+        try {
+            if (typeof this.loadData === 'function') {
+                this.loadData('searchHistory').then(function(data) {
+                    if (data && Array.isArray(data)) {
+                        that._searchHistory = data;
+                    }
+                }).catch(function() {});
+                this.loadData('starredSearches').then(function(data) {
+                    if (data && Array.isArray(data)) {
+                        that._starredSearches = data;
+                    }
+                }).catch(function() {});
+            } else {
+                var saved = localStorage.getItem('cd_search_history');
+                if (saved) {
+                    var parsed = JSON.parse(saved);
+                    if (Array.isArray(parsed)) that._searchHistory = parsed;
+                }
+                var savedStarred = localStorage.getItem('cd_starred_searches');
+                if (savedStarred) {
+                    var parsedStarred = JSON.parse(savedStarred);
+                    if (Array.isArray(parsedStarred)) that._starredSearches = parsedStarred;
+                }
+            }
+        } catch (e) {
+            // 忽略错误
+        }
+    }
+
+    /**
+     * 保存搜索历史到 data.json
+     */
+    _saveSearchHistory() {
+        var that = this;
+        try {
+            if (typeof this.saveData === 'function') {
+                this.saveData('searchHistory', this._searchHistory).catch(function() {});
+            } else {
+                localStorage.setItem('cd_search_history', JSON.stringify(this._searchHistory));
+            }
+        } catch (e) {}
+    }
+
+    /**
+     * 保存收藏的搜索记录到 data.json
+     */
+    _saveStarredSearches() {
+        var that = this;
+        try {
+            if (typeof this.saveData === 'function') {
+                this.saveData('starredSearches', this._starredSearches).catch(function() {});
+            } else {
+                localStorage.setItem('cd_starred_searches', JSON.stringify(this._starredSearches));
+            }
+        } catch (e) {}
+    }
+
+    /**
+     * 判断搜索是否已收藏
+     */
+    _isSearchStarred(query) {
+        for (var i = 0; i < this._starredSearches.length; i++) {
+            if (this._starredSearches[i].query === query) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 切换搜索的收藏状态（操作 _starredSearches，与搜索历史独立）
+     */
+    _toggleSearchStar(query) {
+        // 在 _starredSearches 中查找
+        var existingIdx = -1;
+        for (var i = 0; i < this._starredSearches.length; i++) {
+            if (this._starredSearches[i].query === query) {
+                existingIdx = i;
+                break;
+            }
+        }
+
+        if (existingIdx >= 0) {
+            // 已收藏 → 取消收藏
+            this._starredSearches.splice(existingIdx, 1);
+        } else {
+            // 未收藏 → 从 _searchHistory 中找到对应数据添加到收藏
+            var sourceItem = null;
+            for (var j = 0; j < this._searchHistory.length; j++) {
+                if (this._searchHistory[j].query === query) {
+                    sourceItem = this._searchHistory[j];
+                    break;
+                }
+            }
+            if (sourceItem) {
+                this._starredSearches.push({
+                    query: sourceItem.query,
+                    results: sourceItem.results.slice(),
+                    resultCount: sourceItem.resultCount,
+                    searchedDirs: sourceItem.searchedDirs || 0,
+                    isStopped: sourceItem.isStopped,
+                    timestamp: sourceItem.timestamp || Date.now()
+                });
+            } else {
+                // 历史记录已被挤出或清空，创建最小化收藏记录
+                this._starredSearches.push({
+                    query: query,
+                    results: [],
+                    resultCount: 0,
+                    searchedDirs: 0,
+                    isStopped: false,
+                    timestamp: Date.now()
+                });
+            }
+        }
+
+        // 同步更新 _searchHistory 中的 starred 标记（仅影响显示图标）
+        for (var k = 0; k < this._searchHistory.length; k++) {
+            if (this._searchHistory[k].query === query) {
+                this._searchHistory[k].starred = (existingIdx < 0);
+            }
+        }
+
+        this._saveSearchHistory();
+        this._saveStarredSearches();
+    }
+
+    /**
      * 渲染深度搜索时的面包屑（带返回按钮和进度信息）
      */
-    renderSearchBreadcrumb(query, isLoading, resultCount, searchedDirs) {
+    renderSearchBreadcrumb(query, isLoading, resultCount, searchedDirs, isStopped) {
         var that = this;
         var breadcrumbEl = document.getElementById('cd-breadcrumb');
         if (!breadcrumbEl) return;
@@ -2014,7 +2473,7 @@ class LocalBrowsePlugin extends Plugin {
 
         var searchLabel = document.createElement('span');
         if (isLoading) {
-            var progress = '🔍 深度搜索: ' + query + '（';
+            var progress = '🔍 ' + query + '（';
             var parts = [];
             if (typeof searchedDirs === 'number' && searchedDirs > 0) {
                 parts.push('已搜索 ' + searchedDirs + ' 个目录');
@@ -2028,11 +2487,63 @@ class LocalBrowsePlugin extends Plugin {
             progress += parts.join('，') + '）';
             searchLabel.textContent = progress;
         } else {
-            searchLabel.textContent = '🔍 深度搜索: ' + query;
+            if (isStopped) {
+                searchLabel.textContent = '🔍 ' + query + '（已停止）';
+            } else {
+                searchLabel.textContent = '🔍 ' + query;
+            }
         }
         searchLabel.style.fontWeight = 'bold';
         searchLabel.style.color = 'var(--b3-theme-on-background,#333)';
         breadcrumbEl.appendChild(searchLabel);
+
+        // 搜索中：在结果信息后边添加停止按钮
+        if (isLoading) {
+            var stopBtn = document.createElement('span');
+            stopBtn.textContent = '⏹';
+            stopBtn.style.cursor = 'pointer';
+            stopBtn.style.color = 'var(--b3-theme-error,#e53935)';
+            stopBtn.style.fontSize = '12px';
+            stopBtn.style.marginLeft = '4px';
+            stopBtn.style.verticalAlign = 'middle';
+            stopBtn.title = '停止搜索（保留已找到的结果）';
+            stopBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                // 停止搜索，但保留已有结果
+                that._searchIsCancelled = true;
+                if (that._searchRenderTimer) {
+                    clearTimeout(that._searchRenderTimer);
+                    that._searchRenderTimer = null;
+                }
+                if (that._deepSearchAbort) {
+                    that._deepSearchAbort.cancelled = true;
+                    that._deepSearchAbort = null;
+                }
+                var searchInput = document.getElementById('cd-search');
+                if (searchInput) {
+                    searchInput.disabled = false;
+                }
+                // 保留深度搜索模式和已有结果，渲染当前已找到的结果
+                that.isDeepSearchMode = true;
+                var currentResults = that._deepSearchPartialResults || [];
+                var currentQuery = that._deepSearchCurrentQuery || query;
+                var currentSD = that._deepSearchSearchedDirs || 0;
+                // 保存到缓存，支持后续实时过滤
+                that.cachedFiles = currentResults;
+                that.cachedPath = that.currentPath;
+                // 保存到搜索历史
+                that._addSearchHistory(currentQuery, currentResults, currentSD, true);
+                if (currentResults.length === 0) {
+                    that.renderSearchBreadcrumb(currentQuery, false, 0, 0, true);
+                    var fileListEl = document.getElementById('cd-file-list');
+                    if (fileListEl) fileListEl.innerHTML = '<div style="padding:20px;text-align:center;color:#999">搜索已停止，未找到结果</div>';
+                } else {
+                    that.renderSearchBreadcrumb(currentQuery, false, currentResults.length, currentSD, true);
+                    that.doRender(currentResults, that.currentPath, currentQuery, true);
+                }
+            });
+            breadcrumbEl.appendChild(stopBtn);
+        }
 
         if (!isLoading) {
             var sep = document.createElement('span');
@@ -2193,7 +2704,7 @@ class LocalBrowsePlugin extends Plugin {
                         if (abortFlag.cancelled) break;
 
                         var entry = entries[i];
-                        if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') continue;
+                        if (entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information') continue;
 
                         // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
                         if (entry.name === 'Data' && normalizedPath === '/System/Volumes/') continue;
@@ -2326,7 +2837,13 @@ class LocalBrowsePlugin extends Plugin {
      */
     _applyBottomPadding() {
         var pb = '';
-        if (this._lrcExpanded) {
+        // 视频播放栏优先（比音频播放栏更高）
+        var videoBar = document.getElementById('cd-video-bar');
+        var videoBarVisible = videoBar && (videoBar.style.display === 'flex' || videoBar.style.display === 'block');
+        if (videoBarVisible) {
+            // 视频栏是 flex item，文件列表会自动给它让空间，不需要额外 padding
+            pb = '0px';
+        } else if (this._lrcExpanded) {
             pb = '200px';
         } else {
             var audioBar = document.getElementById('cd-audio-bar');
@@ -2453,12 +2970,16 @@ class LocalBrowsePlugin extends Plugin {
                 var fullPath = f.path || ((currentPath.endsWith(that._sep) ? currentPath : currentPath + that._sep) + f.name);
 
                 var relativePathHtml = '';
+                var searchPathDir = ''; // 用于路径点击跳转的完整目录路径
                 if (isDeepSearch && f.relativePath) {
                     var displayPath = that.escapeHtml(f.relativePath);
                     var lastSlash = Math.max(displayPath.lastIndexOf('\\'), displayPath.lastIndexOf('/'));
                     var folderPath = lastSlash > 0 ? displayPath.substring(0, lastSlash) : '';
                     if (folderPath) {
-                        relativePathHtml = '<div style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">📂 ' + folderPath + '</div>';
+                        // 从完整路径提取目录路径，用于点击跳转
+                        var absLastSlash = Math.max(fullPath.lastIndexOf('\\'), fullPath.lastIndexOf('/'));
+                        searchPathDir = absLastSlash > 0 ? fullPath.substring(0, absLastSlash) : '';
+                        relativePathHtml = '<div class="cd-search-path" data-dirpath="' + that.escapeHtml(searchPathDir) + '" style="font-size:11px;color:var(--b3-theme-secondary,#999);margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer" title="点击打开所在目录">📂 ' + folderPath + '</div>';
                     }
                 }
 
@@ -2516,6 +3037,7 @@ class LocalBrowsePlugin extends Plugin {
 
         // 恢复滚动位置
         that._restoreScrollPosition(fileListEl, currentPath);
+
     }
 
     /**
@@ -3011,7 +3533,7 @@ class LocalBrowsePlugin extends Plugin {
         if (!document.getElementById('cd-expand-hover-style')) {
             var hoverStyle = document.createElement('style');
             hoverStyle.id = 'cd-expand-hover-style';
-            hoverStyle.textContent = '.cd-list-expand:hover,.cd-asset-arrow:hover,.cd-asset-doc-arrow:hover{background:var(--b3-theme-hover,rgba(0,0,0,0.06));border-radius:3px}';
+            hoverStyle.textContent = '.cd-list-expand:hover,.cd-asset-arrow:hover,.cd-asset-doc-arrow:hover{background:var(--b3-theme-hover,rgba(0,0,0,0.06));border-radius:3px}.cd-search-path:hover{text-decoration:underline;color:var(--b3-theme-primary,#4285f4)}';
             document.head.appendChild(hoverStyle);
         }
         var items = fileListEl.querySelectorAll('.cd-item:not([data-bound])');
@@ -3027,6 +3549,18 @@ class LocalBrowsePlugin extends Plugin {
                         var linkPath = e.target.dataset.linkpath;
                         if (linkPath) {
                             that.openLinkedDoc(linkPath);
+                        }
+                        return;
+                    }
+
+                    // 如果点击的是深度搜索结果中的路径，跳转到所在目录并高亮该文件
+                    var searchPathEl = e.target.closest ? e.target.closest('.cd-search-path') : null;
+                    if (searchPathEl) {
+                        var dirPath = searchPathEl.dataset.dirpath;
+                        var fileName = item.dataset.name;
+                        if (dirPath && fileName) {
+                            that._pendingLocateFileName = fileName;
+                            that.loadDirectory(dirPath);
                         }
                         return;
                     }
@@ -3087,7 +3621,7 @@ class LocalBrowsePlugin extends Plugin {
                     // 文件：单击选中
                     var name = item.dataset.name;
                     var nameExt = name.split('.').pop().toLowerCase();
-                    // 图片文件：单击预览
+                    // 图片文件：单击预览（延迟250ms，避免与双击冲突）
                     if (that.isImageFile(name) && nameExt !== 'livp') {
                         var itemPath = item.dataset.path;
                         // 从 files 数组中查找对应的文件大小和修改时间（兼容列表/图标视图）
@@ -3107,8 +3641,11 @@ class LocalBrowsePlugin extends Plugin {
                         }
                         // 使用单击时的鼠标位置定位预览
                         that._previewMousePos = { x: e.clientX, y: e.clientY };
-                        that.showImagePreview(itemPath, name, fileSize, fileMtime);
-                        that._previewCurrentPath = itemPath;
+                        if (that._imageClickTimer) clearTimeout(that._imageClickTimer);
+                        that._imageClickTimer = setTimeout(function() {
+                            that.showImagePreview(itemPath, name, fileSize, fileMtime);
+                            that._previewCurrentPath = itemPath;
+                        }, 250);
                     }
                     that.selectItem(item, e);
                 });
@@ -3116,6 +3653,12 @@ class LocalBrowsePlugin extends Plugin {
                 item.addEventListener('dblclick', function(e) {
                     e.preventDefault();
                     e.stopPropagation();
+                    // 取消单击预览定时器，避免双击时先弹出预览
+                    if (that._imageClickTimer) {
+                        clearTimeout(that._imageClickTimer);
+                        that._imageClickTimer = null;
+                    }
+                    that.hideImagePreview();
 
                     var isDir = item.dataset.isdir === 'true';
                     var itemPath = item.dataset.path;
@@ -5029,6 +5572,11 @@ class LocalBrowsePlugin extends Plugin {
             // 文件右键菜单：插入链接、插入文件、关联当前文档、打开所在位置、剪切、查看属性
             items.push({ icon: '📎', label: '插入链接', action: isDocker ? null : function() { that.handleFileClick(filePath, fileName); }, disabled: isDocker });
             items.push({ icon: '📦', label: '插入文件', action: function() { that.copyFileToAssets(filePath, fileName); } });
+            // 字幕文件额外选项：导入字幕内容到当前文档
+            var fileExt = fileName ? fileName.split('.').pop().toLowerCase() : '';
+            if (fileExt === 'srt' || fileExt === 'ass' || fileExt === 'ssa' || fileExt === 'vtt') {
+                items.push({ icon: '📝', label: '导入字幕到文档', action: function() { that._importSubtitleToDoc(filePath); } });
+            }
             // 关联当前文档
             if (that.isFileDocLinked(filePath)) {
                 items.push({ icon: '🔗', label: '取消关联', action: function() { that.unlinkFileDoc(filePath); } });
@@ -5155,34 +5703,3088 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 播放视频文件
-     * 优先调用思播(siyuan-media-player)插件播放，降级到系统默认播放器
+     * 查找视频文件同目录下的字幕文件
+     * 支持格式：.srt .ass .vtt .ssa
+     * 匹配规则：同名（video.srt）或带语言后缀（video.en.srt）
+     * @returns {Array<{path:string,name:string}>} 字幕文件列表
      */
-    playVideo(filePath, fileName) {
-        var that = this;
-        var fileUrl = this.toFileUrl(filePath);
+    _findSubtitleFiles(videoPath) {
+        try {
+            var fs = require('fs');
+            var path = require('path');
+            var dir = path.dirname(videoPath);
+            var videoName = path.basename(videoPath, path.extname(videoPath));
+            var subtitleExts = { '.srt': 1, '.ass': 1, '.vtt': 1, '.ssa': 1 };
+            var files = fs.readdirSync(dir);
+            var results = [];
+            for (var i = 0; i < files.length; i++) {
+                var f = files[i];
+                var ext = path.extname(f).toLowerCase();
+                if (!subtitleExts[ext]) continue;
+                var base = path.basename(f, ext);
+                // 基础匹配：video.srt
+                if (base === videoName) {
+                    results.push({ path: path.join(dir, f), name: f });
+                    continue;
+                }
+                // 带语言后缀匹配：video.en.srt, video.zh.ass
+                var prefix = base.split('.')[0];
+                if (prefix === videoName) {
+                    results.push({ path: path.join(dir, f), name: f });
+                }
+            }
+            // 按文件名排序，基础匹配优先
+            results.sort(function(a, b) {
+                var aBase = path.basename(a.name, path.extname(a.name));
+                var bBase = path.basename(b.name, path.extname(b.name));
+                // 基础匹配（无语言后缀）排前面
+                var aIsBase = aBase === videoName;
+                var bIsBase = bBase === videoName;
+                if (aIsBase && !bIsBase) return -1;
+                if (!aIsBase && bIsBase) return 1;
+                return a.name.localeCompare(b.name);
+            });
+            return results;
+        } catch (e) {
+            return [];
+        }
+    }
 
-        // 优先：尝试调用思播(siyuan-media-player)插件播放
+    /**
+     * 根据设置决定视频打开方式（插件默认 / 思源默认 / 电脑默认）
+     */
+    _openVideoByMode(filePath, subtitleUrl) {
+        var mode = this._getFileOpenMode(filePath);
+        if (mode === 'siyuan') {
+            // 插件默认：使用内置播放器播放
+            this._openVideoInPanel(filePath, subtitleUrl);
+        } else if (mode === 'smp') {
+            // 思源默认：调用思播(siyuan-media-player)播放，不可用时降级到系统播放器
+            this._playVideoWithSiyuan(filePath, subtitleUrl);
+        } else {
+            // 电脑默认：系统播放器（带字幕处理）
+            this._openVideoWithSubtitle(filePath, subtitleUrl);
+        }
+    }
+
+    /**
+     * 思播模式：调用 siyuan-media-player 插件播放视频，不可用时降级到系统播放器
+     */
+    _playVideoWithSiyuan(filePath, subtitleUrl) {
+        var that = this;
+        var fileUrl = that.toFileUrl(filePath);
+        // 尝试调用思播(siyuan-media-player)
         try {
             var smp = window.siyuanMediaPlayer;
             if (smp && typeof smp.playLink === 'function') {
                 smp.playLink(fileUrl).then(function(ok) {
                     if (!ok) {
-                        // 思播无法解析该URL，打开系统默认播放器
-                        that.openFile(filePath);
+                        that._log('_playVideoWithSiyuan: 思播返回失败，降级到系统播放器');
+                        that._openVideoWithSubtitle(filePath, subtitleUrl);
                     }
                 }).catch(function(e) {
-                    that._error('思播播放失败，打开系统默认播放器:', e);
-                    that.openFile(filePath);
+                    that._log('_playVideoWithSiyuan: 思播调用出错，降级到系统播放器:', e);
+                    that._openVideoWithSubtitle(filePath, subtitleUrl);
                 });
                 return;
             }
         } catch (e) {
-            that._error('调用思播失败:', e);
+            that._log('_playVideoWithSiyuan: 思播不可用，降级到系统播放器');
+        }
+        // 思播不可用，降级到系统播放器
+        that._openVideoWithSubtitle(filePath, subtitleUrl);
+    }
+
+    /**
+     * 在插件面板底部的视频播放栏中播放视频
+     * 类似音频播放器的体验，视频画面+控制栏固定在面板底部
+     * 支持字幕注入、播放/暂停、进度拖拽、字幕开关
+     */
+    _openVideoInPanel(filePath, subtitleUrl, autoPlay) {
+        var that = this;
+        var videoBar = document.getElementById('cd-video-bar');
+        var videoEl = document.getElementById('cd-video-el');
+        if (!videoBar || !videoEl) {
+            that._error('_openVideoInPanel: 视频播放栏元素不存在，降级到对话框');
+            that._openVideoInDialog(filePath, subtitleUrl);
+            return;
+        }
+        // autoPlay 默认为 true（正常打开时自动播放，恢复状态时不自动播放）
+        if (autoPlay === undefined) autoPlay = true;
+
+        // 切换视频时重置文档高亮状态
+        that._docHighlightLastIdx = -1;
+        that._docSegmentsCache = null;
+        if (that._docSegmentsCacheTimer) { clearTimeout(that._docSegmentsCacheTimer); that._docSegmentsCacheTimer = null; }
+
+        // 解析 filePath 中的时间参数 ?t=xxx（秒数或 mm:ss 格式，支持范围 ?t=start-end）
+        var startTime = 0;
+        that._loopPlayStart = null;
+        that._loopPlayEnd = null;
+        that._loopSegMarkStart = null;
+        // 重置循环片段按钮视觉状态（切换/重新打开视频时）
+        var prevLoopBtn = document.getElementById('cd-video-loop-seg');
+        if (prevLoopBtn) { prevLoopBtn.classList.remove('cd-active'); prevLoopBtn.title = '循环片段：1️⃣点击标记起点'; }
+        // 清除旧的音频警告
+        var oldAudioWarn = document.getElementById('cd-video-audio-warn');
+        if (oldAudioWarn) oldAudioWarn.remove();
+        var cleanFilePath = filePath;
+        var tMatch = filePath.match(/[?&]t=([^&#]+)/);
+        if (tMatch) {
+            var tParam = tMatch[1];
+            // 检查是否为范围格式 ?t=30-75 或 ?t=00:30-01:15
+            var rangeMatch = tParam.match(/^(.+?)-(.+)$/);
+            if (rangeMatch) {
+                startTime = that._parseTimestampParam(rangeMatch[1]);
+                that._loopPlayStart = startTime;
+                that._loopPlayEnd = that._parseTimestampParam(rangeMatch[2]);
+                // 确保 start <= end，否则交换
+                if (that._loopPlayEnd < that._loopPlayStart) {
+                    var _tmp = that._loopPlayStart;
+                    that._loopPlayStart = that._loopPlayEnd;
+                    that._loopPlayEnd = _tmp;
+                    startTime = that._loopPlayStart;
+                }
+                that._log('循环片段播放: start=' + startTime + ', end=' + that._loopPlayEnd);
+                // 高亮循环片段按钮，表示正在循环
+                if (prevLoopBtn) { prevLoopBtn.classList.add('cd-active'); prevLoopBtn.title = '点击取消循环'; }
+            } else {
+                startTime = that._parseTimestampParam(tParam);
+            }
+            cleanFilePath = filePath.replace(/[?&]t=[^&#]+/, '').replace(/\?$/, '');
+            filePath = cleanFilePath;
         }
 
-        // 思播未安装或不可用，打开系统默认播放器
+        // 如果当前有视频在播放，先保存当前高度（切换视频时不会调用 _closeVideoPlayer）
+        var existingWrap = document.getElementById('cd-video-wrap');
+        if (existingWrap && videoBar.style.display !== 'none') {
+            try {
+                var curH = existingWrap.offsetHeight;
+                if (curH && curH > 50) localStorage.setItem('cd-video-bar-height', curH);
+            } catch(e) {}
+        }
+
+        // 关闭音频播放器（互斥）
+        if (that._audioEl) {
+            that._audioEl.pause();
+        }
+        var audioBar = document.getElementById('cd-audio-bar');
+        if (audioBar) audioBar.style.display = 'none';
+        var audioLrcPanel = document.getElementById('cd-audio-lrc-panel');
+        if (audioLrcPanel) audioLrcPanel.style.display = 'none';
+        // 清除已保存的音频播放器状态（互斥：视频打开时音频不应恢复）
+        that._audioPlayerClosed = true;
+        that._audioCurrentPath = null;
+        that._audioLoopSegMarkStart = null;
+        that._audioLoopPlayStart = null;
+        that._audioLoopPlayEnd = null;
+        that._clearDocSegmentHighlight();
+        that._saveAudioState(null, null);
+
+        var fileUrl = this.toFileUrl(filePath);
+        var fileName = '';
+        try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+
+        // 显示视频播放栏：恢复用户上次调节的高度
+        videoBar.style.display = 'flex';
+        videoBar.style.flexGrow = '';
+        videoBar.style.flexShrink = '0';
+        videoBar.style.overflow = 'hidden';
+        videoBar.style.visibility = 'visible';
+        videoBar.style.opacity = '1';
+        // 强制重排确保浏览器立即应用样式
+        void videoBar.offsetHeight;
+        // 调试：添加明显边框以便确认视频栏是否可见
+        var videoWrap = document.getElementById('cd-video-wrap');
+        if (videoWrap) {
+            videoWrap.style.flex = '';
+            videoWrap.style.maxHeight = '';
+            // 恢复用户上次调节的高度
+            var savedH = '';
+            try { savedH = localStorage.getItem('cd-video-bar-height'); } catch(e) {}
+            var savedNum = parseInt(savedH, 10);
+            if (savedNum && savedNum > 50) {
+                videoWrap.style.height = savedNum + 'px';
+            } else {
+                videoWrap.style.height = '';  // 回退到 HTML 默认 350px
+            }
+        }
+
+        // 检测 FLV 格式（浏览器原生不支持，需要 mpegts.js）
+        var videoExt = '';
+        try { videoExt = require('path').extname(filePath).toLowerCase(); } catch(e) {
+            var dotIdx = filePath.lastIndexOf('.');
+            videoExt = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
+        }
+
+        // 清理之前的 FLV 播放器及 Blob URL
+        if (this._flvPlayer) {
+            try { this._flvPlayer.destroy(); } catch(e) {}
+            this._flvPlayer = null;
+        }
+        if (this._flvBlobUrl) {
+            try { URL.revokeObjectURL(this._flvBlobUrl); } catch(e) {}
+            this._flvBlobUrl = null;
+        }
+        if (this._flvPlayTimer) {
+            clearTimeout(this._flvPlayTimer);
+            this._flvPlayTimer = null;
+        }
+        // 清除旧的音视频同步定时器
+        if (this._videoAvSyncTimer) { clearInterval(this._videoAvSyncTimer); this._videoAvSyncTimer = null; }
+
+        // 更新文件名
+        var nameEl = document.getElementById('cd-video-name');
+        if (nameEl) nameEl.textContent = fileName;
+
+        // 检查是否是同一个视频（只是时间戳不同）—— 直接 seek 不重新加载，避免黑屏
+        var currentPath = that._videoCurrentPath ? that._videoCurrentPath.split('?')[0] : null;
+        var isSameVideo = currentPath && currentPath === cleanFilePath && !that._isFlvMode && videoBar.style.display !== 'none';
+        if (isSameVideo) {
+            that._log('_openVideoInPanel: 同一个视频，直接跳转到 ' + startTime + 's');
+            // 循环片段状态已在函数开头从 ?t= 参数解析设置（that._loopPlayStart/End）
+            // seek 到目标时间（优先 startTime，否则循环起点，否则不 seek）
+            var seekTarget = startTime > 0 ? startTime : (that._loopPlayStart !== null ? that._loopPlayStart : null);
+            if (seekTarget !== null && videoEl.duration && seekTarget < videoEl.duration) {
+                videoEl.currentTime = seekTarget;
+            }
+            if (autoPlay && videoEl.paused) {
+                var pp = videoEl.play();
+                if (pp && typeof pp.catch === 'function') {
+                    pp.catch(function() {});
+                }
+            }
+            // 显示播放栏（如果隐藏了）
+            videoBar.style.display = 'flex';
+            that._applyBottomPadding();
+            return;
+        }
+
+        if (videoExt === '.flv') {
+            // FLV 格式：使用 mpegts.js 播放
+            this._isFlvMode = true;
+            this._playFlvVideo(videoEl, filePath, autoPlay);
+        } else {
+            // 普通视频格式：直接设置 src
+            this._isFlvMode = false;
+            videoEl.autoplay = autoPlay;
+            videoEl.src = fileUrl;
+            // 如果有时间参数，加载后自动跳转
+            if (startTime > 0) {
+                videoEl.addEventListener('loadedmetadata', function onMeta() {
+                    videoEl.removeEventListener('loadedmetadata', onMeta);
+                    videoEl.currentTime = startTime;
+                }, { signal: that._videoEventController ? that._videoEventController.signal : undefined });
+            }
+            // 显式调用 play() 确保在用户交互上下文中立即播放（仅当 autoPlay 为 true 时）
+            if (autoPlay) {
+                var playPromise = videoEl.play();
+                if (playPromise && typeof playPromise.catch === 'function') {
+                    playPromise.catch(function(err) {
+                        that._log('视频自动播放被阻止（可能需要静音）:', err.message || err);
+                        // 尝试静音后再次播放
+                        videoEl.muted = true;
+                        videoEl.play().then(function() {
+                            that._log('静音后自动播放成功');
+                            // 短暂延迟后取消静音（部分浏览器允许）
+                            setTimeout(function() { videoEl.muted = false; }, 300);
+                        }).catch(function() {
+                            that._log('静音后仍无法自动播放，等待用户点击');
+                        });
+                    });
+                }
+            }
+        } // end of else (non-FLV)
+
+        // 清除旧字幕轨道
+        var oldTracks = videoEl.querySelectorAll('track');
+        for (var i = 0; i < oldTracks.length; i++) { oldTracks[i].remove(); }
+        // 同时禁用视频内嵌字幕轨道（MKV 等格式可能自带字幕，浏览器会自动加载并显示）
+        var embeddedTracks = videoEl.textTracks;
+        for (var ti = 0; ti < embeddedTracks.length; ti++) { embeddedTracks[ti].mode = 'hidden'; }
+
+        // 提前创建 AbortController（字幕回调可能同步执行，需要确保 controller 已存在）
+        if (!that._videoEventsBound) {
+            that._videoEventController = new AbortController();
+        }
+
+        // 注入字幕
+        that._videoSubtitleUrl = subtitleUrl || null;
+        var subToggle = document.getElementById('cd-video-sub-toggle');
+        // 如果没有传入字幕 URL，自动检测同目录字幕文件
+        if (!subtitleUrl) {
+            var autoSubs = that._findSubtitleFiles(cleanFilePath);
+            that._log('_openVideoInPanel: 自动检测字幕文件, videoPath=' + cleanFilePath + ', found=' + autoSubs.length + (autoSubs.length > 0 ? ', first=' + autoSubs[0].name : ''));
+            if (autoSubs.length > 0) {
+                subtitleUrl = that.toFileUrl(autoSubs[0].path);
+                that._videoSubtitleUrl = subtitleUrl;
+            }
+        }
+        if (subtitleUrl) {
+            // 将字幕文件转换为 VTT Blob URL（HTML5 <track> 仅支持 WebVTT 格式）
+            that._convertSubtitleToVttUrl(subtitleUrl, filePath, function(vttUrl) {
+                if (vttUrl) {
+                    var track = document.createElement('track');
+                    track.kind = 'subtitles';
+                    track.src = vttUrl;
+                    track.label = '字幕';
+                    track.default = true;
+                    videoEl.appendChild(track);
+                    // 强制显示字幕（使用 once: true 防止监听器累积）
+                    var forceShowSubtitles = function() {
+                        var tracks = videoEl.textTracks;
+                        for (var k = 0; k < tracks.length; k++) { tracks[k].mode = 'showing'; }
+                    };
+                    videoEl.addEventListener('loadedmetadata', forceShowSubtitles, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
+                    videoEl.addEventListener('canplay', forceShowSubtitles, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
+                    // 延迟强制显示（有时 loadedmetadata 触发太早）
+                    setTimeout(forceShowSubtitles, 500);
+                    setTimeout(forceShowSubtitles, 1500);
+                    // 字幕轨道已添加，立即更新字幕按钮状态
+                    var subBtn = document.getElementById('cd-video-sub-toggle');
+                    if (subBtn) {
+                        subBtn.style.opacity = '';
+                        subBtn.style.pointerEvents = '';
+                        subBtn.classList.add('cd-active');
+                        subBtn.title = '关闭字幕';
+                    }
+                } else {
+                    that.showToastMsg('⚠️ 字幕格式不支持显示');
+                }
+            });
+            if (subToggle) {
+                // 有字幕：可点击状态（高亮在字幕加载后由 change 事件处理）
+                subToggle.style.opacity = '';
+                subToggle.style.pointerEvents = '';
+            }
+        } else {
+            if (subToggle) {
+                // 无字幕：灰色不可点击
+                subToggle.classList.remove('cd-active');
+                subToggle.style.opacity = '0.3';
+                subToggle.style.pointerEvents = 'none';
+            }
+        }
+
+        // 根据 autoPlay 参数设置播放按钮初始状态
+        that._updateVideoPlayBtn(autoPlay ? 'pause' : 'play');
+
+        // 绑定视频事件（防重复绑定）
+        if (!that._videoEventsBound) {
+            // AbortController 已提前创建（确保字幕回调可用）
+            // 临时覆盖 addEventListener，自动注入 signal，避免手动添加到每个调用
+            var _origAEL = EventTarget.prototype.addEventListener;
+            var _sig = that._videoEventController.signal;
+            EventTarget.prototype.addEventListener = function(type, listener, options) {
+                if (options && typeof options === 'object') {
+                    if (!options.signal) options.signal = _sig;
+                } else {
+                    options = { signal: _sig };
+                }
+                return _origAEL.call(this, type, listener, options);
+            };
+            try {
+
+            // 时间更新 → 更新进度条、thumb 和两侧时间显示
+            videoEl.addEventListener('timeupdate', function() {
+                var progressEl = document.getElementById('cd-video-progress');
+                var thumbEl = document.getElementById('cd-video-progress-thumb');
+                var curEl = document.getElementById('cd-video-time-current');
+                var totEl = document.getElementById('cd-video-time-total');
+                if (!videoEl.duration) return;
+                var pct = (videoEl.currentTime / videoEl.duration * 100).toFixed(1);
+                if (progressEl) progressEl.style.width = pct + '%';
+                if (thumbEl) thumbEl.style.left = pct + '%';
+                if (curEl) curEl.textContent = that._formatDuration(videoEl.currentTime);
+                if (totEl) totEl.textContent = that._formatDuration(videoEl.duration);
+                // 循环片段：到达终点时跳回起点
+                if (that._loopPlayEnd !== null && that._loopPlayStart !== null && videoEl.currentTime >= that._loopPlayEnd) {
+                    videoEl.currentTime = that._loopPlayStart;
+                }
+                // 自动定位文档中对应的字幕片段
+                that._highlightDocSegment(videoEl.currentTime, that._videoCurrentPath);
+            });
+
+            // 音视频不同步修复：Chromium 在 DOM 操作或渲染压力大时视频帧会滞后
+            // 定期短暂 pause+play 触发重新同步（仅对原生视频，FLV 模式由 mpegts.js 自行管理）
+            // 注意：此定时器在 _videoEventsBound 块内创建，仅在首次绑定时执行
+            that._startVideoAvSyncTimer(videoEl);
+
+            // 播放/暂停状态变化（A/V 同步期间的 pause+play 不更新按钮）
+            videoEl.addEventListener('play', function() { if (!that._isAvSyncing) that._updateVideoPlayBtn('pause'); });
+            videoEl.addEventListener('pause', function() { if (!that._isAvSyncing) that._updateVideoPlayBtn('play'); });
+            videoEl.addEventListener('ended', function() { that._updateVideoPlayBtn('play'); });
+
+            // 点击视频画面 → 播放/暂停 + 短暂显示大图标
+            videoEl.addEventListener('click', function() {
+                if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+                // 显示大播放/暂停图标
+                var overlay = document.getElementById('cd-video-play-overlay');
+                if (overlay) {
+                    var svg = overlay.querySelector('svg');
+                    if (svg) {
+                        if (videoEl.paused) {
+                            svg.innerHTML = '<polygon points="8,5 19,12 8,19" fill="#fff"/>';
+                        } else {
+                            svg.innerHTML = '<rect x="6" y="5" width="4" height="14" rx="1" fill="#fff"/><rect x="14" y="5" width="4" height="14" rx="1" fill="#fff"/>';
+                        }
+                    }
+                    overlay.style.opacity = '0.8';
+                    setTimeout(function() { overlay.style.opacity = '0'; }, 600);
+                }
+            });
+
+            // 双击视频画面 → 全屏
+            videoEl.addEventListener('dblclick', function() {
+                that._toggleVideoFullscreen();
+            });
+
+            // 视频画面右键菜单
+            videoEl.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                // 移除已有的菜单
+                var oldMenu = document.getElementById('cd-video-ctx-menu');
+                if (oldMenu) oldMenu.remove();
+                var menu = document.createElement('div');
+                menu.id = 'cd-video-ctx-menu';
+                menu.style.cssText = 'position:fixed;z-index:99999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:6px;box-shadow:0 4px 16px rgba(0,0,0,0.15);padding:4px 0;min-width:160px;font-size:12px;color:var(--b3-theme-on-background,#333);cursor:default';
+                function addMenuItem(label, shortKey, cb) {
+                    var item = document.createElement('div');
+                    item.style.cssText = 'padding:6px 12px;cursor:pointer;transition:background 0.15s;display:flex;justify-content:space-between;align-items:center;gap:16px';
+                    item.innerHTML = '<span>' + label + '</span>' + (shortKey ? '<span style="color:var(--b3-theme-secondary,#999);font-size:10px">' + shortKey + '</span>' : '');
+                    item.addEventListener('mouseenter', function() { item.style.background = 'var(--b3-theme-surface,#f0f0f0)'; });
+                    item.addEventListener('mouseleave', function() { item.style.background = ''; });
+                    item.addEventListener('click', function() { menu.remove(); cb(); });
+                    menu.appendChild(item);
+                    return item;
+                }
+                var curTime = videoEl.currentTime || 0;
+                var isPaused = videoEl.paused;
+                addMenuItem(isPaused ? '播放' : '暂停', 'Space', function() {
+                    if (isPaused) { videoEl.play(); } else { videoEl.pause(); }
+                });
+                addMenuItem('快退 5 秒', '←', function() {
+                    videoEl.currentTime = Math.max(0, curTime - 5);
+                });
+                addMenuItem('快进 5 秒', '→', function() {
+                    if (videoEl.duration) videoEl.currentTime = Math.min(videoEl.duration, curTime + 5);
+                });
+                // 分隔线
+                var sep = document.createElement('div');
+                sep.style.cssText = 'height:1px;background:var(--b3-border,#e0e0e0);margin:4px 8px';
+                menu.appendChild(sep);
+                addMenuItem('插入时间戳到笔记', '', function() {
+                    that._insertVideoTimestamp(videoEl.currentTime);
+                });
+                addMenuItem('截图并插入到笔记', '', function() {
+                    that._handleScreenshot();
+                });
+                addMenuItem('复制当前时间戳', '', function() {
+                    var ts = that._formatMediaTime(curTime);
+                    var name = that._videoCurrentName || '视频';
+                    var text = '[' + name + ' ' + ts + ']';
+                    try { navigator.clipboard.writeText(text); } catch(e2) {}
+                    // 复制完成，静默
+                });
+                // 分隔线
+                var sep2 = document.createElement('div');
+                sep2.style.cssText = 'height:1px;background:var(--b3-border,#e0e0e0);margin:4px 8px';
+                menu.appendChild(sep2);
+                addMenuItem('循环片段', '', function() {
+                    that._handleLoopSegment();
+                });
+                addMenuItem('全屏切换', 'F', function() {
+                    that._toggleVideoFullscreen();
+                });
+                // 分隔线
+                var sep3 = document.createElement('div');
+                sep3.style.cssText = 'height:1px;background:var(--b3-border,#e0e0e0);margin:4px 8px';
+                menu.appendChild(sep3);
+                addMenuItem('用系统播放器打开', '', function() {
+                    that._openVideoWithSystemPlayer();
+                });
+                // 定位菜单
+                document.body.appendChild(menu);
+                var mx = e.clientX, my = e.clientY;
+                // 确保不超出屏幕
+                requestAnimationFrame(function() {
+                    var mw = menu.offsetWidth, mh = menu.offsetHeight;
+                    if (mx + mw > window.innerWidth) mx = window.innerWidth - mw - 4;
+                    if (my + mh > window.innerHeight) my = window.innerHeight - mh - 4;
+                    menu.style.left = mx + 'px';
+                    menu.style.top = my + 'px';
+                });
+                // 点击任意位置关闭菜单
+                function closeMenu() { menu.remove(); document.removeEventListener('click', closeMenu); document.removeEventListener('contextmenu', closeMenu); }
+                setTimeout(function() { document.addEventListener('click', closeMenu); document.addEventListener('contextmenu', closeMenu); }, 10);
+            });
+
+            // 播放按钮
+            var playBtn = document.getElementById('cd-video-play');
+            if (playBtn) {
+                playBtn.addEventListener('click', function() {
+                    if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+                });
+            }
+
+            // 视频名称点击定位
+            var videoNameEl = document.getElementById('cd-video-name');
+            if (videoNameEl) {
+                videoNameEl.addEventListener('click', function() {
+                    if (that._videoCurrentPath) {
+                        that.locateFileInPanel(that._videoCurrentPath);
+                    }
+                });
+            }
+
+            // 快退/快进按钮
+            var rewindBtn = document.getElementById('cd-video-rewind');
+            var forwardBtn = document.getElementById('cd-video-forward');
+            if (rewindBtn) {
+                rewindBtn.addEventListener('click', function() {
+                    videoEl.currentTime = Math.max(0, videoEl.currentTime - 5);
+                });
+            }
+            if (forwardBtn) {
+                forwardBtn.addEventListener('click', function() {
+                    if (videoEl.duration) videoEl.currentTime = Math.min(videoEl.duration, videoEl.currentTime + 5);
+                });
+            }
+
+            // 关闭按钮
+            var closeBtn = document.getElementById('cd-video-close');
+            if (closeBtn) {
+                closeBtn.addEventListener('click', function() {
+                    // 标记用户手动关闭，下次启动不再恢复播放器
+                    that._videoPlayerClosed = true;
+                    that._videoCurrentPath = null;
+                    that._videoCurrentName = null;
+                    that._saveVideoState(null, null);
+                    that._closeVideoPlayer();
+                });
+            }
+
+            // 全屏按钮
+            var fullscreenBtn = document.getElementById('cd-video-fullscreen');
+            if (fullscreenBtn) {
+                fullscreenBtn.addEventListener('click', function() {
+                    that._toggleVideoFullscreen();
+                });
+            }
+
+            // 监听全屏状态变化，同步按钮图标
+            document.addEventListener('fullscreenchange', that._onFullscreenChange = function() {
+                var fsBtn = document.getElementById('cd-video-fullscreen');
+                if (!fsBtn) return;
+                var isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+                var svg = fsBtn.querySelector('svg');
+                if (isFs) {
+                    fsBtn.title = '退出全屏';
+                    if (svg) svg.innerHTML = '<path d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z" fill="currentColor"/>';
+                } else {
+                    fsBtn.title = '全屏';
+                    if (svg) svg.innerHTML = '<path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" fill="currentColor"/>';
+                }
+            });
+            document.addEventListener('webkitfullscreenchange', that._onFullscreenChange);
+
+            // 键盘快捷键（仅视频播放器可见时生效）
+            that._videoKeyHandler = function(e) {
+                var vBar = document.getElementById('cd-video-bar');
+                if (!vBar || vBar.style.display === 'none') return;
+                // 如果焦点在输入框内，不拦截
+                var tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : '';
+                if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.target.isContentEditable) return;
+                switch(e.key) {
+                    case ' ':
+                        e.preventDefault();
+                        if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+                        break;
+                    case 'ArrowLeft':
+                        e.preventDefault();
+                        videoEl.currentTime = Math.max(0, videoEl.currentTime - 5);
+                        break;
+                    case 'ArrowRight':
+                        e.preventDefault();
+                        if (videoEl.duration) videoEl.currentTime = Math.min(videoEl.duration, videoEl.currentTime + 5);
+                        break;
+                    case 'ArrowUp':
+                        e.preventDefault();
+                        videoEl.volume = Math.min(1, videoEl.volume + 0.1);
+                        break;
+                    case 'ArrowDown':
+                        e.preventDefault();
+                        videoEl.volume = Math.max(0, videoEl.volume - 0.1);
+                        break;
+                    case 'f':
+                    case 'F':
+                        e.preventDefault();
+                        that._toggleVideoFullscreen();
+                        break;
+                }
+            };
+            document.addEventListener('keydown', that._videoKeyHandler);
+
+            // 字幕开关
+            var subToggleBtn = document.getElementById('cd-video-sub-toggle');
+            if (subToggleBtn) {
+                // 根据是否有字幕轨道设置按钮初始状态
+                function updateSubBtnState() {
+                    var tracks = videoEl.textTracks;
+                    if (tracks.length === 0) {
+                        // 无字幕：灰色不可点击
+                        subToggleBtn.classList.remove('cd-active');
+                        subToggleBtn.style.opacity = '0.3';
+                        subToggleBtn.style.pointerEvents = 'none';
+                        subToggleBtn.title = '无字幕';
+                    } else {
+                        // 有字幕：可点击，根据当前显示状态决定高亮
+                        subToggleBtn.style.opacity = '';
+                        subToggleBtn.style.pointerEvents = '';
+                        var hasShowing = false;
+                        for (var i = 0; i < tracks.length; i++) {
+                            if (tracks[i].mode === 'showing') { hasShowing = true; break; }
+                        }
+                        if (hasShowing) {
+                            subToggleBtn.classList.add('cd-active');
+                            subToggleBtn.title = '关闭字幕';
+                        } else {
+                            subToggleBtn.classList.remove('cd-active');
+                            subToggleBtn.title = '开启字幕';
+                        }
+                    }
+                }
+                subToggleBtn.addEventListener('click', function() {
+                    var tracks = videoEl.textTracks;
+                    if (tracks.length === 0) return;
+                    var hasShowing = false;
+                    for (var i = 0; i < tracks.length; i++) {
+                        if (tracks[i].mode === 'showing') { hasShowing = true; break; }
+                    }
+                    for (var j = 0; j < tracks.length; j++) {
+                        tracks[j].mode = hasShowing ? 'hidden' : 'showing';
+                    }
+                    if (hasShowing) {
+                        subToggleBtn.classList.remove('cd-active');
+                    } else {
+                        subToggleBtn.classList.add('cd-active');
+                    }
+                    // 字幕切换，按钮高亮变化就是反馈
+                });
+                // 监听字幕轨道变化，更新按钮状态
+                videoEl.textTracks.addEventListener('change', updateSubBtnState);
+                videoEl.textTracks.addEventListener('addtrack', updateSubBtnState);
+                videoEl.textTracks.addEventListener('removetrack', updateSubBtnState);
+                // 初始化按钮状态
+                updateSubBtnState();
+            }
+
+            // 时间戳按钮（不使用闭包的 filePath/fileName，避免切换视频后插入旧链接）
+            var timestampBtn = document.getElementById('cd-video-timestamp');
+            if (timestampBtn) {
+                timestampBtn.addEventListener('click', function() {
+                    that._insertVideoTimestamp(videoEl.currentTime);
+                });
+            }
+
+            // 截图按钮
+            var screenshotBtn = document.getElementById('cd-video-screenshot');
+            if (screenshotBtn) {
+                screenshotBtn.addEventListener('click', function() {
+                    that._handleScreenshot();
+                });
+            }
+
+            // 章节跳转按钮
+            var chaptersBtn = document.getElementById('cd-video-chapters');
+            if (chaptersBtn) {
+                chaptersBtn.addEventListener('click', function() {
+                    that._handleChapterJump();
+                });
+            }
+
+            // 循环片段按钮
+            var loopSegBtn = document.getElementById('cd-video-loop-seg');
+            if (loopSegBtn) {
+                loopSegBtn.addEventListener('click', function() {
+                    that._handleLoopSegment();
+                });
+            }
+
+            // 播放速度：悬浮弹出速度选择面板
+            var speedBtn = document.getElementById('cd-video-speed');
+            var speedWrap = document.getElementById('cd-video-speed-wrap');
+            var speedPopup = document.getElementById('cd-video-speed-popup');
+            if (speedBtn && speedWrap && speedPopup) {
+                // 高亮当前速度选项 + 更新按钮视觉
+                function updateSpeedUI(rate) {
+                    // 显示文字：如果是整数或0.5的倍数就简洁显示，否则两位小数
+                    var displayRate = (rate === Math.round(rate * 2) / 2) ? rate : parseFloat(rate.toFixed(2));
+                    speedBtn.textContent = displayRate + 'x';
+                    if (rate !== 1) {
+                        speedBtn.classList.add('cd-active');
+                    } else {
+                        speedBtn.classList.remove('cd-active');
+                    }
+                    // 高亮当前选项
+                    var opts = speedPopup.querySelectorAll('.cd-speed-opt');
+                    for (var k = 0; k < opts.length; k++) {
+                        var s = parseFloat(opts[k].getAttribute('data-speed'));
+                        if (Math.abs(s - rate) < 0.01) {
+                            opts[k].style.color = 'var(--b3-theme-primary,#4285f4)';
+                            opts[k].style.fontWeight = 'bold';
+                            opts[k].style.background = 'var(--b3-theme-surface,#f5f5f5)';
+                        } else {
+                            opts[k].style.color = '';
+                            opts[k].style.fontWeight = '';
+                            opts[k].style.background = '';
+                        }
+                    }
+                    // 更新微调文字
+                    var fl = document.getElementById('cd-video-speed-fine');
+                    if (fl) fl.textContent = parseFloat(rate.toFixed(2)) + 'x';
+                }
+                // 初始高亮
+                updateSpeedUI(videoEl.playbackRate || 1);
+                // 初始化微调文字
+                var fineLabel = document.getElementById('cd-video-speed-fine');
+                if (fineLabel) fineLabel.textContent = (videoEl.playbackRate || 1).toFixed(2) + 'x';
+                // 点击速度选项
+                var speedOpts = speedPopup.querySelectorAll('.cd-speed-opt');
+                for (var si = 0; si < speedOpts.length; si++) {
+                    speedOpts[si].addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        var newSpeed = parseFloat(this.getAttribute('data-speed'));
+                        videoEl.playbackRate = newSpeed;
+                        updateSpeedUI(newSpeed);
+                        // 速度切换，按钮文字变化就是反馈
+                        // 保存到 localStorage
+                        var idx = that._videoSpeedPresets.indexOf(newSpeed);
+                        if (idx !== -1) try { localStorage.setItem('cd-video-speed-idx', idx); } catch(e2) {}
+                    });
+                    // hover 高亮
+                    speedOpts[si].addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-surface,#f0f0f0)'; });
+                    speedOpts[si].addEventListener('mouseleave', function() {
+                        var s = parseFloat(this.getAttribute('data-speed'));
+                        if (Math.abs(s - videoEl.playbackRate) < 0.01) {
+                            this.style.background = 'var(--b3-theme-surface,#f5f5f5)';
+                        } else {
+                            this.style.background = '';
+                        }
+                    });
+                }
+                // 微调按钮 ±0.05
+                var speedDown = document.getElementById('cd-video-speed-down');
+                var speedUp = document.getElementById('cd-video-speed-up');
+                function fineAdjust(delta) {
+                    var cur = videoEl.playbackRate || 1;
+                    var next = Math.round((cur + delta) * 100) / 100;
+                    next = Math.max(0.25, Math.min(4, next));
+                    videoEl.playbackRate = next;
+                    updateSpeedUI(next);
+                    if (fineLabel) fineLabel.textContent = next.toFixed(2) + 'x';
+                    // 速度微调，按钮文字变化就是反馈
+                    // 清除预设高亮保存（微调值不是预设）
+                    try { localStorage.setItem('cd-video-speed-idx', '-1'); } catch(e2) {}
+                }
+                if (speedDown) {
+                    speedDown.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        fineAdjust(-0.05);
+                    });
+                    speedDown.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-surface,#f0f0f0)'; });
+                    speedDown.addEventListener('mouseleave', function() { this.style.background = ''; });
+                }
+                if (speedUp) {
+                    speedUp.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        fineAdjust(0.05);
+                    });
+                    speedUp.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-surface,#f0f0f0)'; });
+                    speedUp.addEventListener('mouseleave', function() { this.style.background = ''; });
+                }
+                // hover 弹出面板（带延迟隐藏防抖，避免鼠标经过间隙时闪烁）
+                var speedHideTimer = null;
+                speedWrap.addEventListener('mouseenter', function() {
+                    if (speedHideTimer) { clearTimeout(speedHideTimer); speedHideTimer = null; }
+                    speedPopup.style.height = (speedOpts.length * 26 + 30) + 'px';
+                    speedPopup.style.opacity = '1';
+                });
+                speedWrap.addEventListener('mouseleave', function() {
+                    speedHideTimer = setTimeout(function() {
+                        speedPopup.style.height = '0';
+                        speedPopup.style.opacity = '0';
+                        speedHideTimer = null;
+                    }, 150);
+                });
+            }
+
+            // 进度条点击跳转 + 悬停时间提示
+            var progressWrap = document.getElementById('cd-video-progress-wrap');
+            var progressTip = document.getElementById('cd-video-progress-tip');
+            if (progressWrap) {
+                progressWrap.addEventListener('click', function(e) {
+                    if (!videoEl.duration) return;
+                    var rect = progressWrap.getBoundingClientRect();
+                    var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                    videoEl.currentTime = pct * videoEl.duration;
+                });
+                // 鼠标悬停显示对应时间
+                if (progressTip) {
+                    progressWrap.addEventListener('mousemove', function(e) {
+                        if (!videoEl.duration) return;
+                        var rect = progressWrap.getBoundingClientRect();
+                        var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                        var time = that._formatDuration(pct * videoEl.duration);
+                        progressTip.textContent = time;
+                        progressTip.style.left = (pct * 100) + '%';
+                        progressTip.style.opacity = '1';
+                    });
+                    progressWrap.addEventListener('mouseleave', function() {
+                        progressTip.style.opacity = '0';
+                    });
+                }
+            }
+
+            // 拖拽调整视频区域高度
+            var resizeHandle = document.getElementById('cd-video-resize-handle');
+            if (resizeHandle) {
+                resizeHandle.addEventListener('mousedown', function(e) {
+                    e.preventDefault();
+                    var startY = e.clientY;
+                    var startH = videoWrap.offsetHeight;
+                    function onMove(ev) {
+                        var deltaY = startY - ev.clientY; // 向上拖增大，向下拖减小
+                        var newH = startH + deltaY;
+                        if (newH < 100) newH = 100;
+                        // 向上拖时，检查是否已拉到顶端（占满面板可用空间）
+                        if (deltaY > 0) {
+                            var panel = document.getElementById('cd-panel-local');
+                            if (panel) {
+                                var statsBar = document.getElementById('cd-stats-bar');
+                                var statsH = statsBar ? statsBar.offsetHeight : 30;
+                                var maxH = panel.offsetHeight - statsH;
+                                if (newH >= maxH) return; // 已拉到顶端，拉不动
+                            }
+                        }
+                        videoWrap.style.height = newH + 'px';
+                        videoWrap.style.flex = 'none';
+                        that._applyBottomPadding();
+                    }
+                    function onUp() {
+                        // 拖拽结束时保存当前高度（localStorage + saveData 双写，跨重启不丢失）
+                        try {
+                            var finalH = videoWrap.offsetHeight;
+                            if (finalH && finalH > 50) {
+                                localStorage.setItem('cd-video-bar-height', finalH);
+                                // 同步到 saveData 持久化（如果当前有视频在播放）
+                                if (that._videoCurrentPath && that._videoCurrentName && !that._videoPlayerClosed) {
+                                    that._saveVideoState(that._videoCurrentPath, that._videoCurrentName);
+                                }
+                            }
+                        } catch(e) {}
+                        document.removeEventListener('mousemove', onMove);
+                        document.removeEventListener('mouseup', onUp);
+                    }
+                    document.addEventListener('mousemove', onMove);
+                    document.addEventListener('mouseup', onUp);
+                });
+            }
+
+            // 音量控制
+            var volumeBtn = document.getElementById('cd-video-volume-btn');
+            var volumeSlider = document.getElementById('cd-video-volume-slider');
+            var volumeWrap = document.getElementById('cd-video-volume-wrap');
+            var lastVolume = 1; // 记住静音前的音量
+            // 更新音量图标
+            function updateVolumeIcon(vol) {
+                if (!volumeBtn) return;
+                var svg = volumeBtn.querySelector('svg');
+                if (!svg) return;
+                if (vol === 0) {
+                    svg.innerHTML = '<path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/><line x1="23" y1="9" x2="17" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><line x1="17" y1="9" x2="23" y2="15" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>';
+                } else if (vol < 0.5) {
+                    svg.innerHTML = '<path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" fill="currentColor"/>';
+                } else {
+                    svg.innerHTML = '<path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/><path d="M16.5 12c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02z" fill="currentColor"/><path d="M19 12c0 2.22-1.28 4.14-3.15 5.09l1.26 1.26C19.56 17.12 21 14.74 21 12s-1.44-5.12-3.89-6.35l-1.26 1.26C17.72 7.86 19 9.78 19 12z" fill="currentColor"/>';
+                }
+            }
+            if (volumeBtn) {
+                // 点击切换静音
+                volumeBtn.addEventListener('click', function() {
+                    if (videoEl.volume > 0) {
+                        lastVolume = videoEl.volume;
+                        videoEl.volume = 0;
+                        if (volumeSlider) volumeSlider.value = 0;
+                    } else {
+                        videoEl.volume = lastVolume || 1;
+                        if (volumeSlider) volumeSlider.value = Math.round(videoEl.volume * 100);
+                    }
+                    updateVolumeIcon(videoEl.volume);
+                });
+            }
+            if (volumeSlider) {
+                // 恢复上次音量
+                var savedVol = '';
+                try { savedVol = localStorage.getItem('cd-video-volume'); } catch(e) {}
+                if (savedVol !== null && savedVol !== '') {
+                    var vol = parseInt(savedVol, 10) / 100;
+                    if (vol >= 0 && vol <= 1) {
+                        videoEl.volume = vol;
+                        volumeSlider.value = Math.round(vol * 100);
+                        updateVolumeIcon(vol);
+                    }
+                }
+                // 拖动调节音量
+                volumeSlider.addEventListener('input', function() {
+                    var v = parseInt(volumeSlider.value, 10) / 100;
+                    videoEl.volume = v;
+                    if (v > 0) lastVolume = v;
+                    updateVolumeIcon(v);
+                    try { localStorage.setItem('cd-video-volume', Math.round(v * 100)); } catch(e) {}
+                });
+            }
+            // hover 展开竖向音量滑条
+            var volumePopup = document.getElementById('cd-video-volume-popup');
+            if (volumeWrap) {
+                volumeWrap.addEventListener('mouseenter', function() {
+                    if (volumePopup) { volumePopup.style.height = '100px'; volumePopup.style.opacity = '1'; }
+                });
+                volumeWrap.addEventListener('mouseleave', function() {
+                    if (volumePopup) { volumePopup.style.height = '0'; volumePopup.style.opacity = '0'; }
+                });
+            }
+            // 所有事件绑定成功完成，标记为已绑定（放在 try 末尾，确保绑定完整后才设 true）
+            that._videoEventsBound = true;
+            // 恢复原始 addEventListener（所有事件绑定已完成，signal 已注入）
+            } finally { EventTarget.prototype.addEventListener = _origAEL; }
+        }
+
+        // A/V 同步定时器：无论是否首次绑定事件，每次打开视频都需要确保定时器运行
+        // _closeVideoPlayer 和 _openVideoInPanel 开头会清除定时器，这里重建
+        if (!that._videoAvSyncTimer) {
+            that._startVideoAvSyncTimer(videoEl);
+        }
+
+        // 音频检测：浏览器不支持部分音频编码（AC3/DTS/FLAC等），导致有画面无声音
+        // 播放后检测音频轨道，若无音频则弹出提示
+        that._checkVideoAudioTrack(videoEl);
+
+        // 恢复播放速度（每次打开视频都执行，因为设置 src 可能重置 playbackRate）
+        var speedBtn = document.getElementById('cd-video-speed');
+        var speedPopup = document.getElementById('cd-video-speed-popup');
+        var savedSpeedIdx = -1;
+        try { savedSpeedIdx = parseInt(localStorage.getItem('cd-video-speed-idx'), 10); } catch(e) {}
+        if (isNaN(savedSpeedIdx) || savedSpeedIdx < 0 || savedSpeedIdx >= that._videoSpeedPresets.length) savedSpeedIdx = 2;
+        var restoreSpeed = that._videoSpeedPresets[savedSpeedIdx];
+        // 在 loadedmetadata 后设置速度，确保 src 加载不会覆盖
+        var applySpeed = function() {
+            videoEl.playbackRate = restoreSpeed;
+            if (speedBtn) {
+                speedBtn.textContent = restoreSpeed + 'x';
+                if (restoreSpeed !== 1) {
+                    speedBtn.classList.add('cd-active');
+                } else {
+                    speedBtn.classList.remove('cd-active');
+                }
+            }
+            // 同步更新弹出面板中的高亮
+            if (speedPopup) {
+                var opts = speedPopup.querySelectorAll('.cd-speed-opt');
+                for (var k = 0; k < opts.length; k++) {
+                    var s = parseFloat(opts[k].getAttribute('data-speed'));
+                    if (Math.abs(s - restoreSpeed) < 0.01) {
+                        opts[k].style.color = 'var(--b3-theme-primary,#4285f4)';
+                        opts[k].style.fontWeight = 'bold';
+                        opts[k].style.background = 'var(--b3-theme-surface,#f5f5f5)';
+                    } else {
+                        opts[k].style.color = '';
+                        opts[k].style.fontWeight = '';
+                        opts[k].style.background = '';
+                    }
+                }
+            }
+            // 同步微调标签
+            var fineLabel2 = document.getElementById('cd-video-speed-fine');
+            if (fineLabel2) fineLabel2.textContent = parseFloat(restoreSpeed.toFixed(2)) + 'x';
+        };
+        // 立即尝试设置，如果视频已加载则直接生效
+        applySpeed();
+        // 同时在 loadedmetadata 也设置一次（某些浏览器在设置 src 后重置 playbackRate）
+        videoEl.addEventListener('loadedmetadata', applySpeed, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
+
+        // 恢复上次播放位置
+        var savedPos = null;
+        try { savedPos = parseFloat(localStorage.getItem('cd-video-pos:' + cleanFilePath)); } catch(e) {}
+        if (savedPos && savedPos > 2) {
+            videoEl.addEventListener('loadedmetadata', function onMetaRestore() {
+                if (videoEl.duration && savedPos < videoEl.duration) {
+                    videoEl.currentTime = savedPos;
+                }
+            }, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
+        }
+
+        // 为文件列表添加底部内边距，避免被视频播放栏遮挡
+        that._applyBottomPadding();
+
+        // 保存播放器状态（下次打开插件时恢复）
+        that._videoPlayerClosed = false;
+        that._videoCurrentPath = filePath;
+        that._videoCurrentName = fileName;
+        that._saveVideoState(filePath, fileName);
+
+        that._log('_openVideoInPanel: 视频播放栏已打开, videoBar显示=' + videoBar.style.display + ', videoBar尺寸=' + videoBar.offsetWidth + 'x' + videoBar.offsetHeight + ', videoWrap高度=' + (videoWrap ? (videoWrap.style.height || '350px(默认)') : 'N/A'));
+    }
+
+    /**
+     * 更新视频播放按钮图标
+     * state: 'play' = 显示播放图标, 'pause' = 显示暂停图标
+     */
+    _updateVideoPlayBtn(state) {
+        var btn = document.getElementById('cd-video-play');
+        if (!btn) return;
+        if (state === 'pause') {
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>';
+            btn.title = '暂停';
+        } else {
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg>';
+            btn.title = '播放';
+        }
+    }
+
+    /**
+     * 切换视频播放器全屏/退出全屏
+     * 全屏目标为 cd-video-bar（包含视频画面和控制栏）
+     */
+    _toggleVideoFullscreen() {
+        var videoBar = document.getElementById('cd-video-bar');
+        if (!videoBar) return;
+        var isFs = !!(document.fullscreenElement || document.webkitFullscreenElement);
+        try {
+            if (isFs) {
+                if (document.exitFullscreen) document.exitFullscreen();
+                else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+            } else {
+                if (videoBar.requestFullscreen) videoBar.requestFullscreen();
+                else if (videoBar.webkitRequestFullscreen) videoBar.webkitRequestFullscreen();
+            }
+        } catch(e) {}
+    }
+
+    /**
+     * 启动音视频同步定时器
+     * Chromium 在 DOM 操作或渲染压力大时视频帧会滞后，定期短暂 pause+play 触发重新同步
+     * 仅对原生视频有效，FLV 模式由 mpegts.js 自行管理
+     */
+    _startVideoAvSyncTimer(videoEl) {
+        var that = this;
+        // 清除旧的定时器
+        if (that._videoAvSyncTimer) { clearInterval(that._videoAvSyncTimer); that._videoAvSyncTimer = null; }
+        that._videoAvSyncTimer = setInterval(function() {
+            if (that._isFlvMode) return;
+            if (!videoEl || videoEl.paused || videoEl.ended || videoEl.readyState < 4) return;
+            try {
+                var cur = videoEl.currentTime;
+                that._isAvSyncing = true;
+                videoEl.pause();
+                videoEl.currentTime = cur;
+                videoEl.play();
+                // play() 是异步的，短暂延迟后重置标记
+                setTimeout(function() { that._isAvSyncing = false; }, 100);
+            } catch(e) {
+                that._isAvSyncing = false;
+            }
+        }, 30000);
+    }
+
+    /**
+     * 检测视频是否有可播放的音频轨道
+     * 浏览器不支持 AC3/DTS/FLAC 等音频编码时，视频有画面但无声音
+     * 检测到无音频时在视频底部显示警告提示
+     */
+    _checkVideoAudioTrack(videoEl) {
+        var that = this;
+        // 清除旧的警告
+        var oldWarn = document.getElementById('cd-video-audio-warn');
+        if (oldWarn) oldWarn.remove();
+
+        function doCheck() {
+            try {
+                // 方法1: captureStream 检测音频轨道
+                if (videoEl.captureStream) {
+                    var stream = videoEl.captureStream();
+                    var audioTracks = stream.getAudioTracks();
+                    if (audioTracks.length === 0) {
+                        that._showVideoAudioWarning();
+                        return;
+                    }
+                }
+                // 方法2: HTMLAudioTrackList（部分 Chromium 版本支持）
+                if (videoEl.audioTracks && videoEl.audioTracks.length === 0) {
+                    that._showVideoAudioWarning();
+                }
+            } catch(e) {
+                // captureStream 不可用或不允许，跳过
+            }
+        }
+
+        // 需要等视频开始播放后再检测（captureStream 需要媒体流已建立）
+        if (videoEl.readyState >= 3) {
+            // 已有足够数据，延迟检测（等音频轨道初始化）
+            setTimeout(doCheck, 1500);
+        } else {
+            videoEl.addEventListener('canplay', function onCanPlay() {
+                videoEl.removeEventListener('canplay', onCanPlay);
+                setTimeout(doCheck, 1500);
+            }, { signal: that._videoEventController ? that._videoEventController.signal : undefined });
+        }
+    }
+
+    /**
+     * 显示"视频无声音"警告提示（可能是音频编码不受浏览器支持）
+     */
+    _showVideoAudioWarning() {
+        var that = this;
+        // 避免重复显示
+        if (document.getElementById('cd-video-audio-warn')) return;
+
+        var videoWrap = document.getElementById('cd-video-wrap');
+        if (!videoWrap) return;
+
+        var warn = document.createElement('div');
+        warn.id = 'cd-video-audio-warn';
+        warn.style.cssText = 'position:absolute;bottom:8px;left:50%;transform:translateX(-50%);' +
+            'background:rgba(0,0,0,0.78);color:#fff;padding:8px 16px;border-radius:8px;' +
+            'font-size:12px;z-index:20;display:flex;align-items:center;gap:10px;' +
+            'white-space:nowrap;box-shadow:0 2px 12px rgba(0,0,0,0.3);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)';
+        warn.innerHTML = '<span style="opacity:0.9">⚠️ 浏览器可能不支持该视频的音频格式</span>' +
+            '<span id="cd-video-audio-open-ext" style="cursor:pointer;padding:3px 10px;border-radius:4px;' +
+            'background:var(--b3-theme-primary,#4285f4);color:#fff;font-size:11px;flex-shrink:0;transition:opacity 0.2s" ' +
+            'onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">用系统播放器打开</span>' +
+            '<span id="cd-video-audio-warn-close" style="cursor:pointer;opacity:0.5;font-size:14px;line-height:1;flex-shrink:0;padding:0 2px" ' +
+            'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.5">✕</span>';
+        videoWrap.appendChild(warn);
+
+        // 点击"用系统播放器打开"
+        var openExtBtn = warn.querySelector('#cd-video-audio-open-ext');
+        if (openExtBtn) {
+            openExtBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._openVideoWithSystemPlayer();
+            });
+        }
+        // 点击关闭
+        var closeBtn = warn.querySelector('#cd-video-audio-warn-close');
+        if (closeBtn) {
+            closeBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                warn.remove();
+            });
+        }
+        // 10秒后自动淡出消失
+        setTimeout(function() {
+            if (warn.parentNode) {
+                warn.style.transition = 'opacity 0.5s';
+                warn.style.opacity = '0';
+                setTimeout(function() { if (warn.parentNode) warn.remove(); }, 500);
+            }
+        }, 10000);
+    }
+
+    /**
+     * 用系统默认播放器打开当前视频
+     */
+    _openVideoWithSystemPlayer() {
+        var that = this;
+        var filePath = that._videoCurrentPath;
+        if (!filePath) {
+            that.showToastMsg('未找到视频文件路径');
+            return;
+        }
+        // 去掉可能的时间戳参数
+        var cleanPath = filePath.split('?')[0];
+        try {
+            var electron = window.require && window.require('electron');
+            if (electron && electron.shell && electron.shell.openPath) {
+                electron.shell.openPath(cleanPath);
+                return;
+            }
+        } catch(e) {}
+        try {
+            var cp = require('child_process');
+            if (that.isWindows) {
+                cp.spawn('cmd', ['/c', 'start', '""', cleanPath], { stdio: 'ignore', detached: true }).unref();
+            } else if (that.platform === 'darwin') {
+                cp.spawn('open', [cleanPath], { stdio: 'ignore', detached: true }).unref();
+            } else {
+                cp.spawn('xdg-open', [cleanPath], { stdio: 'ignore', detached: true }).unref();
+            }
+        } catch(e) {
+            that.showToastMsg('无法打开系统播放器: ' + (e.message || e));
+        }
+    }
+
+
+    _closeVideoPlayer(preserveSrc, hideBar) {
+        var videoBar = document.getElementById('cd-video-bar');
+        var videoEl = document.getElementById('cd-video-el');
+        var videoWrap = document.getElementById('cd-video-wrap');
+        // 清除音频警告提示
+        var audioWarn = document.getElementById('cd-video-audio-warn');
+        if (audioWarn) audioWarn.remove();
+        // 清除音视频同步定时器
+        if (this._videoAvSyncTimer) { clearInterval(this._videoAvSyncTimer); this._videoAvSyncTimer = null; }
+        // 清除循环片段状态 + 重置按钮视觉
+        this._loopSegMarkStart = null;
+        this._loopPlayStart = null;
+        this._loopPlayEnd = null;
+        var loopSegBtn = document.getElementById('cd-video-loop-seg');
+        if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+        // 清除文档字幕高亮和缓存
+        this._clearDocSegmentHighlight();
+        this._docSegmentsCache = null;
+        if (this._docSegmentsCacheTimer) { clearTimeout(this._docSegmentsCacheTimer); this._docSegmentsCacheTimer = null; }
+        // 清除 FLV 自动播放超时定时器
+        if (this._flvPlayTimer) { clearTimeout(this._flvPlayTimer); this._flvPlayTimer = null; }
+        // 销毁 FLV 播放器
+        if (this._flvPlayer) {
+            try { this._flvPlayer.destroy(); } catch(e) {}
+            this._flvPlayer = null;
+        }
+        this._isFlvMode = false;
+        // 释放 FLV Blob URL
+        if (this._flvBlobUrl) {
+            try { URL.revokeObjectURL(this._flvBlobUrl); } catch(e) {}
+            this._flvBlobUrl = null;
+        }
+        // 清理对话框 FLV 播放器和 Blob URL
+        if (this._dialogFlvPlayer) {
+            try { this._dialogFlvPlayer.destroy(); } catch(e) {}
+            this._dialogFlvPlayer = null;
+        }
+        if (this._dialogFlvBlobUrl) {
+            try { URL.revokeObjectURL(this._dialogFlvBlobUrl); } catch(e) {}
+            this._dialogFlvBlobUrl = null;
+        }
+        if (videoEl) {
+            videoEl.pause();
+            // 保存播放位置（关闭时记录，下次打开同一视频时恢复）
+            if (this._videoCurrentPath && videoEl.currentTime > 2) {
+                try {
+                    localStorage.setItem('cd-video-pos:' + this._videoCurrentPath, videoEl.currentTime);
+                } catch(e) {}
+            }
+            if (!preserveSrc) {
+                videoEl.src = '';
+            }
+        }
+        // 重置当前播放视频记录
+        this._videoCurrentPath = null;
+        this._videoCurrentName = null;
+        if (videoBar) {
+            videoBar.style.flexGrow = '';
+            videoBar.style.flexShrink = '';
+            videoBar.style.overflow = '';
+            videoBar.style.maxHeight = '';
+            videoBar.style.visibility = '';
+            videoBar.style.opacity = '';
+        }
+        if (videoWrap) {
+            if (hideBar !== false) {
+                // 真正关闭时：保存当前高度，然后清空
+                try {
+                    var h = videoWrap.offsetHeight;
+                    if (h && h > 50) localStorage.setItem('cd-video-bar-height', h);
+                } catch(e) {}
+                videoWrap.style.flex = '';
+                videoWrap.style.maxHeight = '';
+                videoWrap.style.height = '';
+            }
+            // 切换视频时（hideBar=false）：保留用户调节的高度，不重置
+        }
+        if (hideBar !== false && videoBar) videoBar.style.display = 'none';
+        this._videoSubtitleUrl = null;
+        // 释放字幕 Blob URL
+        if (this._videoSubtitleBlobUrl) {
+            try { URL.revokeObjectURL(this._videoSubtitleBlobUrl); } catch(e) {}
+            this._videoSubtitleBlobUrl = null;
+        }
+        // 清理临时字幕文件（系统播放器使用的同名副本）
+        if (this._tempSubtitlePath) {
+            try {
+                var tfs = require('fs');
+                if (tfs.existsSync(this._tempSubtitlePath)) {
+                    tfs.unlinkSync(this._tempSubtitlePath);
+                }
+            } catch(e) {}
+            this._tempSubtitlePath = null;
+        }
+        // 恢复底部间距
+        this._applyBottomPadding();
+        // 清理全屏事件监听
+        if (this._onFullscreenChange) {
+            document.removeEventListener('fullscreenchange', this._onFullscreenChange);
+            document.removeEventListener('webkitfullscreenchange', this._onFullscreenChange);
+            this._onFullscreenChange = null;
+        }
+        // 清理键盘快捷键监听
+        if (this._videoKeyHandler) {
+            document.removeEventListener('keydown', this._videoKeyHandler);
+            this._videoKeyHandler = null;
+        }
+        // 中止所有事件监听器（通过 AbortController 一次性清除，避免重复绑定）
+        if (hideBar !== false) {
+            if (this._videoEventController) {
+                this._videoEventController.abort();
+                this._videoEventController = null;
+            }
+            this._videoEventsBound = false;
+        }
+    }
+
+    /**
+     * 动态加载 mpegts.js 库（用于 FLV 格式播放）
+     * 从 CDN 加载，加载完成后调用 callback
+     */
+    _loadMpegts(callback) {
+        if (typeof mpegts !== 'undefined') {
+            callback();
+            return;
+        }
+        if (this._mpegtsLoading) {
+            // 正在加载中，等待完成
+            var checkInterval = setInterval(function() {
+                if (typeof mpegts !== 'undefined') {
+                    clearInterval(checkInterval);
+                    callback();
+                }
+            }, 100);
+            setTimeout(function() { clearInterval(checkInterval); }, 15000);
+            return;
+        }
+        this._mpegtsLoading = true;
+        var that = this;
+        var script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js';
+        script.onload = function() {
+            that._mpegtsLoading = false;
+            that._log('_loadMpegts: mpegts.js 加载成功');
+            callback();
+        };
+        script.onerror = function() {
+            that._mpegtsLoading = false;
+            that._error('_loadMpegts: mpegts.js 加载失败');
+            callback();
+        };
+        document.head.appendChild(script);
+    }
+
+    /**
+     * 使用 mpegts.js 播放 FLV 格式视频
+     * FLV 格式浏览器原生不支持，需要通过 MSE (Media Source Extensions) 解码播放
+     */
+    _playFlvVideo(videoEl, filePath, autoPlay) {
+        var that = this;
+        that._loadMpegts(function() {
+            that._createFlvPlayer(videoEl, filePath, autoPlay);
+        });
+    }
+
+    /**
+     * 检测 FLV 文件的音视频编码格式
+     * 读取文件头和前几个 tag，判断编码是否被 mpegts.js 支持
+     * @returns {object|null} {videoCodec, audioCodec, videoSupported, audioSupported} 或 null（检测失败）
+     */
+    _detectFlvCodecs(filePath) {
+        try {
+            var fs = require('fs');
+            var buf = fs.readFileSync(filePath);
+            if (buf.length < 13) return null;
+            // 检查 FLV 签名
+            if (buf[0] !== 0x46 || buf[1] !== 0x4C || buf[2] !== 0x56) return null;
+            var flags = buf[4];
+            var hasVideo = (flags & 0x01) !== 0;
+            var hasAudio = (flags & 0x04) !== 0;
+            var headerSize = buf.readUInt32BE(5);
+            var offset = headerSize + 4; // skip header + first prevTagSize
+
+            var videoCodec = 'none';
+            var audioCodec = 'none';
+            var videoSupported = true;
+            var audioSupported = true;
+
+            // 扫描前 50 个 tag 或最多 64KB 数据
+            var maxTags = 50;
+            var maxOffset = Math.min(buf.length, 65536);
+            for (var t = 0; t < maxTags && offset + 11 < maxOffset; t++) {
+                var tagType = buf[offset];
+                var dataSize = (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3];
+                if (dataSize < 1 || offset + 11 + dataSize > buf.length) break;
+                var dataOffset = offset + 11;
+
+                if (tagType === 9 && hasVideo && videoCodec === 'none') {
+                    // Video tag: first nibble = frame type, second nibble = codec ID
+                    var vCodecId = buf[dataOffset] & 0x0F;
+                    var vCodecMap = { 2: 'H.263', 3: 'Screen', 4: 'VP6', 5: 'VP6A', 6: 'ScreenV2', 7: 'H.264/AVC' };
+                    videoCodec = vCodecMap[vCodecId] || ('Unknown(' + vCodecId + ')');
+                    videoSupported = (vCodecId === 7); // 只有 H.264/AVC 被支持
+                }
+                if (tagType === 8 && hasAudio && audioCodec === 'none') {
+                    // Audio tag: first 4 bits = sound format
+                    var aCodecId = (buf[dataOffset] & 0xF0) >> 4;
+                    var aCodecMap = { 0: 'PCM', 1: 'ADPCM', 2: 'MP3', 3: 'PCM-LE', 4: 'Nellymoser16', 5: 'Nellymoser8', 6: 'Nellymoser', 7: 'G.711A', 8: 'G.711mu', 10: 'AAC', 11: 'Speex', 14: 'MP3-8k' };
+                    audioCodec = aCodecMap[aCodecId] || ('Unknown(' + aCodecId + ')');
+                    audioSupported = (aCodecId === 2 || aCodecId === 10 || aCodecId === 14); // MP3, AAC, MP3-8k
+                }
+
+                if ((videoCodec !== 'none' || !hasVideo) && (audioCodec !== 'none' || !hasAudio)) break;
+
+                // 跳到下一个 tag: current tag (11 header + dataSize) + 4 prevTagSize
+                offset += 11 + dataSize + 4;
+            }
+
+            return { videoCodec: videoCodec, audioCodec: audioCodec, videoSupported: videoSupported, audioSupported: audioSupported };
+        } catch(e) {
+            return null;
+        }
+    }
+
+    /**
+     * 创建 mpegts.js FLV 播放器实例
+     * 优先使用 file:// URL，失败时回退到 fs 读取 + Blob URL
+     */
+    _createFlvPlayer(videoEl, filePath, autoPlay) {
+        var that = this;
+        if (typeof mpegts === 'undefined') {
+            that.showToastMsg('⚠️ FLV 播放组件加载失败，请检查网络连接');
+            return;
+        }
+        if (!mpegts.isSupported()) {
+            that.showToastMsg('⚠️ 当前浏览器不支持 MSE，无法播放 FLV');
+            return;
+        }
+
+        // 预检测 FLV 文件编码格式，提前发现不支持的编码
+        var codecInfo = that._detectFlvCodecs(filePath);
+        if (codecInfo) {
+            that._log('_createFlvPlayer: FLV 编码检测:', JSON.stringify(codecInfo));
+            if (!codecInfo.videoSupported || !codecInfo.audioSupported) {
+                var msg = '⚠️ FLV 编码不支持: ';
+                var parts = [];
+                if (!codecInfo.videoSupported) parts.push('视频(' + codecInfo.videoCodec + ')');
+                if (!codecInfo.audioSupported) parts.push('音频(' + codecInfo.audioCodec + ')');
+                msg += parts.join(' + ');
+                msg += '。仅支持 H.264 + AAC/MP3，建议转码为 MP4 后播放';
+                that.showToastMsg(msg);
+                return;
+            }
+        }
+
+        var fileUrl = that.toFileUrl(filePath);
+
+        try {
+            var player = mpegts.createPlayer({
+                type: 'flv',
+                url: fileUrl
+            }, {
+                enableWorker: false,
+                enableStashBuffer: true,
+                stashInitialSize: 1024 * 384,
+                lazyLoadMaxDuration: 300,
+                seekType: 'range',
+                autoCleanupSourceBuffer: true
+            });
+
+            player.attachMediaElement(videoEl);
+            player.load();
+
+            if (autoPlay) {
+                var doPlay = function() {
+                    player.play().catch(function(err) {
+                        that._log('FLV 自动播放失败:', err.message || err);
+                        videoEl.muted = true;
+                        player.play().then(function() {
+                            setTimeout(function() { videoEl.muted = false; }, 300);
+                        }).catch(function() {});
+                    });
+                };
+                // 等待足够数据后再播放
+                videoEl.addEventListener('canplay', doPlay, { once: true });
+                // 超时保底：3 秒后强制尝试播放
+                if (that._flvPlayTimer) { clearTimeout(that._flvPlayTimer); that._flvPlayTimer = null; }
+                that._flvPlayTimer = setTimeout(doPlay, 3000);
+            }
+
+            player.on(mpegts.Events.ERROR, function(errType, errDetail, errInfo) {
+                that._error('FLV 播放错误:', errType, errDetail);
+                if (errType === mpegts.ErrorTypes.NETWORK_ERROR) {
+                    // file:// 可能不支持，尝试 fs 读取回退
+                    that._log('FLV 网络错误，尝试 fs 读取回退...');
+                    that._playFlvViaFs(videoEl, filePath, autoPlay, player);
+                } else if (errType === mpegts.ErrorTypes.MEDIA_ERROR) {
+                    that.showToastMsg('⚠️ FLV 媒体解码失败，格式可能不支持');
+                }
+            });
+
+            that._flvPlayer = player;
+            that._log('_createFlvPlayer: FLV 播放器创建成功');
+        } catch(e) {
+            that._error('_createFlvPlayer: 创建 FLV 播放器失败:', e.message || e);
+            that.showToastMsg('⚠️ FLV 播放器创建失败: ' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * FLV 播放回退方案：通过 fs 读取文件，创建 Blob URL 播放
+     * 当 file:// URL 无法被 mpegts.js 加载时使用
+     */
+    _playFlvViaFs(videoEl, filePath, autoPlay, oldPlayer) {
+        var that = this;
+        // 销毁旧的播放器
+        if (oldPlayer) {
+            try { oldPlayer.destroy(); } catch(e) {}
+        }
+        that._flvPlayer = null;
+        // 释放旧的 Blob URL，避免内存泄漏
+        if (that._flvBlobUrl) {
+            try { URL.revokeObjectURL(that._flvBlobUrl); } catch(e) {}
+            that._flvBlobUrl = null;
+        }
+
+        try {
+            var fs = require('fs');
+            var buf = fs.readFileSync(filePath);
+            var blob = new Blob([buf], { type: 'video/x-flv' });
+            var blobUrl = URL.createObjectURL(blob);
+            // 保存引用以便后续释放
+            that._flvBlobUrl = blobUrl;
+
+            var player = mpegts.createPlayer({
+                type: 'flv',
+                url: blobUrl
+            }, {
+                enableWorker: false,
+                enableStashBuffer: true,
+                stashInitialSize: 1024 * 384,
+                seekType: 'range'
+            });
+
+            player.attachMediaElement(videoEl);
+            player.load();
+
+            if (autoPlay) {
+                var doPlay = function() {
+                    player.play().catch(function(err) {
+                        that._log('FLV(Blob) 自动播放失败:', err.message || err);
+                        videoEl.muted = true;
+                        player.play().then(function() {
+                            setTimeout(function() { videoEl.muted = false; }, 300);
+                        }).catch(function() {});
+                    });
+                };
+                videoEl.addEventListener('canplay', doPlay, { once: true });
+                if (that._flvPlayTimer) { clearTimeout(that._flvPlayTimer); that._flvPlayTimer = null; }
+                that._flvPlayTimer = setTimeout(doPlay, 3000);
+            }
+
+            player.on(mpegts.Events.ERROR, function(errType, errDetail) {
+                that._error('FLV(Blob) 播放错误:', errType, errDetail);
+                that.showToastMsg('⚠️ FLV 播放失败，格式可能不支持');
+            });
+
+            that._flvPlayer = player;
+            that._log('_playFlvViaFs: 通过 fs 读取 + Blob URL 创建 FLV 播放器成功');
+        } catch(e) {
+            that._error('_playFlvViaFs: 回退方案也失败:', e.message || e);
+            that.showToastMsg('⚠️ FLV 播放失败: ' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * 将字幕文件转换为 VTT 格式的 Blob URL
+     * HTML5 <track> 仅支持 WebVTT 格式，SRT/ASS/SSA 需要转换
+     * @param {string} subtitleUrl - file:/// URL 格式的字幕路径
+     * @param {string} videoFilePath - 视频本地路径（用于定位字幕文件）
+     * @param {function} callback - 回调函数，参数为 vttBlobUrl 或 null
+     */
+    _convertSubtitleToVttUrl(subtitleUrl, videoFilePath, callback) {
+        var that = this;
+        try {
+            var fs = require('fs');
+            var path = require('path');
+            // 从 file:/// URL 还原为本地路径
+            var subPath = that.fileUrlToLocalPath(subtitleUrl);
+            if (!subPath) {
+                that._error('_convertSubtitleToVttUrl: 无法解析字幕路径:', subtitleUrl);
+                callback(null);
+                return;
+            }
+            var ext = path.extname(subPath).toLowerCase();
+            var content = fs.readFileSync(subPath, 'utf-8');
+
+            var vttContent;
+            if (ext === '.vtt') {
+                // 已经是 VTT 格式，直接使用
+                vttContent = content;
+            } else if (ext === '.srt') {
+                // SRT → VTT 转换
+                vttContent = that._srtToVtt(content);
+            } else if (ext === '.ass' || ext === '.ssa') {
+                // ASS/SSA → VTT 转换（提取 Dialogue 行）
+                vttContent = that._assToVtt(content);
+            } else {
+                that._error('_convertSubtitleToVttUrl: 不支持的字幕格式:', ext);
+                callback(null);
+                return;
+            }
+
+            // 创建 Blob URL
+            var blob = new Blob([vttContent], { type: 'text/vtt' });
+            var blobUrl = URL.createObjectURL(blob);
+            // 保存引用，关闭时释放
+            if (that._videoSubtitleBlobUrl) {
+                try { URL.revokeObjectURL(that._videoSubtitleBlobUrl); } catch(e) {}
+            }
+            that._videoSubtitleBlobUrl = blobUrl;
+            that._log('_convertSubtitleToVttUrl: 字幕转换成功', ext, '→ VTT');
+            callback(blobUrl);
+        } catch(e) {
+            that._error('_convertSubtitleToVttUrl: 字幕转换失败:', e.message || e);
+            callback(null);
+        }
+    }
+
+    /**
+     * SRT 字幕内容转 VTT 格式
+     * SRT 和 VTT 的时序格式几乎相同，主要区别：
+     * 1. VTT 需要以 "WEBVTT" 开头
+     * 2. SRT 用逗号分隔毫秒，VTT 用句点
+     * 3. SRT 的序号行可以保留（VTT 可选）
+     */
+    _srtToVtt(srtContent) {
+        var lines = srtContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+        var vttLines = ['WEBVTT', ''];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i];
+            // 检测时序行：00:01:23,456 --> 00:01:25,789
+            if (/^\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}/.test(line)) {
+                // 将逗号替换为句点（毫秒分隔符）
+                vttLines.push(line.replace(/,/g, '.'));
+            } else {
+                vttLines.push(line);
+            }
+        }
+        return vttLines.join('\n');
+    }
+
+    /**
+     * ASS/SSA 字幕内容转 VTT 格式
+     * 提取 Dialogue 行的时间戳和文本，转为 VTT 格式
+     */
+    _assToVtt(assContent) {
+        var lines = assContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+        var vttLines = ['WEBVTT', ''];
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line.indexOf('Dialogue:') !== 0) continue;
+            // 格式: Dialogue: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+            var parts = line.substring(9).split(',');
+            if (parts.length < 10) continue;
+            var start = parts[1].trim();
+            var end = parts[2].trim();
+            // ASS 时间格式 H:MM:SS.CC → VTT 格式 HH:MM:SS.mmm
+            var startVtt = this._assTimeToVtt(start);
+            var endVtt = this._assTimeToVtt(end);
+            // 文本是第10个逗号之后的所有内容（文本中可能包含逗号）
+            var textParts = parts.slice(9);
+            var text = textParts.join(',');
+            // 清理 ASS 格式标签
+            text = text.replace(/\{[^}]*\}/g, ''); // 移除 {} 中的样式标签
+            text = text.replace(/\\N/g, '\n');       // \N 换行
+            text = text.replace(/\\n/g, ' ');        // \n 软换行变空格
+            text = text.trim();
+            if (!text) continue;
+            vttLines.push(startVtt + ' --> ' + endVtt);
+            vttLines.push(text);
+            vttLines.push('');
+        }
+        return vttLines.join('\n');
+    }
+
+    /**
+     * ASS 时间格式转 VTT 时间格式
+     * ASS: H:MM:SS.CC (百分之一秒)
+     * VTT: HH:MM:SS.mmm (毫秒)
+     */
+    _assTimeToVtt(assTime) {
+        // 格式: 0:01:23.45
+        var match = assTime.match(/^(\d+):(\d{2}):(\d{2})\.(\d{1,2})$/);
+        if (!match) return '00:00:00.000';
+        var h = match[1];
+        var m = match[2];
+        var s = match[3];
+        var cs = match[4]; // 百分之一秒
+        // 补零：小时至少2位，百分之一秒补到3位毫秒
+        var hh = h.length < 2 ? '0' + h : h;
+        var ms = cs.length === 1 ? cs + '00' : cs + '0';
+        return hh + ':' + m + ':' + s + '.' + ms;
+    }
+
+    /**
+     * 格式化秒数为 m:ss
+     */
+    /**
+     * 将字幕文件内容导入到当前文档
+     * 支持格式：SRT、ASS/SSA、VTT
+     * 输出格式：每行字幕转为「时间戳 文本」的 Markdown 列表
+     */
+    _importSubtitleToDoc(filePath) {
+        var that = this;
+        try {
+            var fs = require('fs');
+            var path = require('path');
+            if (!fs.existsSync(filePath)) {
+                that.showToastMsg('⚠️ 字幕文件不存在', 2000, 'warning');
+                return;
+            }
+            var ext = path.extname(filePath).toLowerCase();
+            var content = fs.readFileSync(filePath, 'utf-8');
+            var entries = [];
+
+            if (ext === '.srt') {
+                entries = that._parseSrtEntries(content);
+            } else if (ext === '.ass' || ext === '.ssa') {
+                entries = that._parseAssEntries(content);
+            } else if (ext === '.vtt') {
+                entries = that._parseVttEntries(content);
+            } else {
+                that.showToastMsg('⚠️ 不支持的字幕格式: ' + ext, 2000, 'warning');
+                return;
+            }
+
+            if (entries.length === 0) {
+                that.showToastMsg('⚠️ 未解析到字幕内容', 2000, 'warning');
+                return;
+            }
+
+            // 查找同目录下对应的视频/音频文件
+            var subtitleBaseName = path.basename(filePath, path.extname(filePath));
+            // 去掉语言后缀（如 .en, .zh）再匹配
+            var mediaBaseName = subtitleBaseName.split('.')[0];
+            var mediaPath = null;
+            var mediaName = null;
+            try {
+                var dirFiles = fs.readdirSync(path.dirname(filePath));
+                var videoExts = {'mp4':1,'avi':1,'mkv':1,'mov':1,'wmv':1,'flv':1,'webm':1,'m4v':1,'mpg':1,'mpeg':1,'ts':1,'m2ts':1,'3gp':1};
+                var audioExts = {'mp3':1,'wav':1,'flac':1,'aac':1,'ogg':1,'wma':1,'m4a':1,'ape':1,'opus':1,'aiff':1,'alac':1};
+                // 优先精确匹配（subtitleBaseName），再宽松匹配（mediaBaseName）
+                for (var pass = 0; pass < 2; pass++) {
+                    var targetName = pass === 0 ? subtitleBaseName : mediaBaseName;
+                    for (var di = 0; di < dirFiles.length; di++) {
+                        var df = dirFiles[di];
+                        var dExt = path.extname(df).toLowerCase().replace('.', '');
+                        if (!videoExts[dExt] && !audioExts[dExt]) continue;
+                        var dBase = path.basename(df, path.extname(df));
+                        if (dBase === targetName) {
+                            mediaPath = path.join(path.dirname(filePath), df);
+                            mediaName = df;
+                            break;
+                        }
+                    }
+                    if (mediaPath) break;
+                }
+            } catch(e2) {}
+
+            // 生成 Markdown 内容
+            var fileName = path.basename(filePath);
+            var mdLines = ['**字幕：' + fileName + '**', ''];
+            for (var i = 0; i < entries.length; i++) {
+                var e = entries[i];
+                var startStr = that._formatTimestampTime(e.start);
+                var endStr = that._formatTimestampTime(e.end);
+                var startSec = Math.floor(e.start);
+                var endSec = Math.floor(e.end);
+                if (mediaPath) {
+                    // 生成循环片段链接（只保留时间）
+                    var mediaUrl = that.toFileUrl(mediaPath) + '?t=' + startSec + '-' + endSec;
+                    mdLines.push('- [' + startStr + '-' + endStr + '](' + mediaUrl + ') ' + e.text);
+                } else {
+                    // 没找到媒体文件，纯文本时间
+                    mdLines.push('- ' + startStr + '-' + endStr + ' ' + e.text);
+                }
+            }
+
+            var markdown = mdLines.join('\n');
+            that._insertMarkdownAtCursor(markdown, function(success) {
+                if (!success) {
+                    that._copyToClipboard(markdown, function(ok) {
+                        if (!ok) {
+                            that.showToastMsg('⚠️ 导入失败，请手动复制', 3000, 'warning');
+                        }
+                    });
+                }
+            });
+        } catch(e) {
+            that.showToastMsg('⚠️ 读取字幕文件失败: ' + (e.message || e), 3000, 'warning');
+        }
+    }
+
+    /**
+     * 解析 SRT 字幕条目
+     * @returns {Array<{start:number, end:number, text:string}>}
+     */
+    _parseSrtEntries(content) {
+        var entries = [];
+        var blocks = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split(/\n\n+/);
+        for (var i = 0; i < blocks.length; i++) {
+            var lines = blocks[i].split('\n');
+            // 找到时间行
+            var timeLineIdx = -1;
+            for (var j = 0; j < lines.length; j++) {
+                if (/^\d{0,2}:?\d{2}:\d{2}[,.]\d{2,3}\s*-->\s*\d{0,2}:?\d{2}:\d{2}[,.]\d{2,3}/.test(lines[j].trim())) {
+                    timeLineIdx = j;
+                    break;
+                }
+            }
+            if (timeLineIdx < 0) continue;
+            var timeLine = lines[timeLineIdx];
+            var times = timeLine.split('-->');
+            if (times.length < 2) continue;
+            var start = this._parseSubtitleTime(times[0].trim());
+            var end = this._parseSubtitleTime(times[1].trim());
+            if (start === null || end === null) continue;
+            var textLines = lines.slice(timeLineIdx + 1);
+            // 清理 HTML 标签（SRT 常见 <i>, <b> 等）
+            var text = textLines.join(' ').replace(/<[^>]+>/g, '').trim();
+            if (!text) continue;
+            entries.push({ start: start, end: end, text: text });
+        }
+        return entries;
+    }
+
+    /**
+     * 解析 ASS/SSA 字幕条目
+     * @returns {Array<{start:number, end:number, text:string}>}
+     */
+    _parseAssEntries(content) {
+        var entries = [];
+        var lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+        for (var i = 0; i < lines.length; i++) {
+            var line = lines[i].trim();
+            if (line.indexOf('Dialogue:') !== 0) continue;
+            // Dialogue: Marked=0,0:00:01.50,0:00:04.50,Default,,0,0,0,,文本
+            var parts = line.substring(9).split(',');
+            if (parts.length < 10) continue;
+            var start = this._parseAssTime(parts[1].trim());
+            var end = this._parseAssTime(parts[2].trim());
+            if (start === null || end === null) continue;
+            // 文本从第10个逗号之后开始（可能有额外的逗号）
+            var textParts = parts.slice(9);
+            var text = textParts.join(',').replace(/\{[^}]*\}/g, '').replace(/\\N/g, ' ').replace(/\\n/g, ' ').replace(/\\h/g, ' ').trim();
+            if (!text) continue;
+            entries.push({ start: start, end: end, text: text });
+        }
+        return entries;
+    }
+
+    /**
+     * 解析 VTT 字幕条目
+     * @returns {Array<{start:number, end:number, text:string}>}
+     */
+    _parseVttEntries(content) {
+        var entries = [];
+        var lines = content.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim().split('\n');
+        var i = 0;
+        // 跳过 WEBVTT 头部
+        while (i < lines.length && lines[i].trim().indexOf('WEBVTT') === 0) i++;
+        while (i < lines.length) {
+            var line = lines[i].trim();
+            // 检测时间行
+            if (/^\d{0,2}:?\d{2}:\d{2}\.\d{2,3}\s*-->\s*\d{0,2}:?\d{2}:\d{2}\.\d{2,3}/.test(line)) {
+                var times = line.split('-->');
+                var start = this._parseSubtitleTime(times[0].trim());
+                var end = this._parseSubtitleTime(times[1].trim());
+                var textLines = [];
+                i++;
+                while (i < lines.length && lines[i].trim() !== '' && !/^\d{0,2}:?\d{2}:\d{2}\.\d{2,3}\s*-->/.test(lines[i].trim())) {
+                    textLines.push(lines[i].trim());
+                    i++;
+                }
+                var text = textLines.join(' ').replace(/<[^>]+>/g, '').trim();
+                if (start !== null && end !== null && text) {
+                    entries.push({ start: start, end: end, text: text });
+                }
+            } else {
+                i++;
+            }
+        }
+        return entries;
+    }
+
+    /**
+     * 解析 SRT/VTT 时间戳为秒数
+     * 支持格式：HH:MM:SS,mmm / HH:MM:SS.mmm / MM:SS,mmm / MM:SS.mmm
+     */
+    _parseSubtitleTime(str) {
+        try {
+            // 去掉位置信息（VTT 可能有 D:xxx 之类）
+            str = str.split(/\s+/)[0];
+            // 统一逗号为句点
+            str = str.replace(',', '.');
+            var parts = str.split(':');
+            if (parts.length === 3) {
+                var h = parseInt(parts[0], 10);
+                var m = parseInt(parts[1], 10);
+                var s = parseFloat(parts[2]);
+                return h * 3600 + m * 60 + s;
+            } else if (parts.length === 2) {
+                var m2 = parseInt(parts[0], 10);
+                var s2 = parseFloat(parts[1]);
+                return m2 * 60 + s2;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    /**
+     * 解析 ASS 时间戳为秒数（格式：H:MM:SS.cc）
+     */
+    _parseAssTime(str) {
+        try {
+            var parts = str.split(':');
+            if (parts.length === 3) {
+                var h = parseInt(parts[0], 10);
+                var m = parseInt(parts[1], 10);
+                var s = parseFloat(parts[2]);
+                return h * 3600 + m * 60 + s;
+            }
+        } catch(e) {}
+        return null;
+    }
+
+    _formatMediaTime(sec) {
+        if (!sec || isNaN(sec)) return '0:00';
+        var m = Math.floor(sec / 60);
+        var s = Math.floor(sec % 60);
+        return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    /**
+     * 格式化为时长显示（自动显示小时：>=1h 显示 HH:MM:SS，否则 MM:SS）
+     */
+    _formatDuration(sec) {
+        if (!sec || isNaN(sec)) return '0:00';
+        var h = Math.floor(sec / 3600);
+        var m = Math.floor((sec % 3600) / 60);
+        var s = Math.floor(sec % 60);
+        if (h > 0) {
+            return h + ':' + (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+        }
+        return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    /**
+     * 格式化秒数为 mm:ss（用于时间戳链接显示）
+     */
+    _formatTimestampTime(sec) {
+        if (!sec || isNaN(sec)) return '00:00';
+        var m = Math.floor(sec / 60);
+        var s = Math.floor(sec % 60);
+        return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    /**
+     * 解析 URL 时间参数（支持纯秒数或 mm:ss / hh:mm:ss 格式）
+     */
+    _parseTimestampParam(param) {
+        if (!param) return 0;
+        // 纯秒数
+        if (/^\d+(\.\d+)?$/.test(param)) return parseFloat(param);
+        // mm:ss 格式
+        var mmss = param.match(/^(\d+):(\d{2})$/);
+        if (mmss) return parseInt(mmss[1], 10) * 60 + parseInt(mmss[2], 10);
+        // hh:mm:ss 格式
+        var hhmmss = param.match(/^(\d+):(\d{2}):(\d{2})$/);
+        if (hhmmss) return parseInt(hhmmss[1], 10) * 3600 + parseInt(hhmmss[2], 10) * 60 + parseInt(hhmmss[3], 10);
+        return 0;
+    }
+
+    /**
+     * 插入视频时间戳到思源笔记
+     * 生成 [视频名 00:00](file://path?t=123) 格式的 Markdown 链接
+     */
+    _insertVideoTimestamp(currentTime) {
+        var that = this;
+        var filePath = that._videoCurrentPath;
+        var fileName = that._videoCurrentName;
+        if (!filePath || !fileName) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+        var timeStr = that._formatTimestampTime(currentTime);
+        var url = that.toFileUrl(filePath) + '?t=' + Math.floor(currentTime);
+        var markdown = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+
+        // 优先尝试插入到思源编辑器光标处
+        that._insertMarkdownAtCursor(markdown, function(success) {
+            if (success) {
+                // 插入成功，内容出现在编辑器就是反馈
+            } else {
+                // 降级：复制到剪贴板
+                that._copyToClipboard(markdown, function(ok) {
+                    if (ok) {
+                        // 复制成功，静默
+                    } else {
+                        that.showToastMsg('⚠️ 插入失败，请手动复制: ' + markdown, 3000, 'warning');
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * 尝试将 Markdown 插入到思源编辑器当前光标位置
+     * callback(success) - success 为布尔值
+     */
+    _insertMarkdownAtCursor(markdown, callback) {
+        try {
+            // 方式1：使用思源 API /api/block/insertBlock 插入到当前光标块
+            var protyle = document.querySelector('.protyle:not(.fn__none)');
+            if (!protyle) protyle = document.querySelector('.protyle');
+            if (protyle && protyle.querySelector('[data-node-id]')) {
+                // 尝试获取当前编辑器的块 ID
+                var activeBlock = protyle.querySelector('.protyle-wysiwyg--select') ||
+                                  protyle.querySelector('[data-node-id]:last-child');
+                if (activeBlock) {
+                    var blockId = activeBlock.getAttribute('data-node-id');
+                    if (blockId) {
+                        fetch('/api/block/insertBlock', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                dataType: 'markdown',
+                                data: markdown,
+                                previousID: blockId
+                            })
+                        }).then(function(r) { return r.json(); }).then(function(res) {
+                            if (res && res.code === 0) {
+                                callback(true);
+                            } else {
+                                callback(false);
+                            }
+                        }).catch(function() { callback(false); });
+                        return;
+                    }
+                }
+            }
+            callback(false);
+        } catch (e) {
+            callback(false);
+        }
+    }
+
+    /**
+     * 复制文本到剪贴板
+     */
+    _copyToClipboard(text, callback) {
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function() {
+                    callback(true);
+                }).catch(function() {
+                    callback(false);
+                });
+            } else {
+                // 降级方案
+                var ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                var ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                callback(ok);
+            }
+        } catch (e) {
+            callback(false);
+        }
+    }
+
+    /**
+     * 从 video 元素截取当前帧，返回 Blob
+     * @param {string} format - 图片格式: 'png' | 'jpeg' | 'webp'
+     * @param {number} quality - 图片质量 0-1（仅 jpeg/webp 有效）
+     * @returns {Promise<Blob|null>}
+     */
+    _getScreenshotBlob(format, quality, maxWidth) {
+        return new Promise(function(resolve) {
+            try {
+                var videoEl = document.getElementById('cd-video-el');
+                if (!videoEl || !videoEl.videoWidth) {
+                    resolve(null);
+                    return;
+                }
+                var srcW = videoEl.videoWidth || videoEl.clientWidth;
+                var srcH = videoEl.videoHeight || videoEl.clientHeight;
+                // 限制最大宽度，等比缩放
+                var scale = 1;
+                if (maxWidth && srcW > maxWidth) {
+                    scale = maxWidth / srcW;
+                }
+                var canvas = document.createElement('canvas');
+                var ctx = canvas.getContext('2d');
+                canvas.width = Math.round(srcW * scale);
+                canvas.height = Math.round(srcH * scale);
+                if (!ctx || !canvas.width || !canvas.height) {
+                    resolve(null);
+                    return;
+                }
+                ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+                var mimeType = 'image/png';
+                if (format === 'jpeg' || format === 'jpg') mimeType = 'image/jpeg';
+                else if (format === 'webp') mimeType = 'image/webp';
+                var q = (typeof quality === 'number' && quality > 0) ? quality : 0.92;
+                canvas.toBlob(function(blob) {
+                    resolve(blob);
+                }, mimeType, q);
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
+    /**
+     * 上传截图 Blob 到思源 assets，返回 assets 路径
+     * @param {Blob} blob - 图片 Blob
+     * @returns {Promise<string>} - 如 "/assets/screenshot_1718012345678.png"
+     */
+    _uploadScreenshotToAssets(blob) {
+        return new Promise(function(resolve) {
+            try {
+                var ext = 'png';
+                if (blob.type === 'image/jpeg') ext = 'jpg';
+                else if (blob.type === 'image/webp') ext = 'webp';
+                var filename = 'screenshot_' + Date.now() + '.' + ext;
+                var file = new File([blob], filename, { type: blob.type });
+                var formData = new FormData();
+                formData.append('file[]', file);
+                fetch('/api/asset/upload', {
+                    method: 'POST',
+                    body: formData
+                }).then(function(r) { return r.json(); }).then(function(res) {
+                    if (res && res.code === 0 && res.data && res.data.succMap && res.data.succMap[filename]) {
+                        resolve(res.data.succMap[filename]);
+                    } else {
+                        resolve(null);
+                    }
+                }).catch(function() { resolve(null); });
+            } catch (e) {
+                resolve(null);
+            }
+        });
+    }
+
+    /**
+     * 截图并插入到笔记
+     * 流程：截图 → 上传 assets → 生成 markdown → 插入编辑器 / 复制剪贴板
+     */
+    _handleScreenshot() {
+        var that = this;
+        var videoEl = document.getElementById('cd-video-el');
+        if (!videoEl || videoEl.readyState < 2) {
+            that.showToastMsg('⚠️ 视频尚未加载，无法截图', 2000, 'warning');
+            return;
+        }
+        var filePath = that._videoCurrentPath;
+        var fileName = that._videoCurrentName;
+        if (!filePath || !fileName) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+        // 截图：使用 JPEG 格式 + 限制最大宽度，大幅减小体积
+        that._getScreenshotBlob('jpeg', 0.8, 1920).then(function(blob) {
+            if (!blob) {
+                that.showToastMsg('⚠️ 截图失败，可能视频格式不支持', 2000, 'warning');
+                return;
+            }
+            // 上传到思源 assets
+            that._uploadScreenshotToAssets(blob).then(function(assetPath) {
+                var currentTime = videoEl.currentTime || 0;
+                var timeStr = that._formatTimestampTime(currentTime);
+                var markdown;
+
+                if (assetPath) {
+                    // 生成带时间戳链接 + 截图图片的 Markdown
+                    var url = that.toFileUrl(filePath) + '?t=' + Math.floor(currentTime);
+                    var linkText = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+                    markdown = linkText + '\n![' + fileName + ' ' + timeStr + '](' + assetPath + ')';
+                } else {
+                    // 上传失败，降级：只插入时间戳链接
+                    var url2 = that.toFileUrl(filePath) + '?t=' + Math.floor(currentTime);
+                    markdown = '[' + fileName + ' ' + timeStr + '](' + url2 + ')';
+                    that.showToastMsg('⚠️ 截图上传失败，仅插入时间戳', 2000, 'warning');
+                }
+
+                // 优先插入到编辑器光标处
+                that._insertMarkdownAtCursor(markdown, function(success) {
+                    if (success) {
+                        // 截图插入成功，内容出现在编辑器就是反馈
+                    } else {
+                        // 降级：复制到剪贴板
+                        that._copyToClipboard(markdown, function(ok) {
+                            if (ok) {
+                                // 复制成功，静默
+                            } else {
+                                that.showToastMsg('⚠️ 截图插入失败，请手动粘贴', 3000, 'warning');
+                            }
+                        });
+                    }
+                });
+            });
+        });
+    }
+
+    /**
+     * 循环片段：两次点击标记起止时间，插入带范围的链接
+     * 第一次点击：记录当前时间作为循环起点
+     * 第二次点击：记录当前时间作为循环终点，生成 [视频名 00:30-01:15](file://path?t=30-75) 并插入文档
+     * 正在循环时点击：取消循环
+     */
+    _handleLoopSegment() {
+        var that = this;
+        var videoEl = document.getElementById('cd-video-el');
+        if (!videoEl || !that._videoCurrentPath) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+        var filePath = that._videoCurrentPath;
+        var fileName = that._videoCurrentName;
+        var currentTime = videoEl.currentTime;
+        var loopSegBtn = document.getElementById('cd-video-loop-seg');
+
+        // 正在循环播放中：点击取消循环
+        if (that._loopPlayStart !== null && that._loopPlayEnd !== null && that._loopSegMarkStart === null) {
+            that._loopPlayStart = null;
+            that._loopPlayEnd = null;
+            if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+            return;
+        }
+
+        if (that._loopSegMarkStart === null) {
+            // 第一次点击：记录起点
+            that._loopSegMarkStart = currentTime;
+            // 按钮高亮就是反馈
+            if (loopSegBtn) {
+                loopSegBtn.classList.add('cd-active');
+                loopSegBtn.title = '2️⃣点击标记终点';
+            }
+        } else {
+            // 第二次点击：记录终点，生成链接并插入
+            var startTime = that._loopSegMarkStart;
+            var endTime = currentTime;
+            // 确保 start <= end
+            if (endTime < startTime) {
+                var tmp = startTime;
+                startTime = endTime;
+                endTime = tmp;
+            }
+            that._loopSegMarkStart = null;
+            if (loopSegBtn) {
+                loopSegBtn.classList.remove('cd-active');
+                loopSegBtn.title = '循环片段：1️⃣点击标记起点';
+            }
+
+            var timeStr = that._formatTimestampTime(startTime) + '-' + that._formatTimestampTime(endTime);
+            var url = that.toFileUrl(filePath) + '?t=' + Math.floor(startTime) + '-' + Math.floor(endTime);
+            var markdown = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+
+            that._insertMarkdownAtCursor(markdown, function(success) {
+                if (success) {
+                    // 插入成功，内容出现在编辑器就是反馈
+                } else {
+                    that._copyToClipboard(markdown, function(ok) {
+                        if (ok) {
+                            // 复制成功，静默
+                        } else {
+                            that.showToastMsg('⚠️ 插入失败，请手动复制: ' + markdown, 3000, 'warning');
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /**
+     * 一键转换：将当前文档标题中的时间戳转为可点击的视频跳转链接
+     * 例如 "某某内容 00:05" → "某某内容 [00:05](file://path?t=5)"
+     */
+    _handleChapterJump() {
+        var that = this;
+        var videoEl = document.getElementById('cd-video-el');
+        if (!videoEl) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+        var filePath = that._videoCurrentPath;
+        var fileName = that._videoCurrentName;
+        if (!filePath || !fileName) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+
+        // 获取当前文档 ID
+        var docId = that.getCurrentDocId();
+        if (!docId) {
+            that.showToastMsg('⚠️ 未找到当前文档', 2000, 'warning');
+            return;
+        }
+
+        var baseUrl = that.toFileUrl(filePath);
+
+        // 查询文档中所有标题块(h)、列表项(i)和段落(p)
+        var sql = "SELECT id, content, markdown, type FROM blocks WHERE type IN ('h', 'i', 'p') AND root_id='" + docId + "'";
+        that._log('_handleChapterJump SQL:', sql);
+        fetch('/api/query/sql', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ stmt: sql })
+        }).then(function(r) { return r.json(); }).then(function(res) {
+            if (!res || res.code !== 0 || !res.data || res.data.length === 0) {
+                that.showToastMsg('⚠️ 查询文档标题失败', 2000, 'warning');
+                return;
+            }
+
+            that._log('_handleChapterJump found blocks:', res.data.length);
+
+            // 时间戳正则：匹配 MM:SS 或 H:MM:SS
+            var tsRegex = /\b((?:[0-5]?\d):(?:[0-5]\d)(?::(?:[0-5]\d))?)\b/g;
+            var toUpdate = [];
+            var toCheckRefs = []; // 需要进一步检查块引的块
+
+            res.data.forEach(function(block) {
+                var md = block.markdown || '';
+                var content = block.content || '';
+
+                // 检查是否已包含视频链接（避免重复转换）
+                // 检查是否已包含视频链接（避免重复转换）
+                // 只检查 markdown 中的链接格式，content 中的纯文本 URL（如系统播放器附加的路径）不算
+                if (/\[.*?\]\([^)]*\?t=\d+\)/.test(md)) return;
+
+                // 检查 content（纯文本，块引已展开）中是否有时间戳
+                // content 中可能包含 \uFEFF，需要清理
+                var cleanContent = content.replace(/\uFEFF/g, '');
+                tsRegex.lastIndex = 0;
+                var contentMatch = tsRegex.exec(cleanContent);
+                tsRegex.lastIndex = 0;
+
+                // 如果 content 中没有时间戳，尝试从 md 的清理版本中提取
+                // 某些 heading 块中 content 字段可能为空或不全
+                if (!contentMatch && md) {
+                    var cleanMd = md.replace(/^#+\s*/, '').replace(/\uFEFF/g, '');
+                    tsRegex.lastIndex = 0;
+                    contentMatch = tsRegex.exec(cleanMd);
+                    tsRegex.lastIndex = 0;
+                    if (contentMatch) {
+                        that._log('  -> found timestamp in cleaned md fallback');
+                    }
+                }
+
+                if (!contentMatch) return; // content 里没有时间戳，跳过
+
+                var tsStr = contentMatch[1];
+                var tsSeconds = that._parseTimestampStr(tsStr);
+                if (tsSeconds === null || tsSeconds < 0) return;
+
+                // 检查 markdown 中是否有直接的时间戳文本
+                // 先清理 \uFEFF，否则时间戳可能被包裹在 \uFEFF 中导致匹配问题
+                var cleanMdForCheck = md.replace(/\uFEFF/g, '');
+                var hasTsInMd = tsRegex.test(cleanMdForCheck);
+                tsRegex.lastIndex = 0;
+
+                that._log('_handleChapterJump block', block.id, 'type=' + block.type, 'hasTsInMd=' + hasTsInMd);
+                that._log('  md:', md);
+                that._log('  content:', content);
+
+                if (hasTsInMd) {
+                    // markdown 中有直接的时间戳文本，直接替换
+                    // 需要在清理了 \uFEFF 的 md 上替换，否则 \uFEFF 包裹的时间戳可能匹配不到
+                    var cleanMdForReplace = md.replace(/\uFEFF/g, '');
+                    var newMd = cleanMdForReplace.replace(tsRegex, function(fullMatch) {
+                        var seconds = that._parseTimestampStr(fullMatch);
+                        if (seconds === null || seconds < 0) return fullMatch;
+                        return '[' + fullMatch + '](' + baseUrl + '?t=' + seconds + ')';
+                    });
+                    if (newMd !== cleanMdForReplace) {
+                        toUpdate.push({ id: block.id, markdown: newMd });
+                        that._log('  -> direct update queued');
+                    }
+                    return;
+                }
+
+                // content 中有但 markdown 中没有纯文本时间戳 → 时间戳分散在块引/超链接等中
+                // 同时匹配块引用 ((id)) 和超链接 [text](url)
+                var inlineRefRegex = /\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["'][^"']*["'])?\)\)|\[([^\]]*)\]\([^)]*\)/g;
+                var refs = [];
+                var hasInlineElement = false;
+                var m;
+                while ((m = inlineRefRegex.exec(md)) !== null) {
+                    hasInlineElement = true;
+                    if (m[1]) {
+                        // 块引用 ((id))
+                        refs.push({ full: m[0], id: m[1], type: 'ref' });
+                    }
+                    // 超链接 [text](url) 也标记为有内联元素，策略2段解析器会处理
+                }
+                that._log('  -> content has ts, block refs found:', refs.length, 'hasInlineElement:', hasInlineElement);
+
+                if (refs.length > 0 || hasInlineElement) {
+                    toCheckRefs.push({ block: block, refs: refs, tsStr: tsStr, tsSeconds: tsSeconds });
+                } else {
+                    // 没有内联元素，fallback 在末尾追加链接
+                    var newMd = md + ' [' + tsStr + '](' + baseUrl + '?t=' + tsSeconds + ')';
+                    toUpdate.push({ id: block.id, markdown: newMd });
+                    that._log('  -> fallback append update queued (no refs)');
+                }
+            });
+
+            that._log('_handleChapterJump toUpdate:', toUpdate.length, 'toCheckRefs:', toCheckRefs.length);
+
+            // 如果没有直接可替换的，也没有需要检查块引的
+            if (toUpdate.length === 0 && toCheckRefs.length === 0) {
+                that.showToastMsg('⚠️ 当前文档中没有可转换的时间戳', 2000, 'warning');
+                return;
+            }
+
+            that.showToastMsg('⏳ 正在转换时间戳...', 2000);
+
+            // 辅助函数：执行批量更新
+            function doUpdateAll() {
+                if (toUpdate.length === 0) {
+                    that.showToastMsg('⚠️ 未发现可转换的时间戳', 2000, 'warning');
+                    return;
+                }
+                var successCount = 0;
+                var failCount = 0;
+                var done = 0;
+                var total = toUpdate.length;
+
+                toUpdate.forEach(function(item) {
+                    fetch('/api/block/updateBlock', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ id: item.id, dataType: 'markdown', data: item.markdown })
+                    }).then(function(r2) { return r2.json(); }).then(function(res2) {
+                        done++;
+                        if (res2 && res2.code === 0) successCount++;
+                        else failCount++;
+                        if (done === total) {
+                            if (failCount === 0) {
+                                that.showToastMsg('✅ 已转换 ' + successCount + ' 个时间戳为可点击链接');
+                            } else {
+                                that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount, 3000, 'warning');
+                            }
+                        }
+                    }).catch(function() {
+                        done++;
+                        failCount++;
+                        if (done === total) {
+                            that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount, 3000, 'warning');
+                        }
+                    });
+                });
+            }
+
+            // 如果有需要检查块引的，批量查询被引块内容
+            if (toCheckRefs.length === 0) {
+                doUpdateAll();
+                return;
+            }
+
+            var allRefIds = [];
+            toCheckRefs.forEach(function(item) {
+                item.refs.forEach(function(ref) {
+                    allRefIds.push("'" + ref.id + "'");
+                });
+            });
+
+            var refSql = "SELECT id, content FROM blocks WHERE id IN (" + allRefIds.join(',') + ")";
+            fetch('/api/query/sql', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ stmt: refSql })
+            }).then(function(r) { return r.json(); }).then(function(refRes) {
+                var refContentMap = {};
+                if (refRes && refRes.code === 0 && refRes.data) {
+                    refRes.data.forEach(function(row) { refContentMap[row.id] = row.content; });
+                }
+
+                toCheckRefs.forEach(function(item) {
+                    var md = item.block.markdown;
+                    var newMd = md;
+                    var replaced = false;
+
+                    // 策略1：逐个检查被引块是否是完整时间戳
+                    item.refs.forEach(function(ref) {
+                        var refContent = refContentMap[ref.id];
+                        if (!refContent) return;
+                        tsRegex.lastIndex = 0;
+                        var m2 = tsRegex.exec(refContent);
+                        if (m2) {
+                            var fullMatch = m2[1];
+                            var seconds = that._parseTimestampStr(fullMatch);
+                            if (seconds !== null && seconds >= 0) {
+                                newMd = newMd.replace(ref.full, '[' + fullMatch + '](' + baseUrl + '?t=' + seconds + ')');
+                                replaced = true;
+                            }
+                        }
+                    });
+
+                    // 策略2：处理"时间戳分散在多个块引/超链接+文本中"
+                    // 例如：((id)) 内容是 "03"，后面跟着 ":17" 纯文本
+                    // 例如：[03](url) 后面跟着 ":17" 纯文本
+                    if (!replaced) {
+                        var segments = [];
+                        // 同时匹配块引用 ((id)) 和超链接 [text](url)
+                        var inlineRegex2 = /\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["'][^"']*["'])?\)\)|\[([^\]]*)\]\([^)]*\)/g;
+                        var lastIdx = 0;
+                        var m2;
+                        while ((m2 = inlineRegex2.exec(md)) !== null) {
+                            if (m2.index > lastIdx) {
+                                segments.push({ type: 'text', text: md.substring(lastIdx, m2.index) });
+                            }
+                            if (m2[1]) {
+                                // 块引用 ((id))
+                                var rid = m2[1];
+                                var rcontent = refContentMap[rid] || '';
+                                segments.push({ type: 'ref', text: rcontent, full: m2[0] });
+                            } else {
+                                // 超链接 [text](url)
+                                segments.push({ type: 'link', text: m2[2] || '', full: m2[0] });
+                            }
+                            lastIdx = m2.index + m2[0].length;
+                        }
+                        if (lastIdx < md.length) {
+                            segments.push({ type: 'text', text: md.substring(lastIdx) });
+                        }
+
+                        that._log('  -> strategy2 segments:', segments.length, segments.map(function(s) { return s.type + ':' + JSON.stringify(s.text); }).join(', '));
+
+                        var expanded = '';
+                        var offsets = [];
+                        segments.forEach(function(seg) {
+                            offsets.push(expanded.length);
+                            expanded += seg.text;
+                        });
+
+                        that._log('  -> expanded:', JSON.stringify(expanded));
+
+                        tsRegex.lastIndex = 0;
+                        var tsMatch = tsRegex.exec(expanded);
+                        if (tsMatch) {
+                            var tsStr2 = tsMatch[1];
+                            var tsStart = tsMatch.index;
+                            var tsEnd = tsStart + tsStr2.length;
+                            var seconds2 = that._parseTimestampStr(tsStr2);
+
+                            if (seconds2 !== null && seconds2 >= 0) {
+                                var startSeg = -1, endSeg = -1;
+                                var startOffsetInSeg = 0, endOffsetInSeg = 0;
+                                for (var i = 0; i < offsets.length; i++) {
+                                    var segStart = offsets[i];
+                                    var segEnd = (i + 1 < offsets.length) ? offsets[i + 1] : expanded.length;
+                                    if (startSeg === -1 && segStart <= tsStart && tsStart < segEnd) {
+                                        startSeg = i;
+                                        startOffsetInSeg = tsStart - segStart;
+                                    }
+                                    if (segStart < tsEnd && tsEnd <= segEnd) {
+                                        endSeg = i;
+                                        endOffsetInSeg = tsEnd - segStart;
+                                        break;
+                                    }
+                                }
+                                if (endSeg === -1) endSeg = segments.length - 1;
+
+                                that._log('  -> tsMatch:', tsStr2, 'startSeg:', startSeg, 'endSeg:', endSeg, 'startOff:', startOffsetInSeg, 'endOff:', endOffsetInSeg);
+
+                                if (startSeg !== -1 && endSeg !== -1) {
+                                    var parts = [];
+                                    for (var i = 0; i < segments.length; i++) {
+                                        if (i < startSeg || i > endSeg) {
+                                            // 不在时间戳范围内的段，保持原样
+                                            parts.push(segments[i].type === 'text' ? segments[i].text : segments[i].full);
+                                        } else if (i === startSeg && i === endSeg) {
+                                            // 时间戳完全在一个段内
+                                            if (segments[i].type === 'text') {
+                                                // 文本段：保留时间戳前后的文字，只替换时间戳部分
+                                                var segText = segments[i].text;
+                                                parts.push(segText.substring(0, startOffsetInSeg));
+                                                parts.push('[' + tsStr2 + '](' + baseUrl + '?t=' + seconds2 + ')');
+                                                parts.push(segText.substring(endOffsetInSeg));
+                                            } else {
+                                                // 块引用/超链接段：整个替换为视频链接
+                                                parts.push('[' + tsStr2 + '](' + baseUrl + '?t=' + seconds2 + ')');
+                                            }
+                                        } else if (i === startSeg) {
+                                            // 跨段：第一个段
+                                            if (segments[i].type === 'text') {
+                                                parts.push(segments[i].text.substring(0, startOffsetInSeg));
+                                            }
+                                            parts.push('[' + tsStr2 + '](' + baseUrl + '?t=' + seconds2 + ')');
+                                        } else if (i === endSeg) {
+                                            // 跨段：最后一个段
+                                            if (segments[i].type === 'text') {
+                                                parts.push(segments[i].text.substring(endOffsetInSeg));
+                                            }
+                                            // 块引用/超链接段：时间戳到此结束，不需要保留
+                                        }
+                                        // 中间段 (startSeg < i < endSeg)：完全被时间戳覆盖，跳过
+                                    }
+                                    newMd = parts.join('');
+                                    replaced = true;
+                                    that._log('  -> segment replacement for', tsStr2, 'result:', JSON.stringify(newMd));
+                                }
+                            }
+                        }
+                    }
+
+                    // 策略3：fallback — 在 markdown 末尾追加视频链接
+                    if (!replaced) {
+                        newMd = md + ' [' + item.tsStr + '](' + baseUrl + '?t=' + item.tsSeconds + ')';
+                        replaced = true;
+                        that._log('  -> fallback append for', item.tsStr);
+                    }
+
+                    if (newMd !== md) {
+                        toUpdate.push({ id: item.block.id, markdown: newMd });
+                    }
+                });
+
+                doUpdateAll();
+            }).catch(function(err) {
+                that._log('_handleChapterJump ref query error:', err);
+                toCheckRefs.forEach(function(item) {
+                    var newMd = item.block.markdown + ' [' + item.tsStr + '](' + baseUrl + '?t=' + item.tsSeconds + ')';
+                    toUpdate.push({ id: item.block.id, markdown: newMd });
+                });
+                doUpdateAll();
+            });
+        }).catch(function() {
+            that.showToastMsg('⚠️ 查询文档失败', 2000, 'warning');
+        });
+    }
+
+    /**
+     * 解析时间戳字符串为秒数
+     * @param {string} str - 如 "00:05"、"01:30:00"
+     * @returns {number|null}
+     */
+    _parseTimestampStr(str) {
+        try {
+            var parts = str.split(':');
+            if (parts.length === 2) {
+                var m = parseInt(parts[0], 10);
+                var s = parseInt(parts[1], 10);
+                if (!isNaN(m) && !isNaN(s) && s >= 0 && s < 60) {
+                    return m * 60 + s;
+                }
+            } else if (parts.length === 3) {
+                var h = parseInt(parts[0], 10);
+                var m2 = parseInt(parts[1], 10);
+                var s2 = parseInt(parts[2], 10);
+                if (!isNaN(h) && !isNaN(m2) && !isNaN(s2) && m2 >= 0 && m2 < 60 && s2 >= 0 && s2 < 60) {
+                    return h * 3600 + m2 * 60 + s2;
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    /**
+     * 降级：在思源 Dialog 中打开视频播放器（面板内播放栏不可用时使用）
+     */
+    _openVideoInDialog(filePath, subtitleUrl) {
+        var that = this;
+        var fileUrl = this.toFileUrl(filePath);
+        var fileName = '';
+        try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+
+        // 检测 FLV 格式
+        var videoExt = '';
+        try { videoExt = require('path').extname(filePath).toLowerCase(); } catch(e) {
+            var dotIdx = filePath.lastIndexOf('.');
+            videoExt = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
+        }
+
+        var contentHtml = '<div style="display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#000;position:relative">'
+            + '<video id="cd-dialog-video" controls autoplay style="max-width:100%;max-height:100%;outline:none"></video>'
+            + '</div>';
+
+        if (typeof siyuanApi.Dialog === 'function') {
+            var dialog = new siyuanApi.Dialog({
+                title: '🎬 ' + that.escapeHtml(fileName),
+                content: contentHtml,
+                width: '80vw',
+                height: '80vh'
+            });
+            setTimeout(function() {
+                var dEl = dialog.element;
+                var video = dEl.querySelector('#cd-dialog-video');
+                if (!video) return;
+
+                if (videoExt === '.flv') {
+                    // FLV 格式：使用 mpegts.js 播放
+                    that._loadMpegts(function() {
+                        if (typeof mpegts === 'undefined' || !mpegts.isSupported()) {
+                            that.showToastMsg('⚠️ 无法播放 FLV 格式');
+                            return;
+                        }
+                        try {
+                            var dPlayer = mpegts.createPlayer({
+                                type: 'flv',
+                                url: fileUrl
+                            }, {
+                                enableWorker: false,
+                                enableStashBuffer: true,
+                                seekType: 'range'
+                            });
+                            dPlayer.attachMediaElement(video);
+                            dPlayer.load();
+                            dPlayer.play().catch(function() {
+                                video.muted = true;
+                                dPlayer.play().then(function() {
+                                    setTimeout(function() { video.muted = false; }, 300);
+                                }).catch(function() {});
+                            });
+                            dPlayer.on(mpegts.Events.ERROR, function(errType) {
+                                if (errType === mpegts.ErrorTypes.NETWORK_ERROR) {
+                                    // 回退到 fs 读取
+                                    try {
+                                        var fs = require('fs');
+                                        var buf = fs.readFileSync(filePath);
+                                        var blob = new Blob([buf], { type: 'video/x-flv' });
+                                        var blobUrl = URL.createObjectURL(blob);
+                                        dPlayer.destroy();
+                                        var dPlayer2 = mpegts.createPlayer({ type: 'flv', url: blobUrl }, { enableWorker: false, enableStashBuffer: true });
+                                        dPlayer2.attachMediaElement(video);
+                                        dPlayer2.load();
+                                        dPlayer2.play().catch(function() {});
+                                        // 保存引用，对话框关闭时清理
+                                        that._dialogFlvPlayer = dPlayer2;
+                                        that._dialogFlvBlobUrl = blobUrl;
+                                    } catch(e2) {
+                                        that.showToastMsg('⚠️ FLV 播放失败');
+                                    }
+                                } else {
+                                    that.showToastMsg('⚠️ FLV 解码失败');
+                                }
+                            });
+                        } catch(e) {
+                            that.showToastMsg('⚠️ FLV 播放器创建失败');
+                        }
+                    });
+                } else {
+                    video.src = fileUrl;
+                }
+                if (subtitleUrl) {
+                    // Dialog 中也使用 VTT Blob URL
+                    that._convertSubtitleToVttUrl(subtitleUrl, filePath, function(vttUrl) {
+                        if (vttUrl) {
+                            var track = document.createElement('track');
+                            track.kind = 'subtitles';
+                            track.src = vttUrl;
+                            track.label = '字幕';
+                            track.default = true;
+                            video.appendChild(track);
+                            video.addEventListener('loadedmetadata', function() {
+                                for (var i = 0; i < video.textTracks.length; i++) { video.textTracks[i].mode = 'showing'; }
+                            });
+                        }
+                    });
+                }
+                try {
+                    var bdEl = dEl.querySelector('.b3-dialog__body') || dEl.querySelector('.fn__flex-1');
+                    if (bdEl) { bdEl.style.padding = '0'; bdEl.style.overflow = 'hidden'; }
+                } catch(e) {}
+
+                // 监听对话框关闭，清理 FLV 播放器和 Blob URL
+                var dialogObs = new MutationObserver(function() {
+                    if (!document.contains(dEl)) {
+                        dialogObs.disconnect();
+                        if (that._dialogFlvPlayer) {
+                            try { that._dialogFlvPlayer.destroy(); } catch(e) {}
+                            that._dialogFlvPlayer = null;
+                        }
+                        if (that._dialogFlvBlobUrl) {
+                            URL.revokeObjectURL(that._dialogFlvBlobUrl);
+                            that._dialogFlvBlobUrl = null;
+                        }
+                    }
+                });
+                dialogObs.observe(document.body, { childList: true, subtree: true });
+            }, 100);
+        } else {
+            // 最终降级：用系统播放器
+            that.openFile(filePath);
+        }
+    }
+
+    /**
+     * 播放视频文件
+     * 优先调用思播(siyuan-media-player)插件播放，降级到系统默认播放器
+     * 自动检测并加载同目录字幕文件
+     */
+    playVideo(filePath, fileName) {
+        var that = this;
+        that._log('playVideo called: ' + filePath);
+        var fileUrl = this.toFileUrl(filePath);
+
+        // 自动检测同目录字幕文件
+        var subtitles = this._findSubtitleFiles(filePath);
+        var subtitleUrl = null;
+        var subtitleName = '';
+
+        if (subtitles.length === 1) {
+            subtitleUrl = this.toFileUrl(subtitles[0].path);
+            subtitleName = subtitles[0].name;
+            // 字幕自动匹配成功，字幕出现就是反馈
+        } else if (subtitles.length > 1) {
+            // 多个字幕：弹出选择菜单
+            that._showSubtitleSelectMenu(filePath, fileName, fileUrl, subtitles);
+            return;
+        }
+
+        // 直接在插件面板内播放视频（不再优先调用思播，避免思播禁用后变量残留导致卡死）
+        // 思播返回 ok=true 但实际未打开窗口，无法可靠检测，故统一走面板播放器
+        that._openVideoByMode(filePath, subtitleUrl);
+    }
+
+    /**
+     * 注入字幕轨道到思播播放器的 video 元素
+     * 思播创建播放器后延迟查找 video，注入 <track> 并强制显示
+     * 如果超时未找到 video 元素（思播未真正打开窗口），降级到 _openVideoByMode
+     */
+    _injectSubtitleTrack(videoPath, subtitleUrl) {
+        var that = this;
+        if (!subtitleUrl) return;
+        // 延迟等待思播创建 video 元素
+        var attempts = 0;
+        var maxAttempts = 20;
+        var timer = setInterval(function() {
+            attempts++;
+            // 查找页面中所有 video 元素（思播创建的 dialog 中的 video）
+            // 注意：排除我们自己创建的 #cd-dialog-video，只找思播的
+            var videos = document.querySelectorAll('video:not(#cd-dialog-video):not(#cd-video-el)');
+            var targetVideo = null;
+            for (var i = 0; i < videos.length; i++) {
+                var v = videos[i];
+                // 优先找思播弹窗中的 video（在 b3-dialog 内）
+                if (v.closest('.b3-dialog') || v.closest('[data-plugin]') || v.src) {
+                    targetVideo = v;
+                    break;
+                }
+            }
+            if (!targetVideo && videos.length > 0) {
+                targetVideo = videos[videos.length - 1]; // 兜底：最新的 video
+            }
+            if (targetVideo) {
+                clearInterval(timer);
+                // 移除旧的 track
+                var oldTracks = targetVideo.querySelectorAll('track');
+                for (var j = 0; j < oldTracks.length; j++) {
+                    oldTracks[j].remove();
+                }
+                // 注入新 track
+                var track = document.createElement('track');
+                track.src = subtitleUrl;
+                track.kind = 'subtitles';
+                track.label = '字幕';
+                track.default = true;
+                targetVideo.appendChild(track);
+                // 强制显示字幕
+                var forceShow = function() {
+                    var tracks = targetVideo.textTracks;
+                    for (var k = 0; k < tracks.length; k++) {
+                        tracks[k].mode = 'showing';
+                    }
+                };
+                // 立即尝试 + loadedmetadata 后重试
+                forceShow();
+                targetVideo.addEventListener('loadedmetadata', forceShow);
+                targetVideo.addEventListener('canplay', forceShow);
+                that.showToastMsg('🎬 字幕已加载');
+                return;
+            }
+            if (attempts >= maxAttempts) {
+                clearInterval(timer);
+                that._log('_injectSubtitleTrack: 未找到 video 元素，思播未真正打开窗口，降级处理');
+                that.showToastMsg('🎬 思播未响应，按设置降级打开视频');
+                that._openVideoByMode(videoPath, subtitleUrl);
+            }
+        }, 300);
+    }
+
+    /**
+     * 用系统播放器打开视频，确保字幕可被自动加载
+     * 如果字幕不是完全同名，临时复制为同名文件
+     */
+    _openVideoWithSubtitle(filePath, subtitleUrl) {
+        var that = this;
+        var subtitlePath = null;
+        if (subtitleUrl) {
+            subtitlePath = this.fileUrlToLocalPath(subtitleUrl);
+        }
+        // 系统播放器自动加载同名字幕，检查是否需要临时复制
+        var needTempSub = false;
+        if (subtitlePath) {
+            try {
+                var path = require('path');
+                var videoName = path.basename(filePath, path.extname(filePath));
+                var subName = path.basename(subtitlePath, path.extname(subtitlePath));
+                if (subName !== videoName) {
+                    needTempSub = true;
+                }
+            } catch (e) {}
+        }
+        if (needTempSub && subtitlePath) {
+            try {
+                var path = require('path');
+                var fs = require('fs');
+                var videoDir = path.dirname(filePath);
+                var videoName = path.basename(filePath, path.extname(filePath));
+                var subExt = path.extname(subtitlePath);
+                var tempSubPath = path.join(videoDir, videoName + subExt);
+                // 如果临时文件已存在且不是原文件，跳过
+                if (tempSubPath !== subtitlePath) {
+                    fs.copyFileSync(subtitlePath, tempSubPath);
+                    that._tempSubtitlePath = tempSubPath; // 记录以便后续清理
+                    that.showToastMsg('🎬 已复制同名字幕，播放器将自动加载');
+                }
+            } catch (e) {
+                that._error('复制临时字幕失败:', e);
+            }
+        } else if (subtitlePath) {
+            that.showToastMsg('🎬 已找到字幕，播放器将自动加载');
+        }
         that.openFile(filePath);
+    }
+
+    /**
+     * 弹出字幕选择菜单（多个字幕时让用户选择）
+     */
+    _showSubtitleSelectMenu(videoPath, videoName, videoUrl, subtitles) {
+        var that = this;
+        // 关闭已存在的菜单
+        var oldMenu = document.getElementById('cd-subtitle-select-menu');
+        if (oldMenu) oldMenu.remove();
+
+        var menu = document.createElement('div');
+        menu.id = 'cd-subtitle-select-menu';
+        menu.style.cssText = 'position:fixed;z-index:9999;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.15);padding:4px 0;font-size:12px;min-width:200px;user-select:none';
+
+        // 标题
+        var title = document.createElement('div');
+        title.style.cssText = 'padding:6px 12px;font-size:11px;color:var(--b3-theme-secondary,#999);border-bottom:1px solid var(--b3-border,#eee);margin-bottom:2px';
+        title.textContent = '🎬 选择字幕文件';
+        menu.appendChild(title);
+
+        for (var i = 0; i < subtitles.length; i++) {
+            (function(sub, idx) {
+                var item = document.createElement('div');
+                item.style.cssText = 'padding:6px 12px;cursor:pointer;white-space:nowrap;color:var(--b3-theme-on-background,#333);transition:background 0.1s;display:flex;align-items:center;gap:4px';
+                // 提取语言标识（如果有）
+                var path = require('path');
+                var base = path.basename(sub.name, path.extname(sub.name));
+                var parts = base.split('.');
+                var langHint = '';
+                if (parts.length > 1) {
+                    var lang = parts[parts.length - 1];
+                    var langMap = { 'zh': '中文', 'chs': '简体中文', 'cht': '繁体中文', 'en': '英文', 'ja': '日文', 'ko': '韩文', 'fr': '法文', 'de': '德文', 'es': '西班牙文', 'ru': '俄文' };
+                    langHint = langMap[lang] || lang;
+                }
+                var ext = path.extname(sub.name).toLowerCase().substring(1).toUpperCase();
+                var label = (idx + 1) + '. ' + sub.name;
+                if (langHint) label += ' (' + langHint + ')';
+                label += ' [' + ext + ']';
+                item.textContent = label;
+                item.title = sub.path;
+
+                item.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+                item.addEventListener('mouseleave', function() { this.style.background = ''; });
+                item.addEventListener('click', function(ev) {
+                    ev.stopPropagation();
+                    menu.remove();
+                    var subUrl = that.toFileUrl(sub.path);
+                    that.showToastMsg('🎬 已选择字幕：' + sub.name);
+                    // 用选中的字幕播放视频
+                    try {
+                        var smp = window.siyuanMediaPlayer;
+                        if (smp && typeof smp.playLink === 'function') {
+                            smp.playLink(videoUrl).then(function(ok) {
+                                if (!ok) {
+                                    that._openVideoByMode(videoPath, subUrl);
+                                } else {
+                                    that._injectSubtitleTrack(videoPath, subUrl);
+                                }
+                            }).catch(function(e) {
+                                that._openVideoByMode(videoPath, subUrl);
+                            });
+                            return;
+                        }
+                    } catch (e) {}
+                    that._openVideoByMode(videoPath, subUrl);
+                });
+                menu.appendChild(item);
+            })(subtitles[i], i);
+        }
+
+        // 取消按钮
+        var cancelItem = document.createElement('div');
+        cancelItem.style.cssText = 'padding:6px 12px;cursor:pointer;white-space:nowrap;color:var(--b3-theme-secondary,#999);transition:background 0.1s;border-top:1px solid var(--b3-border,#eee);margin-top:2px;text-align:center';
+        cancelItem.textContent = '取消（无字幕播放）';
+        cancelItem.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e3f2fd)'; });
+        cancelItem.addEventListener('mouseleave', function() { this.style.background = ''; });
+        cancelItem.addEventListener('click', function(ev) {
+            ev.stopPropagation();
+            menu.remove();
+            // 无字幕播放
+            try {
+                var smp = window.siyuanMediaPlayer;
+                if (smp && typeof smp.playLink === 'function') {
+                    smp.playLink(videoUrl).then(function(ok) {
+                        if (!ok) that._openVideoByMode(videoPath, null);
+                    }).catch(function(e) {
+                        that._openVideoByMode(videoPath, null);
+                    });
+                    return;
+                }
+            } catch (e) {}
+            that._openVideoByMode(videoPath, null);
+        });
+        menu.appendChild(cancelItem);
+
+        document.body.appendChild(menu);
+
+        // 居中显示
+        var rect = menu.getBoundingClientRect();
+        var x = Math.max(4, (window.innerWidth - rect.width) / 2);
+        var y = Math.max(4, (window.innerHeight - rect.height) / 2);
+        menu.style.left = x + 'px';
+        menu.style.top = y + 'px';
+
+        function closeMenu() { menu.remove(); }
+        setTimeout(function() {
+            document.addEventListener('click', function clickOut(e) {
+                if (!menu.contains(e.target)) {
+                    closeMenu();
+                    document.removeEventListener('click', clickOut);
+                }
+            });
+            document.addEventListener('keydown', function escHandler(ev) {
+                if (ev.key === 'Escape') { closeMenu(); document.removeEventListener('keydown', escHandler); }
+            });
+        }, 10);
     }
 
     /**
@@ -5347,9 +8949,51 @@ class LocalBrowsePlugin extends Plugin {
                 if (target.dataset && target.dataset.type === 'a' && target.dataset.href && target.dataset.href.indexOf('file:///') === 0) {
                     return { href: target.dataset.href, linkEl: target };
                 }
+                // 图片 <img src="file:///..."> —— 点击文档中插入的本地图片
+                if (target.tagName === 'IMG' && target.src && target.src.indexOf('file:///') === 0) {
+                    return { href: target.src, linkEl: target, isImage: true };
+                }
                 target = target.parentElement;
             }
             return null;
+        }
+
+        /**
+         * 将各种格式的媒体 href 解析为本地路径
+         * 支持：file:///、assets/ 相对路径、思源本地服务器 URL
+         */
+        function _resolveMediaPath(href) {
+            if (!href) return null;
+            var cleanHref = href.split('#')[0];
+            // 1. file:/// 协议（本地文件链接）
+            if (cleanHref.indexOf('file:///') === 0) {
+                return that.fileUrlToLocalPath(cleanHref);
+            }
+            // 2. assets/ 相对路径（思源内部资源）
+            if (cleanHref.indexOf('assets/') === 0 || cleanHref.indexOf('assets\\') === 0) {
+                try {
+                    var dataDir = (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) || '';
+                    if (dataDir) {
+                        return require('path').join(dataDir, cleanHref.replace(/\\/g, '/'));
+                    }
+                } catch(ex) {}
+                return null;
+            }
+            // 3. 思源本地服务器 URL (http://127.0.0.1:*/assets/...)
+            var serverMatch = cleanHref.match(/^https?:\/\/127\.0\.0\.1:\d+\/(assets\/.+)/i);
+            if (serverMatch) {
+                try {
+                    var dataDir2 = (window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir) || '';
+                    if (dataDir2) {
+                        return require('path').join(dataDir2, serverMatch[1].split('?')[0]);
+                    }
+                } catch(ex) {}
+                return null;
+            }
+            // 4. blob: URL 无法解析为本地路径
+            if (cleanHref.indexOf('blob:') === 0) return null;
+            // 5. 其他格式：尝试作为 file URL 解析
+            return that.fileUrlToLocalPath(cleanHref);
         }
 
         that._linkClickInterceptor = function(e) {
@@ -5360,6 +9004,12 @@ class LocalBrowsePlugin extends Plugin {
             // 解析本地路径（去掉 fragment）
             var cleanUrl = href.split('#')[0];
             var localPath = that.fileUrlToLocalPath(cleanUrl);
+
+            // 图片点击：只定位到插件面板，不阻止默认行为（图片已在文档中显示）
+            if (linkInfo.isImage && localPath) {
+                that.locateFileInPanel(localPath);
+                return;
+            }
 
             // 文件夹链接处理：根据设置决定打开方式
             if (localPath) {
@@ -5387,8 +9037,38 @@ class LocalBrowsePlugin extends Plugin {
 
                 // 文件链接：根据设置决定打开方式
                 var fileMode = that._getFileOpenMode(localPath);
+                var isVideo = that.isVideoFile(localPath);
+                var isAudio = that.isAudioFile(localPath);
+                // 提取时间戳参数（如果存在），用于插件播放器跳转
+                var tsMatch = href.match(/[?&]t=([^&#]+)/);
+                var pathWithTs = tsMatch ? (localPath + '?t=' + tsMatch[1]) : localPath;
+                if (fileMode === 'siyuan') {
+                    if (isVideo || isAudio) {
+                        // 音视频文件 + 插件默认：拦截并走插件内嵌播放器
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.stopImmediatePropagation();
+                        if (isAudio) {
+                            // 音频文件：关闭视频播放器（互斥），然后用插件音频播放器打开
+                            var vBar = document.getElementById('cd-video-bar');
+                            if (vBar && vBar.style.display !== 'none') {
+                                that._closeVideoPlayer();
+                            }
+                            var aName = require('path').basename(localPath);
+                            that.playAudio(pathWithTs, aName);
+                        } else {
+                            that._openVideoInPanel(pathWithTs, null, true);
+                            // _openVideoInPanel 内部会自动检测字幕
+                        }
+                        that.locateFileInPanel(localPath);
+                    } else {
+                        // 非音视频文件（文档/图片/代码等）+ siyuan 模式：让思源自己处理，只在面板中定位
+                        that.locateFileInPanel(localPath);
+                    }
+                    return;
+                }
                 if (fileMode === 'system') {
-                    // 明确阻止默认行为后，用系统默认程序打开
+                    // 电脑默认：阻止默认行为，用系统默认程序打开
                     e.preventDefault();
                     e.stopPropagation();
                     e.stopImmediatePropagation();
@@ -5403,16 +9083,32 @@ class LocalBrowsePlugin extends Plugin {
                     that.openFile(localPath);
                     return;
                 }
-                if (fileMode === 'siyuan') {
-                    // 思源笔记打开：同步在插件面板中定位，然后不拦截，让思源自己处理
+                if (fileMode === 'smp') {
+                    // 思源默认（思播）：同步在插件面板中定位，然后不拦截，让思源/思播自己处理
                     that.locateFileInPanel(localPath);
                     return;
                 }
-                // 插件内打开：阻止默认行为，在插件面板中同步定位到该文件
-                e.preventDefault();
-                e.stopPropagation();
-                e.stopImmediatePropagation();
-                that.locateFileInPanel(localPath);
+                // localbrowser 模式：插件能处理的文件走插件，不能处理的不拦截让思源处理
+                if (isVideo || isAudio) {
+                    // 音视频文件：走插件内嵌播放器
+                    e.preventDefault();
+                    e.stopPropagation();
+                    e.stopImmediatePropagation();
+                    if (isAudio) {
+                        var vBar = document.getElementById('cd-video-bar');
+                        if (vBar && vBar.style.display !== 'none') {
+                            that._closeVideoPlayer();
+                        }
+                        var aName = require('path').basename(localPath);
+                        that.playAudio(pathWithTs, aName);
+                    } else {
+                        that._openVideoInPanel(pathWithTs, null, true);
+                    }
+                    that.locateFileInPanel(localPath);
+                } else {
+                    // 非音视频文件（文档/代码等）：插件无内置查看器，不拦截，让思源自带处理
+                    that.locateFileInPanel(localPath);
+                }
                 return;
             }
 
@@ -5434,6 +9130,165 @@ class LocalBrowsePlugin extends Plugin {
 
         // 在捕获阶段拦截 click 事件（思源通过 click 处理链接，不用 mousedown）
         document.addEventListener('click', that._linkClickInterceptor, true);
+
+        // 在 window 捕获阶段额外注册媒体链接拦截器，确保先于其他插件（如思播）处理
+        that._windowVideoInterceptor = function(e) {
+            // === 新增：拦截文档中嵌入的 <video>/<audio> 元素点击（思源"插入文件"产生的媒体块） ===
+            var mediaTarget = e.target;
+            var mediaEl = null;
+            // 向上查找 VIDEO 或 AUDIO 元素（点击可能落在子元素上）
+            while (mediaTarget && mediaTarget !== document) {
+                if (mediaTarget.tagName === 'VIDEO' || mediaTarget.tagName === 'AUDIO') {
+                    mediaEl = mediaTarget;
+                    break;
+                }
+                mediaTarget = mediaTarget.parentElement;
+            }
+            if (mediaEl) {
+                // 检查是否在 protyle 编辑器内（文档中的媒体块，非插件面板内的播放器）
+                var isInProtyle = false;
+                var p = mediaEl.parentElement;
+                while (p && p !== document) {
+                    if (p.classList && p.classList.contains('protyle-content')) { isInProtyle = true; break; }
+                    p = p.parentElement;
+                }
+                if (isInProtyle) {
+                    // 从 data-src 或 src 属性获取媒体路径
+                    // 优先 data-src（原始路径），其次 getAttribute('src')（HTML 属性值），最后 el.src（浏览器解析后的绝对 URL）
+                    var mediaSrc = mediaEl.getAttribute('data-src') || mediaEl.getAttribute('src') || '';
+                    // 如果属性值是 blob: 或为空，尝试 el.src（浏览器解析后的绝对 URL，可能为 http://127.0.0.1:*/assets/...）
+                    if ((!mediaSrc || mediaSrc.indexOf('blob:') === 0) && mediaEl.src) {
+                        mediaSrc = mediaEl.src;
+                    }
+                    var localMediaPath = mediaSrc ? _resolveMediaPath(mediaSrc) : null;
+                    if (localMediaPath) {
+                        var isVid = mediaEl.tagName === 'VIDEO';
+                        var mediaMode = that._getFileOpenMode(localMediaPath);
+                        if (mediaMode === 'siyuan') {
+                            // 插件默认：拦截并走插件内嵌播放器
+                            e.preventDefault();
+                            e.stopPropagation();
+                            e.stopImmediatePropagation();
+                            if (isVid) {
+                                that._openVideoInPanel(localMediaPath, null, true);
+                            } else {
+                                var vBar = document.getElementById('cd-video-bar');
+                                if (vBar && vBar.style.display !== 'none') { that._closeVideoPlayer(); }
+                                var mName = require('path').basename(localMediaPath);
+                                that.playAudio(localMediaPath, mName);
+                            }
+                            that.locateFileInPanel(localMediaPath);
+                            return;
+                        } else if (mediaMode === 'system') {
+                            // 电脑默认：拦截，用系统播放器
+                            e.preventDefault();
+                            e.stopPropagation();
+                            e.stopImmediatePropagation();
+                            that._openVideoWithSubtitle(localMediaPath, null);
+                            return;
+                        }
+                        // smp（思源默认/思播）：不拦截，让思播自己处理
+                    }
+                }
+            }
+
+            // === 拦截 file:/// 链接 ===
+            var linkInfo = findFileLink(e);
+            if (!linkInfo) {
+                // === 更广泛的媒体链接拦截：assets/ 路径、思源服务器 URL 等 ===
+                // findFileLink 只匹配 file:/// 协议，这里补充拦截其他格式的音视频链接
+                var broadTarget = e.target;
+                while (broadTarget && broadTarget !== document) {
+                    var broadRawHref = null;
+                    if (broadTarget.tagName === 'A') {
+                        broadRawHref = broadTarget.getAttribute('href') || '';
+                    } else if (broadTarget.dataset && broadTarget.dataset.type === 'a') {
+                        broadRawHref = broadTarget.dataset.href || '';
+                    }
+                    if (broadRawHref) {
+                        // 检查是否为音视频文件（通过扩展名判断）
+                        var cleanBroadHref = broadRawHref.split('#')[0].split('?')[0];
+                        if (that.isVideoFile(cleanBroadHref) || that.isAudioFile(cleanBroadHref)) {
+                            var resolvedMediaPath = _resolveMediaPath(broadRawHref);
+                            if (resolvedMediaPath) {
+                                var broadMode = that._getFileOpenMode(resolvedMediaPath);
+                                if (broadMode === 'siyuan') {
+                                    // 插件默认：拦截并走插件内嵌播放器
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    e.stopImmediatePropagation();
+                                    if (that.isVideoFile(cleanBroadHref)) {
+                                        that._openVideoInPanel(resolvedMediaPath, null, true);
+                                    } else {
+                                        var bvb = document.getElementById('cd-video-bar');
+                                        if (bvb && bvb.style.display !== 'none') { that._closeVideoPlayer(); }
+                                        that.playAudio(resolvedMediaPath, require('path').basename(resolvedMediaPath));
+                                    }
+                                    that.locateFileInPanel(resolvedMediaPath);
+                                    return;
+                                } else if (broadMode === 'system') {
+                                    // 电脑默认：拦截，用系统播放器
+                                    e.preventDefault();
+                                    e.stopPropagation();
+                                    e.stopImmediatePropagation();
+                                    that._openVideoWithSubtitle(resolvedMediaPath, null);
+                                    return;
+                                }
+                                // smp（思源默认/思播）：不拦截，让思播自己处理
+                            }
+                        }
+                    }
+                    broadTarget = broadTarget.parentElement;
+                }
+                return;
+            }
+            var href = linkInfo.href;
+            // 解析本地路径（去掉 fragment）
+            var cleanUrl = href.split('#')[0];
+            var localPath = that.fileUrlToLocalPath(cleanUrl);
+            if (!localPath) return;
+            var pathForCheck = localPath.split('?')[0];
+            var isVideo = that.isVideoFile(pathForCheck);
+            var isAudio = that.isAudioFile(pathForCheck);
+            if (!isVideo && !isAudio) return;
+            var fileMode = that._getFileOpenMode(localPath);
+            var tsMatch = href.match(/[?&]t=([^&#]+)/);
+            var pathWithTs = tsMatch ? (localPath + '?t=' + tsMatch[1]) : localPath;
+            if (fileMode === 'siyuan' || fileMode === 'localbrowser') {
+                // 插件默认 / 本地浏览器模式：拦截并走插件内嵌播放器
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                if (isVideo) {
+                    that._openVideoInPanel(pathWithTs, null, true);
+                } else {
+                    var videoBar = document.getElementById('cd-video-bar');
+                    if (videoBar && videoBar.style.display !== 'none') {
+                        that._closeVideoPlayer();
+                    }
+                    var name = require('path').basename(localPath);
+                    that.playAudio(pathWithTs, name);
+                }
+                that.locateFileInPanel(localPath);
+            } else if (fileMode === 'smp') {
+                // 思源默认（思播）：关闭插件播放器，不拦截，让思播自己处理
+                var videoBar = document.getElementById('cd-video-bar');
+                if (videoBar && videoBar.style.display !== 'none') {
+                    that._closeVideoPlayer();
+                }
+            } else if (fileMode === 'system') {
+                // 电脑默认：关闭插件播放器，用系统播放器
+                var videoBar2 = document.getElementById('cd-video-bar');
+                if (videoBar2 && videoBar2.style.display !== 'none') {
+                    that._closeVideoPlayer();
+                }
+                e.preventDefault();
+                e.stopPropagation();
+                e.stopImmediatePropagation();
+                that._openVideoWithSubtitle(localPath, null);
+            }
+        };
+        window.addEventListener('click', that._windowVideoInterceptor, true);
     }
 
     /**
@@ -5746,6 +9601,13 @@ class LocalBrowsePlugin extends Plugin {
             var ext = path.extname(filePath).toLowerCase();
             // 目前只支持 MP3 (ID3v2)
             if (ext !== '.mp3') return null;
+            // 检查缓存：以文件路径 + 修改时间为 key
+            var stat = fs.statSync(filePath);
+            var cacheKey = filePath + '_' + stat.mtimeMs;
+            if (!this._audioCoverCache) this._audioCoverCache = {};
+            if (this._audioCoverCache[cacheKey]) {
+                return this._audioCoverCache[cacheKey];
+            }
             // 读取前 512KB（封面通常在前部）
             var fd = fs.openSync(filePath, 'r');
             var buffer = Buffer.alloc(512 * 1024);
@@ -5807,7 +9669,14 @@ class LocalBrowsePlugin extends Plugin {
                     }
                     var imgData = buffer.slice(descEnd, pos + frameSize);
                     var base64 = imgData.toString('base64');
-                    return 'data:' + mimeType + ';base64,' + base64;
+                    var coverUrl = 'data:' + mimeType + ';base64,' + base64;
+                    // 存入缓存并限制大小
+                    this._audioCoverCache[cacheKey] = coverUrl;
+                    var keys = Object.keys(this._audioCoverCache);
+                    if (keys.length > 30) {
+                        delete this._audioCoverCache[keys[0]];
+                    }
+                    return coverUrl;
                 }
                 pos += frameSize;
                 // 安全：防止异常数据导致无限循环
@@ -5829,8 +9698,36 @@ class LocalBrowsePlugin extends Plugin {
         var audioBar = document.getElementById('cd-audio-bar');
         if (!audioBar) return;
 
-        // 构建 file:// URL
-        var fileUrl = that.toFileUrl(filePath);
+        // 切换音频时重置文档高亮状态
+        that._docHighlightLastIdx = -1;
+        that._docSegmentsCache = null;
+        if (that._docSegmentsCacheTimer) { clearTimeout(that._docSegmentsCacheTimer); that._docSegmentsCacheTimer = null; }
+
+        // 分离路径和 URL 参数（支持循环片段链接 ?t=start-end 和时间戳 ?t=seconds）
+        var cleanFilePath = filePath.split('?')[0];
+        var paramMatch = filePath.match(/[?&]t=([^&#]+)/);
+        var loopStart = null;
+        var loopEnd = null;
+        var seekTime = null;
+        if (paramMatch) {
+            var rangeMatch = paramMatch[1].match(/^(\d+)-(\d+)$/);
+            if (rangeMatch) {
+                loopStart = parseInt(rangeMatch[1], 10);
+                loopEnd = parseInt(rangeMatch[2], 10);
+                if (loopEnd < loopStart) {
+                    var _t = loopStart; loopStart = loopEnd; loopEnd = _t;
+                }
+            } else {
+                // 单个时间戳 ?t=5
+                var seekVal = parseInt(paramMatch[1], 10);
+                if (!isNaN(seekVal) && seekVal > 0) {
+                    seekTime = seekVal;
+                }
+            }
+        }
+
+        // 构建 file:// URL（用 cleanFilePath，不含参数）
+        var fileUrl = that.toFileUrl(cleanFilePath);
 
         // 如果没有 audio 元素则创建
         if (!that._audioEl) {
@@ -5866,8 +9763,66 @@ class LocalBrowsePlugin extends Plugin {
             }
         }
         that._audioIndex = idx >= 0 ? idx : 0;
-        that._audioCurrentPath = filePath;
+        // 提前获取循环片段按钮（同音频优化也需要用）
+        var loopSegBtn = document.getElementById('cd-audio-loop-seg');
+        // 检查是否是同一个音频文件（只是时间戳不同）—— 直接 seek 不重新加载
+        var currentAudioPath = that._audioCurrentPath ? that._audioCurrentPath.split('?')[0] : null;
+        var isSameAudio = currentAudioPath && currentAudioPath === cleanFilePath && audioBar.style.display !== 'none';
+        if (isSameAudio && (seekTime !== null || loopStart !== null)) {
+            that._log('playAudio: 同一个音频，直接跳转到 ' + (seekTime || loopStart) + 's');
+            // 更新循环片段状态
+            that._audioLoopSegMarkStart = null;
+            if (loopStart !== null && loopEnd !== null) {
+                that._audioLoopPlayStart = loopStart;
+                that._audioLoopPlayEnd = loopEnd;
+                if (loopSegBtn) { loopSegBtn.classList.add('cd-active'); loopSegBtn.title = '点击取消循环'; }
+            } else {
+                that._audioLoopPlayStart = null;
+                that._audioLoopPlayEnd = null;
+                if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+            }
+            // 直接 seek 到目标时间
+            var targetTime = seekTime !== null ? seekTime : loopStart;
+            if (targetTime !== null && that._audioEl.duration && targetTime < that._audioEl.duration) {
+                that._audioEl.currentTime = targetTime;
+            }
+            // 确保正在播放
+            if (that._audioEl.paused) {
+                that._audioEl.play().catch(function() {});
+            }
+            // 重置文档高亮索引
+            that._docHighlightLastIdx = -1;
+            return;
+        }
+
+        that._audioCurrentPath = cleanFilePath;  // 必须在 setTimeout 之前设置（_loadLrc 竞态检查依赖）
         that._audioCurrentName = fileName;  // 单独存储文件名
+
+        // 重置音频循环片段状态（切换/重新打开音频时）
+        that._audioLoopSegMarkStart = null;
+        if (loopStart !== null && loopEnd !== null) {
+            // 从链接参数解析到循环范围
+            that._audioLoopPlayStart = loopStart;
+            that._audioLoopPlayEnd = loopEnd;
+            // 循环片段也应该从起点开始播放
+            that._audioSeekOnLoad = loopStart;
+        } else {
+            that._audioLoopPlayStart = null;
+            that._audioLoopPlayEnd = null;
+        }
+        if (loopStart !== null && loopEnd !== null) {
+            // 从链接参数解析到循环范围 → 高亮按钮表示正在循环
+            if (loopSegBtn) { loopSegBtn.classList.add('cd-active'); loopSegBtn.title = '点击取消循环'; }
+        } else {
+            if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+        }
+
+        // 记录需要跳转的时间点（从链接 ?t=seconds 参数，canplay 后 seek）
+        // 注意：循环片段 ?t=start-end 已在上面设置了 _audioSeekOnLoad = loopStart，
+        // 这里只在非循环片段时才用 seekTime 覆盖
+        if (seekTime !== null) {
+            that._audioSeekOnLoad = seekTime;
+        }
 
         // 设置预加载策略：仅加载元数据，避免网盘大文件阻塞 UI
         that._audioEl.preload = 'metadata';
@@ -5875,6 +9830,10 @@ class LocalBrowsePlugin extends Plugin {
 
         // 先更新 UI，避免设置 src 后网盘文件加载阻塞界面
         audioBar.style.display = 'flex';
+        // 关闭视频播放器（互斥）+ 清除已保存的视频状态（否则重启会恢复视频而非音频）
+        if (that._closeVideoPlayer) that._closeVideoPlayer();
+        that._videoPlayerClosed = true;
+        that._saveVideoState(null, null);
         var nameEl = document.getElementById('cd-audio-name');
         if (nameEl) nameEl.textContent = '🎵 ' + fileName;
         // 延迟显示 loading：本地文件 canplay 很快，不需要 loading；只有加载卡顿超过 80ms 才显示
@@ -5884,8 +9843,11 @@ class LocalBrowsePlugin extends Plugin {
         }, 80);
 
         // 延迟设置 src：让 UI 渲染先完成，再触发音频加载
+        // 使用版本号防止快速切歌时旧的 setTimeout 覆盖新的 src
+        var loadVersion = that._audioLoadVersion = (that._audioLoadVersion || 0) + 1;
         setTimeout(function() {
             if (!that._audioEl) return;
+            if (that._audioLoadVersion !== loadVersion) return;  // 已被更新的调用取代
             that._audioEl.src = fileUrl;
         }, 0);
 
@@ -5902,7 +9864,7 @@ class LocalBrowsePlugin extends Plugin {
             }
             that._preloadData = null;
         }
-        that._loadLrc(filePath);
+        that._loadLrc(cleanFilePath);
 
         // 首次播放后延迟触发预加载
         setTimeout(function() {
@@ -5973,6 +9935,95 @@ class LocalBrowsePlugin extends Plugin {
         var m = Math.floor(sec / 60);
         var s = Math.floor(sec % 60);
         return m + ':' + (s < 10 ? '0' : '') + s;
+    }
+
+    /**
+     * 插入音频时间戳到当前文档
+     */
+    _insertAudioTimestamp(currentTime) {
+        var that = this;
+        var filePath = that._audioCurrentPath;
+        var fileName = that._audioCurrentName;
+        if (!filePath || !fileName) {
+            that.showToastMsg('⚠️ 未在播放音频', 2000, 'warning');
+            return;
+        }
+        var timeStr = that._formatAudioTime(currentTime);
+        var url = that.toFileUrl(filePath) + '?t=' + Math.floor(currentTime);
+        var markdown = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+
+        that._insertMarkdownAtCursor(markdown, function(success) {
+            if (success) {
+                // 插入成功，内容出现在编辑器就是反馈
+            } else {
+                that._copyToClipboard(markdown, function(ok) {
+                    if (ok) {
+                        // 复制成功，静默
+                    } else {
+                        that.showToastMsg('⚠️ 插入失败，请手动复制: ' + markdown, 3000, 'warning');
+                    }
+                });
+            }
+        });
+    }
+
+    /**
+     * 处理音频循环片段：两次点击标记起止时间
+     * 正在循环时点击：取消循环
+     */
+    _handleAudioLoopSegment() {
+        var that = this;
+        if (!that._audioEl || !that._audioCurrentPath) {
+            that.showToastMsg('⚠️ 未在播放音频', 2000, 'warning');
+            return;
+        }
+        var filePath = that._audioCurrentPath;
+        var fileName = that._audioCurrentName;
+        var currentTime = that._audioEl.currentTime;
+        var loopSegBtn = document.getElementById('cd-audio-loop-seg');
+
+        // 正在循环播放中：点击取消循环
+        if (that._audioLoopPlayStart !== null && that._audioLoopPlayEnd !== null && that._audioLoopSegMarkStart === null) {
+            that._audioLoopPlayStart = null;
+            that._audioLoopPlayEnd = null;
+            if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+            return;
+        }
+
+        if (that._audioLoopSegMarkStart === null) {
+            // 第一次点击：记录起点
+            that._audioLoopSegMarkStart = currentTime;
+            if (loopSegBtn) { loopSegBtn.classList.add('cd-active'); loopSegBtn.title = '2️⃣点击标记终点'; }
+        } else {
+            // 第二次点击：记录终点，生成链接并插入
+            var startTime = that._audioLoopSegMarkStart;
+            var endTime = currentTime;
+            if (endTime < startTime) {
+                var tmp = startTime;
+                startTime = endTime;
+                endTime = tmp;
+            }
+            that._audioLoopSegMarkStart = null;
+            if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+
+            var timeStr = that._formatAudioTime(startTime) + '-' + that._formatAudioTime(endTime);
+            var url = that.toFileUrl(filePath) + '?t=' + Math.floor(startTime) + '-' + Math.floor(endTime);
+            var markdown = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+
+            that._insertMarkdownAtCursor(markdown, function(success) {
+                if (success) {
+                    // 插入成功，内容出现在编辑器就是反馈
+                } else {
+                    that._copyToClipboard(markdown, function(ok) {
+                        if (ok) {
+                            // 复制成功，静默
+                        } else {
+                            that.showToastMsg('⚠️ 插入失败，请手动复制: ' + markdown, 3000, 'warning');
+                        }
+                    });
+                }
+            });
+        }
     }
 
     /**
@@ -6640,10 +10691,10 @@ class LocalBrowsePlugin extends Plugin {
         target.style.transition = 'background 0.3s';
 
         // 清除之前的高亮
-        if (that._lastAudioHighlight) {
-            that._lastAudioHighlight.style.background = '';
+        if (that._lastLocateHighlight) {
+            that._lastLocateHighlight.style.background = '';
         }
-        that._lastAudioHighlight = target;
+        that._lastLocateHighlight = target;
     }
 
     /**
@@ -6732,6 +10783,23 @@ class LocalBrowsePlugin extends Plugin {
             });
         }
 
+        // 插入时间戳
+        var tsBtn = document.getElementById('cd-audio-timestamp');
+        if (tsBtn) {
+            tsBtn.addEventListener('click', function() {
+                if (!that._audioEl) return;
+                that._insertAudioTimestamp(that._audioEl.currentTime);
+            });
+        }
+
+        // 循环片段
+        var loopSegBtn = document.getElementById('cd-audio-loop-seg');
+        if (loopSegBtn) {
+            loopSegBtn.addEventListener('click', function() {
+                that._handleAudioLoopSegment();
+            });
+        }
+
         // 关闭播放器
         if (closeBtn) {
             closeBtn.addEventListener('click', function() {
@@ -6748,8 +10816,18 @@ class LocalBrowsePlugin extends Plugin {
                 var lrcPanel = document.getElementById('cd-audio-lrc-panel');
                 if (lrcPanel) lrcPanel.style.display = 'none';
                 if (lrcToggle) lrcToggle.style.opacity = '0.5';
+                // 重置音频循环片段状态
+                that._audioLoopSegMarkStart = null;
+                that._audioLoopPlayStart = null;
+                that._audioLoopPlayEnd = null;
+                if (loopSegBtn) { loopSegBtn.classList.remove('cd-active'); loopSegBtn.title = '循环片段：1️⃣点击标记起点'; }
+                // 清除文档字幕高亮和缓存
+                that._clearDocSegmentHighlight();
+                that._docSegmentsCache = null;
+                if (that._docSegmentsCacheTimer) { clearTimeout(that._docSegmentsCacheTimer); that._docSegmentsCacheTimer = null; }
                 // 标记用户手动关闭，下次启动不再恢复播放器
                 that._audioPlayerClosed = true;
+                that._audioCurrentPath = null;
                 that._audioCurrentName = null;
                 that._saveAudioState(null, null);
             });
@@ -6816,6 +10894,12 @@ class LocalBrowsePlugin extends Plugin {
                 if (timeEl) timeEl.textContent = that._formatAudioTime(that._audioEl.currentTime) + '/' + that._formatAudioTime(that._audioEl.duration);
                 // 同步歌词高亮
                 that._updateLrcHighlight(that._audioEl.currentTime);
+                // 音频循环片段：到达终点自动跳回起点
+                if (that._audioLoopPlayEnd !== null && that._audioLoopPlayStart !== null && that._audioEl.currentTime >= that._audioLoopPlayEnd) {
+                    that._audioEl.currentTime = that._audioLoopPlayStart;
+                }
+                // 自动定位文档中对应的字幕片段
+                that._highlightDocSegment(that._audioEl.currentTime, that._audioCurrentPath);
             });
 
             // canplay：元数据加载完成，可以开始播放（解决网盘大文件阻塞 UI）
@@ -6825,6 +10909,11 @@ class LocalBrowsePlugin extends Plugin {
                 if (that._audioLoadTimer) {
                     clearTimeout(that._audioLoadTimer);
                     that._audioLoadTimer = null;
+                }
+                // 跳转到时间戳指定位置（从链接 ?t=seconds 参数）
+                if (that._audioSeekOnLoad !== null) {
+                    that._audioEl.currentTime = that._audioSeekOnLoad;
+                    that._audioSeekOnLoad = null;
                 }
                 // 仅当显式请求播放时才自动 play（恢复状态时不自动播放）
                 if (that._audioShouldAutoPlay && that._audioEl.paused) {
@@ -6978,6 +11067,118 @@ class LocalBrowsePlugin extends Plugin {
             }
         } catch (e) {
             that._error('_restoreAudioState error:', e);
+        }
+    }
+
+    /**
+     * 保存视频播放器状态（双写：saveData 持久化 + localStorage 即时缓存）
+     * 视频路径是设备相关的，不需要跨设备同步
+     * @param {string|null} filePath - 视频文件路径，null 表示用户关闭了播放器
+     * @param {string|null} fileName - 视频文件名
+     */
+    _saveVideoState(filePath, fileName) {
+        var that = this;
+        try {
+            var key = 'cd_video_state_' + this.platform;
+            var data = filePath && fileName ? { path: filePath, name: fileName } : null;
+            // 同步保存视频播放器高度（跨重启不丢失）
+            if (data) {
+                try {
+                    var videoWrap = document.getElementById('cd-video-wrap');
+                    if (videoWrap) {
+                        var curH = videoWrap.offsetHeight;
+                        if (curH && curH > 50) {
+                            data.height = curH;
+                            localStorage.setItem('cd-video-bar-height', curH);
+                        }
+                    }
+                } catch(e) {}
+            }
+            // localStorage 即时缓存（同步，_restoreVideoState 优先读取）
+            if (data) {
+                localStorage.setItem(key, JSON.stringify(data));
+            } else {
+                localStorage.removeItem(key);
+            }
+            // saveData 持久化到 data.json（异步，跨重启不丢失）
+            if (typeof this.saveData === 'function') {
+                this.saveData(key, data).catch(function(e) {
+                    that._error('saveData video state failed:', e);
+                });
+            }
+        } catch (e) {
+            this._error('save video state error:', e);
+        }
+    }
+
+    /**
+     * 恢复视频播放器状态（localStorage 优先，降级到 loadData）
+     * 如果上次用户没有关闭播放器，重新显示播放器（暂停状态）
+     */
+    _restoreVideoState() {
+        var that = this;
+        try {
+            var key = 'cd_video_state_' + this.platform;
+
+            // 内部函数：根据保存的数据恢复播放器 UI
+            var doRestore = function(savedPath, savedName, savedHeight) {
+                if (!savedPath || !savedName) return;
+
+                // 验证文件是否存在于当前设备
+                that._fsExists(savedPath).then(function(exists) {
+                    if (!exists) {
+                        that._log('_restoreVideoState: file not exists, skip:', savedPath);
+                        localStorage.removeItem(key);
+                        return;
+                    }
+
+                    // 恢复高度：如果 localStorage 没有，用 saveData 持久化的高度
+                    if (savedHeight && savedHeight > 50) {
+                        try { localStorage.setItem('cd-video-bar-height', savedHeight); } catch(e) {}
+                    }
+
+                    // 自动检测字幕文件
+                    var subtitles = that._findSubtitleFiles(savedPath);
+                    var subUrl = null;
+                    if (subtitles.length === 1) {
+                        subUrl = that.toFileUrl(subtitles[0].path);
+                    } else if (subtitles.length > 1) {
+                        subUrl = that.toFileUrl(subtitles[0].path);
+                    }
+
+                    // 使用 _openVideoInPanel 恢复播放器（不自动播放，已含高度恢复逻辑）
+                    that._openVideoInPanel(savedPath, subUrl, false);
+                    that._videoCurrentPath = savedPath;
+                    that._videoCurrentName = savedName;
+
+                    that._log('_restoreVideoState: restored', savedName, 'height=' + savedHeight);
+                }).catch(function(e) {
+                    that._error('_restoreVideoState: _fsExists check failed:', e);
+                });
+            };
+
+            // 优先从 localStorage 读取（同步，速度快）
+            var saved = localStorage.getItem(key);
+            if (saved) {
+                var parsed = JSON.parse(saved);
+                doRestore(parsed.path, parsed.name, parsed.height);
+                return;
+            }
+
+            // localStorage 没有数据，尝试从 loadData 读取（重启后 localStorage 可能被清空）
+            if (typeof this.loadData === 'function') {
+                this.loadData(key).then(function(data) {
+                    if (data && data.path && data.name) {
+                        // 回写 localStorage 缓存，下次启动更快
+                        try { localStorage.setItem(key, JSON.stringify(data)); } catch (e) {}
+                        doRestore(data.path, data.name, data.height);
+                    }
+                }).catch(function() {
+                    // 没有保存过数据，忽略
+                });
+            }
+        } catch (e) {
+            that._error('_restoreVideoState error:', e);
         }
     }
 
@@ -7464,6 +11665,170 @@ class LocalBrowsePlugin extends Plugin {
             var lineTop = lineEl.offsetTop;
             var lineH = lineEl.clientHeight;
             lrcContent.scrollTop = lineTop - panelH / 2 + lineH / 2;
+        }
+    }
+
+    /**
+     * 播放时自动定位文档中对应的字幕/循环片段链接
+     * 查找当前文档中所有指向正在播放的媒体文件、且带 ?t=start-end 参数的链接
+     * 高亮当前时间所在的片段，并滚动到可见区域
+     * 优化：缓存片段列表，避免每次 timeupdate 都查 DOM；智能滚动，已在视口内不重复滚动
+     */
+    _highlightDocSegment(currentTime, mediaPath) {
+        var that = this;
+        if (!mediaPath || currentTime === undefined || currentTime === null) return;
+
+        // 使用缓存的片段列表（缓存与 mediaPath 绑定，切换媒体时自动重建）
+        var segments = null;
+        if (that._docSegmentsCache && that._docSegmentsCache.mediaPath === mediaPath) {
+            segments = that._docSegmentsCache.segments;
+        }
+        if (!segments) {
+            // 缓存为空或媒体已切换，重建并缓存
+            segments = that._buildDocSegmentsCache(mediaPath);
+            that._docSegmentsCache = { mediaPath: mediaPath, segments: segments };
+            // 5秒后自动刷新缓存（文档可能被编辑）
+            if (that._docSegmentsCacheTimer) clearTimeout(that._docSegmentsCacheTimer);
+            that._docSegmentsCacheTimer = setTimeout(function() {
+                that._docSegmentsCache = null;
+            }, 5000);
+        }
+
+        if (segments.length === 0) {
+            that._clearDocSegmentHighlight();
+            return;
+        }
+
+        // 检测用户是否正在编辑文档（光标在 protyle 编辑区内）
+        var activeEl = document.activeElement;
+        var isEditing = false;
+        if (activeEl && activeEl !== document.body) {
+            var protyleEditor = activeEl.closest ? activeEl.closest('.protyle-wysiwyg') : null;
+            var isProtyleSelf = activeEl.classList && activeEl.classList.contains('protyle-wysiwyg');
+            if (protyleEditor || isProtyleSelf) isEditing = true;
+        }
+
+        // 找到当前时间所在的片段（start <= currentTime < end）
+        var activeIdx = -1;
+        for (var i = 0; i < segments.length; i++) {
+            if (currentTime >= segments[i].start && currentTime < segments[i].end) {
+                activeIdx = i;
+                break;
+            }
+        }
+        // 没有精确匹配时，找最后一个 start <= currentTime 的（字幕间隙）
+        if (activeIdx === -1) {
+            for (var j = segments.length - 1; j >= 0; j--) {
+                if (currentTime >= segments[j].start) {
+                    activeIdx = j;
+                    break;
+                }
+            }
+        }
+
+        if (activeIdx === that._docHighlightLastIdx) return;
+        that._docHighlightLastIdx = activeIdx;
+
+        // 清除所有高亮
+        that._clearDocSegmentHighlight(true);
+
+        // 高亮当前片段
+        if (activeIdx >= 0 && activeIdx < segments.length) {
+            var seg = segments[activeIdx];
+            // 检查 DOM 元素是否还在文档中（可能被编辑删除了）
+            if (!document.contains(seg.el)) {
+                that._docSegmentsCache = null;  // 缓存失效
+                that._docHighlightLastIdx = -1; // 重置索引，下次重新高亮
+                return;
+            }
+            seg.el.style.backgroundColor = 'rgba(66, 133, 244, 0.15)';
+            seg.el.style.borderRadius = '3px';
+            seg.el.classList.add('cd-doc-seg-active');
+            if (seg.parentLi && document.contains(seg.parentLi)) {
+                seg.parentLi.style.outline = '2px solid rgba(66, 133, 244, 0.5)';
+                seg.parentLi.style.outlineOffset = '-2px';
+                seg.parentLi.style.borderRadius = '4px';
+                seg.parentLi.classList.add('cd-doc-seg-active');
+                // 用户正在编辑时暂停自动滚动，只高亮不滚动
+                if (!isEditing) {
+                    // 智能滚动：只在元素不在视口可见区域时才滚动
+                    var rect = seg.parentLi.getBoundingClientRect();
+                    var viewH = window.innerHeight || document.documentElement.clientHeight;
+                    // 元素中心在视口上下 30% 范围内就认为可见，不需要滚动
+                    var elemCenter = rect.top + rect.height / 2;
+                    if (elemCenter < viewH * 0.2 || elemCenter > viewH * 0.8) {
+                        seg.parentLi.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 构建文档中字幕片段的缓存列表
+     */
+    _buildDocSegmentsCache(mediaPath) {
+        var that = this;
+        var protyles = document.querySelectorAll('.protyle-wysiwyg');
+        if (!protyles || protyles.length === 0) return [];
+
+        var mediaUrlPrefix = that.toFileUrl(mediaPath).split('?')[0];
+        var segments = [];
+
+        for (var pi = 0; pi < protyles.length; pi++) {
+            var spans = protyles[pi].querySelectorAll('span[data-type="a"]');
+            for (var si = 0; si < spans.length; si++) {
+                var span = spans[si];
+                var href = span.getAttribute('data-href') || '';
+                if (href.indexOf(mediaUrlPrefix) === -1) continue;
+                var tMatch = href.match(/[?&]t=([^&#]+)/);
+                if (!tMatch) continue;
+                var rangeMatch = tMatch[1].match(/^(.+?)-(.+)$/);
+                if (!rangeMatch) continue;
+                var start = that._parseTimestampParam(rangeMatch[1]);
+                var end = that._parseTimestampParam(rangeMatch[2]);
+                if (isNaN(start) || isNaN(end)) continue;
+                var parentLi = span.closest('.li') || span.closest('[data-node-id]');
+                segments.push({ el: span, start: start, end: end, parentLi: parentLi });
+            }
+            var anchors = protyles[pi].querySelectorAll('a[href]');
+            for (var ai = 0; ai < anchors.length; ai++) {
+                var anchor = anchors[ai];
+                var aHref = anchor.getAttribute('href') || '';
+                if (aHref.indexOf(mediaUrlPrefix) === -1) continue;
+                var aTMatch = aHref.match(/[?&]t=([^&#]+)/);
+                if (!aTMatch) continue;
+                var aRangeMatch = aTMatch[1].match(/^(.+?)-(.+)$/);
+                if (!aRangeMatch) continue;
+                var aStart = that._parseTimestampParam(aRangeMatch[1]);
+                var aEnd = that._parseTimestampParam(aRangeMatch[2]);
+                if (isNaN(aStart) || isNaN(aEnd)) continue;
+                var dup = false;
+                for (var di = 0; di < segments.length; di++) {
+                    if (segments[di].el === anchor) { dup = true; break; }
+                }
+                if (dup) continue;
+                var aParentLi = anchor.closest('.li') || anchor.closest('[data-node-id]');
+                segments.push({ el: anchor, start: aStart, end: aEnd, parentLi: aParentLi });
+            }
+        }
+
+        segments.sort(function(a, b) { return a.start - b.start; });
+        return segments;
+    }
+
+    /**
+     * 清除文档中字幕片段的高亮
+     */
+    _clearDocSegmentHighlight(skipIdxReset) {
+        var that = this;
+        if (!skipIdxReset) that._docHighlightLastIdx = -1;
+        var activeEls = document.querySelectorAll('.cd-doc-seg-active');
+        for (var i = 0; i < activeEls.length; i++) {
+            activeEls[i].style.backgroundColor = '';
+            activeEls[i].style.boxShadow = '';
+            activeEls[i].style.outline = '';
+            activeEls[i].classList.remove('cd-doc-seg-active');
         }
     }
 
@@ -9277,11 +13642,13 @@ class LocalBrowsePlugin extends Plugin {
 
     /**
      * 根据文件路径判断打开方式
-     * @returns {string} 'localbrowser' | 'system' | 'siyuan'
+     * @returns {string} 'localbrowser' | 'system' | 'siyuan' | 'smp'
      */
     _getFileOpenMode(filePath) {
         if (!filePath) return 'system';
-        var ext = require('path').extname(filePath).toLowerCase();
+        // 去除查询参数后再获取扩展名（支持时间戳链接 ?t=xxx）
+        var cleanPath = filePath.split('?')[0];
+        var ext = require('path').extname(cleanPath).toLowerCase();
         // 优先查扩展名例外规则
         if (ext && this._openSettings.extensionRules && this._openSettings.extensionRules[ext] !== undefined) {
             return this._openSettings.extensionRules[ext];
@@ -9355,7 +13722,7 @@ class LocalBrowsePlugin extends Plugin {
             var mode = rules[ext];
             var row = document.createElement('div');
             row.style.cssText = 'display:flex;gap:8px;padding:6px 8px;align-items:center;font-size:13px;border-bottom:1px solid var(--b3-border,#f5f5f5)';
-            var modeText = mode === 'localbrowser' ? '在插件本地浏览器中打开' : (mode === 'siyuan' ? '思源笔记默认打开' : '使用电脑默认程序打开');
+            var modeText = mode === 'localbrowser' ? '在插件本地浏览器中打开' : (mode === 'siyuan' ? '插件默认(内置播放器)' : (mode === 'smp' ? '思源默认打开' : '使用电脑默认程序打开'));
             row.innerHTML = '<span style="width:80px;font-family:monospace">' + ext + '</span>' +
                 '<span style="flex:1">' + modeText + '</span>';
             var delBtn = document.createElement('button');
@@ -9403,9 +13770,10 @@ class LocalBrowsePlugin extends Plugin {
         settingPanel.appendChild(folderDesc);
 
         // === 视频打开方式 ===
-        settingPanel.appendChild(that._createSettingSectionTitle('🎬 视频打开方式'));
+        settingPanel.appendChild(that._createSettingSectionTitle('🎬 音视频打开方式'));
         var mediaRow = that._createSettingSelectRow('打开方式', 'cd-media-mode', [
-            { value: 'siyuan', text: '思源默认' },
+            { value: 'siyuan', text: '插件默认' },
+            { value: 'smp', text: '思源默认' },
             { value: 'system', text: '电脑默认' }
         ], that._openSettings.fileOpenMode.media, function(val) {
             that._openSettings.fileOpenMode.media = val;
@@ -9414,7 +13782,7 @@ class LocalBrowsePlugin extends Plugin {
         settingPanel.appendChild(mediaRow);
         var mediaDesc = document.createElement('div');
         mediaDesc.style.cssText = 'font-size:11px;color:var(--b3-theme-secondary,#999);margin:-4px 0 8px 0';
-        mediaDesc.textContent = '设置点击文档中插入的视频链接时的默认打开方式';
+        mediaDesc.textContent = '设置点击文档中的音视频（视频/音频文件、链接、嵌入块）的默认打开方式';
         settingPanel.appendChild(mediaDesc);
 
         // 使用思源 API 打开对话框
@@ -9842,7 +14210,17 @@ class LocalBrowsePlugin extends Plugin {
     saveFavorites() {
         var that = this;
         try {
-            var platformData = { items: this.favorites, groups: this.favoriteGroups, recentFolders: this._recentFolders, _version: 2 };
+            // 清理 _exists 临时标记，避免持久化运行时状态
+            var cleanItems = this.favorites.map(function(f) {
+                var copy = {};
+                for (var k in f) {
+                    if (f.hasOwnProperty(k) && k !== '_exists') {
+                        copy[k] = f[k];
+                    }
+                }
+                return copy;
+            });
+            var platformData = { items: cleanItems, groups: this.favoriteGroups, recentFolders: this._recentFolders, _version: 2 };
             var fullData = {};
             if (typeof this.loadData === 'function') {
                 this.loadData('favorites').then(function(existing) {
@@ -9962,8 +14340,10 @@ class LocalBrowsePlugin extends Plugin {
             var changed = false;
             var fixCount = 0;
             var failCount = 0;
+            var fixedNames = [];
             for (var i = 0; i < that.favorites.length; i++) {
                 var fav = that.favorites[i];
+                var oldPath = fav.path;
                 var exists = false;
                 try {
                     exists = fs.existsSync(fav.path);
@@ -9980,7 +14360,14 @@ class LocalBrowsePlugin extends Plugin {
                             changed = true;
                         }
                         fixCount++;
-                        that.showToastMsg('收藏路径已自动修复：' + fav.name);
+                        fixedNames.push(fav.name);
+                        // 同步更新 _recentFolders 中的旧路径
+                        for (var rfi = 0; rfi < that._recentFolders.length; rfi++) {
+                            if (that._recentFolders[rfi].path === oldPath) {
+                                that._recentFolders[rfi].path = fixedPath;
+                                break;
+                            }
+                        }
                         continue;
                     }
                     if (fav._exists !== false) {
@@ -9997,6 +14384,9 @@ class LocalBrowsePlugin extends Plugin {
                 that.saveFavorites();
                 that.renderFavorites();
                 that.renderFavTree();
+            }
+            if (fixCount > 0) {
+                that.showToastMsg('已自动修复 ' + fixCount + ' 个收藏路径：' + fixedNames.join('、'));
             }
             if (failCount > 0) {
                 that.showToastMsg('有 ' + failCount + ' 个收藏路径已失效且无法自动修复，请手动重新收藏');
@@ -10155,7 +14545,8 @@ class LocalBrowsePlugin extends Plugin {
             groupHeader.className = 'cd-fav-group-header';
             groupHeader.dataset.groupId = group.id;
             groupHeader.draggable = true;
-            groupHeader.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 2px;font-size:11px;color:var(--b3-theme-primary,#4285f4);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s';
+            groupHeader.tabIndex = 0;
+            groupHeader.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 2px;font-size:11px;color:var(--b3-theme-primary,#4285f4);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s;outline:none';
             var arrowSvg = '<svg width="8" height="8" viewBox="0 0 8 8" style="transition:transform 0.15s;color:var(--b3-theme-primary,#4285f4)"><path d="M1 2L6 4L1 6Z" fill="currentColor"/></svg>';
             groupHeader.innerHTML = '<span style="font-size:9px;width:12px;text-align:center;display:inline-block;color:var(--b3-theme-primary,#4285f4)">' + (group.expanded !== false ? '<span style="display:inline-block;transform:rotate(90deg)">' + arrowSvg + '</span>' : arrowSvg) + '</span><span style="flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(group.name) + '</span><span style="font-size:9px;color:var(--b3-theme-primary,#4285f4);opacity:0.7">' + items.length + '</span>';
             tree.appendChild(groupHeader);
@@ -10187,6 +14578,12 @@ class LocalBrowsePlugin extends Plugin {
                     e.stopPropagation();
                     that._showGroupContextMenu(e, g, header);
                 });
+                header.addEventListener('keydown', function(e) {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        header.click();
+                    }
+                });
                 // 分组拖拽排序
                 header.addEventListener('dragstart', function(e) {
                     this.style.opacity = '0.4';
@@ -10207,9 +14604,10 @@ class LocalBrowsePlugin extends Plugin {
                 var isActive = currentPath === favItem.path;
                 var isInvalid = favItem._exists === false;
                 var itemEl = document.createElement('div');
-                itemEl.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 4px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.1s;user-select:none;' + (isActive ? 'background:var(--b3-theme-hover,#e3f2fd);color:var(--b3-theme-primary,#4285f4);font-weight:500;' : (isInvalid ? 'color:var(--b3-theme-secondary,#999);opacity:0.6;' : 'color:var(--b3-theme-on-background,#333);'));
+                itemEl.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 4px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.1s;user-select:none;outline:none;' + (isActive ? 'background:var(--b3-theme-hover,#e3f2fd);color:var(--b3-theme-primary,#4285f4);font-weight:500;' : (isInvalid ? 'color:var(--b3-theme-secondary,#999);opacity:0.6;' : 'color:var(--b3-theme-on-background,#333);'));
                 itemEl.title = isInvalid ? '路径已失效：' + favItem.path : favItem.path;
                 itemEl.draggable = true;
+                itemEl.tabIndex = 0;
                 itemEl.dataset.favPath = favItem.path;
                 itemEl.dataset.groupId = group.id;
                 itemEl.innerHTML = '<span style="font-size:9px;flex-shrink:0">' + (favItem.pinToTop ? '📌' : (isInvalid ? '⚠️' : '⭐')) + '</span><span style="overflow:hidden;text-overflow:ellipsis">' + this.escapeHtml(favItem.name) + '</span>';
@@ -10321,12 +14719,139 @@ class LocalBrowsePlugin extends Plugin {
                         that.saveFavorites();
                         that.renderFavorites();
                     });
+                    // 键盘支持：Enter 打开，Delete 删除收藏
+                    el.addEventListener('keydown', function(e) {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            el.click();
+                        } else if (e.key === 'Delete' && !invalid) {
+                            e.preventDefault();
+                            if (confirm('确定要取消收藏「' + fav.name + '」吗？')) {
+                                that.removeFavorite(fav.path);
+                            }
+                        }
+                    });
                 })(favItem, itemEl, isInvalid);
 
                 itemsContainer.appendChild(itemEl);
             }
             tree.appendChild(itemsContainer);
         }
+        // 拖拽移动收藏项到分组后的闪烁反馈
+        if (this._flashFavGroupId) {
+            var flashHeader = tree.querySelector('.cd-fav-group-header[data-group-id="' + this._flashFavGroupId + '"]');
+            if (flashHeader) {
+                flashHeader.style.background = 'var(--b3-theme-primary-lightest,rgba(66,133,244,0.25))';
+                setTimeout(function() {
+                    if (flashHeader) flashHeader.style.background = '';
+                }, 400);
+            }
+            this._flashFavGroupId = null;
+        }
+        // === 搜索记录虚拟分组（显示收藏的搜索记录）===
+        var starredSearches = this._starredSearches || [];
+        if (starredSearches.length > 0) {
+            var searchGroupHeader = document.createElement('div');
+            searchGroupHeader.className = 'cd-fav-group-header';
+            searchGroupHeader.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 2px;font-size:11px;color:var(--b3-theme-primary,#4285f4);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s;outline:none';
+            var arrowSvg2 = '<svg width="8" height="8" viewBox="0 0 8 8" style="transition:transform 0.15s;color:var(--b3-theme-primary,#4285f4)"><path d="M1 2L6 4L1 6Z" fill="currentColor"/></svg>';
+            searchGroupHeader.innerHTML = '<span style="font-size:9px;width:12px;text-align:center;display:inline-block;color:var(--b3-theme-primary,#4285f4)"><span style="display:inline-block;transform:rotate(90deg)">' + arrowSvg2 + '</span></span><span style="flex:1;font-weight:500;overflow:hidden;text-overflow:ellipsis">搜索记录</span><span style="font-size:9px;color:var(--b3-theme-primary,#4285f4);opacity:0.7">' + starredSearches.length + '</span>';
+            tree.appendChild(searchGroupHeader);
+
+            var searchItemsContainer = document.createElement('div');
+            searchItemsContainer.style.cssText = 'padding-left:12px;';
+
+            searchGroupHeader.addEventListener('click', function() {
+                var isExpanded = searchItemsContainer.style.display !== 'none';
+                searchItemsContainer.style.display = isExpanded ? 'none' : 'block';
+                var arrowWrap = searchGroupHeader.querySelector('span:first-child');
+                if (arrowWrap) {
+                    arrowWrap.innerHTML = isExpanded ? arrowSvg2 : '<span style="display:inline-block;transform:rotate(90deg)">' + arrowSvg2 + '</span>';
+                }
+            });
+            searchGroupHeader.addEventListener('mouseenter', function() { this.style.background = 'var(--b3-theme-hover,#e8e8e8)'; });
+            searchGroupHeader.addEventListener('mouseleave', function() { this.style.background = ''; });
+
+            for (var sj = 0; sj < starredSearches.length; sj++) {
+                (function(sItem) {
+                    var sEl = document.createElement('div');
+                    sEl.style.cssText = 'display:flex;align-items:center;gap:2px;padding:3px 4px;font-size:11px;border-radius:3px;cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.1s;user-select:none;outline:none;color:var(--b3-theme-on-background,#333)';
+                    sEl.title = sItem.query + '（' + sItem.resultCount + ' 个结果）';
+
+                    var searchIcon = document.createElement('span');
+                    searchIcon.style.cssText = 'font-size:9px;flex-shrink:0';
+                    searchIcon.textContent = '🔍';
+
+                    var queryText = document.createElement('span');
+                    queryText.style.cssText = 'overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0';
+                    queryText.textContent = sItem.query;
+
+                    var deleteBtn = document.createElement('span');
+                    deleteBtn.style.cssText = 'flex-shrink:0;font-size:10px;color:var(--b3-theme-secondary,#999);cursor:pointer;opacity:0;transition:opacity 0.15s;padding:0 2px';
+                    deleteBtn.textContent = '✕';
+                    deleteBtn.title = '删除该搜索记录';
+                    deleteBtn.addEventListener('click', function(e) {
+                        e.stopPropagation();
+                        // 从 _starredSearches 中移除
+                        for (var di = 0; di < that._starredSearches.length; di++) {
+                            if (that._starredSearches[di].query === sItem.query) {
+                                that._starredSearches.splice(di, 1);
+                                break;
+                            }
+                        }
+                        // 同步更新 _searchHistory 中的 starred 标记
+                        for (var dj = 0; dj < that._searchHistory.length; dj++) {
+                            if (that._searchHistory[dj].query === sItem.query) {
+                                that._searchHistory[dj].starred = false;
+                                break;
+                            }
+                        }
+                        that._saveStarredSearches();
+                        that._saveSearchHistory();
+                        that.renderFavTree();
+                    });
+
+                    sEl.appendChild(searchIcon);
+                    sEl.appendChild(queryText);
+                    sEl.appendChild(deleteBtn);
+
+                    sEl.addEventListener('click', function(e) {
+                        if (e.target === deleteBtn) return;
+                        // 恢复该条搜索结果
+                        that.isDeepSearchMode = true;
+                        that.cachedFiles = sItem.results;
+                        that.cachedPath = that.currentPath;
+                        that._deepSearchCurrentQuery = sItem.query;
+                        that._deepSearchSearchedDirs = sItem.searchedDirs || 0;
+                        // 更新搜索框
+                        var siInput = document.getElementById('cd-search');
+                        if (siInput) { siInput.value = sItem.query; siInput.disabled = false; }
+                        var cb = document.getElementById('cd-clear-search');
+                        if (cb) cb.style.display = 'inline';
+                        // 渲染搜索结果
+                        that.renderSearchBreadcrumb(sItem.query, false, sItem.results.length, sItem.searchedDirs, sItem.isStopped);
+                        that.doRender(sItem.results, that.currentPath, sItem.query, true);
+                        // 收起收藏树面板
+                        var wrap = document.getElementById('cd-fav-tree-wrap');
+                        if (wrap) {
+                            wrap.style.display = 'none';
+                            that._favSidebarVisible = false;
+                        }
+                    });
+                    sEl.addEventListener('mouseenter', function() {
+                        this.style.background = 'var(--b3-theme-surface,#f5f5f5)';
+                        deleteBtn.style.opacity = '1';
+                    });
+                    sEl.addEventListener('mouseleave', function() {
+                        this.style.background = '';
+                        deleteBtn.style.opacity = '0';
+                    });
+                    searchItemsContainer.appendChild(sEl);
+                })(starredSearches[sj]);
+            }
+            tree.appendChild(searchItemsContainer);
+        }
+
         // 新建分组按钮
         var addGroupBtn = document.createElement('div');
         addGroupBtn.style.cssText = 'display:flex;align-items:center;gap:4px;padding:4px 6px;font-size:11px;color:var(--b3-theme-secondary,#999);cursor:pointer;user-select:none;border-radius:3px;transition:background 0.1s;margin-top:2px';
@@ -12337,12 +16862,14 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         // 先去掉 URL fragment（#size=xxx&mtime=xxx），避免误判文件不存在
         var urlWithoutFragment = url.split('#')[0];
+        // 再去掉 URL query 参数（?t=xxx），保留纯净路径用于文件检测
+        var urlWithoutQuery = urlWithoutFragment.split('?')[0];
         var decoded;
         try {
-            decoded = decodeURIComponent(urlWithoutFragment);
+            decoded = decodeURIComponent(urlWithoutQuery);
         } catch (e) {
             // 非法编码序列，使用原始字符串
-            decoded = urlWithoutFragment;
+            decoded = urlWithoutQuery;
         }
         // file:///D:/docs/file.pdf → D:\docs\file.pdf (Windows) 或 D:/docs/file.pdf (macOS/Linux 跨端)
         // file:///Users/mac/docs → /Users/mac/docs (Unix，保留前导 / 用于跨端匹配)
@@ -13007,7 +17534,7 @@ class LocalBrowsePlugin extends Plugin {
                                 }
                             }
                         } else if (isDir) {
-                            if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
+                            if (entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
                             // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
                             var nextDir = path ? path.join(item.dir, entry.name) : (item.dir.replace(/[\\\/]+$/, '') + that._sep + entry.name);
                             if (entry.name === 'Data' && item.dir === '/System/Volumes') continue;
@@ -13203,7 +17730,7 @@ class LocalBrowsePlugin extends Plugin {
                         // 也处理 OTHER 类型（symlink/junction 指向目录）
                         if (isDir) {
                             // 目录过滤：跳过系统目录、隐藏目录、开发目录
-                            if (entry.name.charAt(0) === '.' || entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
+                            if (entry.name === '$RECYCLE.BIN' || entry.name === 'System Volume Information' || entry.name === 'node_modules' || entry.name === '.git') continue;
                             // macOS APFS firmlink: /System/Volumes/Data 镜像根文件系统，跳过避免重复扫描
                             if (entry.name === 'Data' && normalizedPath === '/System/Volumes/') continue;
                             searchRecursive(fullPath);
@@ -13330,9 +17857,14 @@ class LocalBrowsePlugin extends Plugin {
 
         // 修复：改用 toFileUrl（不编码中文），和 insertLocalFileLink 保持一致，避免中文显示为 % 编码乱码
         var newUrl = that.toFileUrl(newLocalPath);
-        var newUrlWithTitle = newFingerprintTitle ? (newUrl + ' "' + newFingerprintTitle + '"') : newUrl;
+        // 保留旧链接中的时间戳参数 ?t=xxx（如果有）
+        var timestampParam = '';
+        var tMatch = oldUrl.match(/\?t=[^\s#"]*/);
+        if (tMatch) timestampParam = tMatch[0];
+        var newUrlWithTimestamp = newUrl + timestampParam;
+        var newUrlWithTitle = newFingerprintTitle ? (newUrlWithTimestamp + ' "' + newFingerprintTitle + '"') : newUrlWithTimestamp;
 
-        that._log('replaceLink: docId=' + docId + ', oldUrl=' + oldUrl + ', newUrl=' + newUrl);
+        that._log('replaceLink: docId=' + docId + ', oldUrl=' + oldUrl + ', newUrl=' + newUrlWithTimestamp);
 
         try {
 
@@ -13545,13 +18077,19 @@ class LocalBrowsePlugin extends Plugin {
             }
         });
 
-        // 将音频播放器移到当前活动面板内，统计栏上方（歌词面板保持在外部避免被裁切）
-        var audioBar = document.getElementById('cd-audio-bar');
+        // 将视频播放栏和音频播放器移到当前活动面板内，统计栏上方
         var activePanel = document.getElementById('cd-panel-' + tabName);
         if (activePanel) {
             var statsBar = activePanel.querySelector('#cd-stats-bar, #cd-assets-stats-bar');
-            if (statsBar && audioBar) {
-                activePanel.insertBefore(audioBar, statsBar);
+            var videoBar = document.getElementById('cd-video-bar');
+            var audioBar = document.getElementById('cd-audio-bar');
+            if (statsBar) {
+                if (videoBar) {
+                    activePanel.insertBefore(videoBar, statsBar);
+                }
+                if (audioBar) {
+                    activePanel.insertBefore(audioBar, statsBar);
+                }
             }
         }
 

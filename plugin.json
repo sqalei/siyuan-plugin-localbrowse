@@ -2,7 +2,7 @@
     "name": "siyuan-plugin-localbrowse",
     "author": "sqalei",
     "url": "https://github.com/sqalei/siyuan-plugin-localbrowse",
-    "version": "0.9.0",
+    "version": "1.0.0",
     "minAppVersion": "3.0.0",
     "backends": [
         "all"
@@ -16,8 +16,8 @@
         "zh_CN": "本地文件浏览器"
     },
     "description": {
-        "default": "Local file browser: browse disk files and internal assets, insert links with one click, auto-repair broken links when files move, cross-device sync — no cloud upload needed",
-        "zh_CN": "本地文件浏览器：浏览磁盘文件与内部资源、一键插入链接、文件移动后自动修复失效链接、跨设备同步，无需上传云端。"
+        "default": "Seamlessly integrate local files into SiYuan. Browse/search/manage disk files, insert links with one click, support audio/video timestamps & subtitle-to-timestamp, auto-sync links when files move, relative paths for cross-device sync. Pure local, zero cloud dependency.",
+        "zh_CN": "把本地文件系统无缝融入思源笔记。浏览/搜索/管理磁盘文件、一键插入笔记、支持音视频时间戳、字幕转换时间戳，文件移动后自动同步替换新链接，相对路径支持跨设备同步。纯本地运行，跨设备零依赖。"
     },
     "readme": {
         "default": "README.md",
