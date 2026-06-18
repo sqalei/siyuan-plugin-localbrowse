@@ -27,6 +27,10 @@
     },
     "hints": {
         "ensureMounted": "请确保存储路径可访问",
-        "addCustom": "或在设置中添加自定义路径"
+        "addCustom": "或在设置中添加自定义路径",
+        "hevcWasmLoading": "HEVC 软解播放器开发中，当前使用转码模式...",
+        "codecUnsupported": "视频编码不支持，正在自动转码...",
+        "hevcTryHardware": "正在尝试 HEVC 硬件解码...",
+        "transcodeFailed": "转码失败，请尝试使用系统播放器打开"
     }
 }

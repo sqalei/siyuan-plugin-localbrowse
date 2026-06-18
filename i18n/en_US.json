@@ -27,6 +27,10 @@
     },
     "hints": {
         "ensureMounted": "Make sure the volume is mounted and accessible",
-        "addCustom": "Or add a custom path in settings"
+        "addCustom": "Or add a custom path in settings",
+        "hevcWasmLoading": "HEVC software decoder in development, using transcoding mode...",
+        "codecUnsupported": "Video codec not supported, auto-transcoding...",
+        "hevcTryHardware": "Trying HEVC hardware decoding...",
+        "transcodeFailed": "Transcoding failed, please try opening with system player"
     }
 }

@@ -35,6 +35,8 @@ try {
 class LocalBrowsePlugin extends Plugin {
     constructor(options) {
         super(options);
+        // ★ 确保 ffmpeg 在 PATH 中（视频转码依赖）
+        try { if (require('fs').existsSync('C:\\ffmpeg\\bin\\ffmpeg.exe')) { process.env.PATH = 'C:\\ffmpeg\\bin;' + (process.env.PATH || ''); } } catch(e) {}
         this.dockPanel = null;
         this.currentPath = '';
         this._pathRestoredFromSettings = false;  // loadPathSettings 是否成功恢复了上次路径（区分用户保存路径 vs 回退根路径）
@@ -63,6 +65,7 @@ class LocalBrowsePlugin extends Plugin {
         this._flashFavGroupId = null;   // 拖拽收藏项到分组后需要闪烁高亮的目标分组ID
         this._recentFolders = [];       // 最近访问的文件夹列表（最近访问快捷入口）
         this._audioCoverCache = {};     // 音频封面图缓存 {filePath_mtimeMs: dataUrl}
+        this._probeCache = {};          // 视频编码检测缓存 {filePath_mtimeMs: codecInfo}（避免重复 ffprobe）
         this._openSettings = {
             folderOpenMode: 'localbrowser', // 文件夹打开方式（localbrowser=插件内打开, system=系统默认打开）
             fileOpenMode: {                // 文件分类打开方式
@@ -134,6 +137,8 @@ class LocalBrowsePlugin extends Plugin {
         this._flvPlayTimer = null;       // FLV 自动播放超时定时器
         this._videoAvSyncTimer = null;   // 音视频同步定时器
         this._isAvSyncing = false;       // 标记 A/V 同步中，防止播放按钮闪烁
+        this._videoProxyServer = null;   // HTTP 代理服务器（将 file:/// 转为 HTTP 流，支持 Range 请求和边转边播）
+        this._videoProxyPort = 0;        // 代理服务器端口（随机分配）
         this._videoSpeedPresets = [0.5, 0.75, 1, 1.25, 1.5, 2]; // 播放速度预设列表
         this._loopSegMarkStart = null;   // 循环片段：两步标记的起点时间（秒），null 表示未标记（视频/音频共享，互斥播放）
         this._loopPlayStart = null;      // 循环片段：播放循环起点（秒），从 URL ?t=start-end 解析（视频/音频共享）
@@ -153,6 +158,7 @@ class LocalBrowsePlugin extends Plugin {
         this._pendingBlurBlobRevoke = null; // crossfade 完成后待释放的旧模糊缩略图 blob URL
         this._coverFadeEpoch = 0; // crossfade 世代计数器，快速切歌时旧 cleanup 自动失效
         this._lrcBgFadeEpoch = 0; // 歌词背景 crossfade 世代计数器
+        this._subtitleShowTimers = []; // 字幕强制显示延迟定时器（关闭时清理）
         // 本地文件：展开的文件夹路径集合（点击小房子返回根目录时折叠所有）
         this._expandedDirs = new Set();
         // 内部资源面板：路径导航状态
@@ -294,6 +300,9 @@ class LocalBrowsePlugin extends Plugin {
         // 注册链接点击拦截器：处理带 fragment（#size=xxx&mtime=xxx）的 file:/// 链接
         // Windows 会把 fragment 当作文件名一部分，导致打不开文件
         this.registerLinkClickInterceptor();
+
+        // 启动本地 HTTP 代理服务器，用于视频播放（将 file:/// 转为 HTTP 流，支持 Range 请求和边转边播）
+        this._startVideoProxyServer();
     }
 
     onunload() {
@@ -428,6 +437,11 @@ class LocalBrowsePlugin extends Plugin {
             this._searchRenderTimer = null;
         }
         // 清理 Dock 面板引用，避免内存泄漏
+        if (this._dockIconObserver) {
+            this._dockIconObserver.disconnect();
+            this._dockIconObserver = null;
+        }
+        this._lastPanelVisible = undefined; // 重置面板可见性状态
         this.dockPanel = null;
         // 保存音频播放器状态（如果用户没有手动关闭）
         if (this._audioEl && this._audioCurrentPath && !this._audioPlayerClosed) {
@@ -465,9 +479,57 @@ class LocalBrowsePlugin extends Plugin {
                 vName = lastSep2 >= 0 ? this._videoCurrentPath.substring(lastSep2 + 1) : this._videoCurrentPath;
             }
             this._saveVideoState(this._videoCurrentPath, vName);
+            // ★ 如果正在转码，删除不完整的伴随 MP4（防止下次启动加载损坏文件卡死浏览器）
+            if (this._flvTranscodeProc) {
+                var _scMp4 = this._videoCurrentPath + '.transcoded.mp4';
+                try {
+                    var _fs2 = require('fs');
+                    if (_fs2.existsSync(_scMp4)) {
+                        // 验证文件头：如果是无效 MP4（转码中断产物），删除之
+                        try {
+                            var _fd2 = _fs2.openSync(_scMp4, 'r');
+                            var _buf2 = Buffer.alloc(8);
+                            _fs2.readSync(_fd2, _buf2, 0, 8, 0);
+                            _fs2.closeSync(_fd2);
+                            if (_buf2.slice(4, 8).toString() !== 'ftyp') {
+                                _fs2.unlinkSync(_scMp4);
+                                this._log('onunload: 删除转码中断的不完整伴随 MP4: ' + _scMp4);
+                            }
+                        } catch(_) { /* 无法读取则保守不删除 */ }
+                    }
+                } catch(_) {}
+            }
         }
         // 清理视频播放器
         if (this._closeVideoPlayer) this._closeVideoPlayer();
+        // ★ 清理浮窗播放器（事件监听器、Blob URL、子进程等）
+        if (this._closeStandalonePlayer) this._closeStandalonePlayer();
+        // ★ 独立清理 document 级事件监听器（onunload 时 _closeVideoPlayer 可能跳过部分分支）
+        if (this._onFullscreenChange) {
+            document.removeEventListener('fullscreenchange', this._onFullscreenChange);
+            document.removeEventListener('webkitfullscreenchange', this._onFullscreenChange);
+            this._onFullscreenChange = null;
+        }
+        if (this._videoKeyHandler) {
+            document.removeEventListener('keydown', this._videoKeyHandler);
+            this._videoKeyHandler = null;
+        }
+        if (this._searchHistoryClickOutside) {
+            document.removeEventListener('mousedown', this._searchHistoryClickOutside);
+            this._searchHistoryClickOutside = null;
+        }
+        // ★ 清理视频相关定时器（_closeVideoPlayer 可能跳过）
+        if (this._autoPlayTimeout) { clearTimeout(this._autoPlayTimeout); this._autoPlayTimeout = null; }
+        if (this._flvPlayTimer) { clearTimeout(this._flvPlayTimer); this._flvPlayTimer = null; }
+        if (this._transcodePollInterval) { clearInterval(this._transcodePollInterval); this._transcodePollInterval = null; }
+        if (this._subtitleShowTimers && this._subtitleShowTimers.length) {
+            for (var _sti = 0; _sti < this._subtitleShowTimers.length; _sti++) clearTimeout(this._subtitleShowTimers[_sti]);
+            this._subtitleShowTimers = [];
+        }
+        if (this._docSegmentsCacheTimer) { clearTimeout(this._docSegmentsCacheTimer); this._docSegmentsCacheTimer = null; }
+        if (this._videoEventController) { try { this._videoEventController.abort(); } catch(e) {} this._videoEventController = null; }
+        if (this._assetClickTimer) { clearTimeout(this._assetClickTimer); this._assetClickTimer = null; }
+        if (this._previewAbortController) { try { this._previewAbortController.abort(); } catch(e) {} this._previewAbortController = null; }
         // 清理 loading 延迟定时器
         if (this._audioLoadTimer) {
             clearTimeout(this._audioLoadTimer);
@@ -507,6 +569,18 @@ class LocalBrowsePlugin extends Plugin {
         this._lrcLines = [];
         this._lrcActiveIndex = -1;
         this._lrcExpanded = false;
+        // 关闭视频代理服务器
+        this._stopVideoProxyServer();
+        // 清理智能缓冲定时器和状态
+        if (this._bufferMonitorTimer) { clearInterval(this._bufferMonitorTimer); this._bufferMonitorTimer = null; }
+        // ★ 清理收藏夹保存防抖定时器，并立即执行最后一次保存
+        if (this._saveFavTimer) {
+            clearTimeout(this._saveFavTimer);
+            this._saveFavTimer = null;
+            if (this._doSaveFavorites) this._doSaveFavorites();
+        }
+        // ★ 清理收藏夹关闭定时器
+        if (this._favCloseTimer) { clearTimeout(this._favCloseTimer); this._favCloseTimer = null; }
     }
 
     uninstall() {
@@ -557,6 +631,9 @@ class LocalBrowsePlugin extends Plugin {
                 init: function() {
                     that.dockPanel = this;
                     that.renderFileTree();
+                    // ★ 面板可见性检测：在 video 的 timeupdate 事件中处理
+                    // 不再使用 MutationObserver/mousedown 等方式（SiYuan dock 结构不标准，选择器不可靠）
+                    // 见 _bindVideoEvents 中 timeupdate 处理器的面板隐藏检测逻辑
                 },
                 destroy: function() {
                     that._log('Dock destroyed');
@@ -608,7 +685,52 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     renderFileTree() {
+        // 面板打开时，如果独立播放器正在播放，迁移到面板内
+        if (this._standaloneVideoPath) {
+            if (this._standaloneIsMigrated) {
+                // ★ 迁移模式：无缝 DOM reparenting，不重建视频
+                this._migrateStandaloneToPanel();
+                // ★ 关键：设置 _panelVideoOpening 锁，阻止后续 innerHTML 重建销毁刚迁回的视频 DOM
+                // 否则 renderFileTree 继续执行 innerHTML 重建会把视频 DOM 连同 currentTime 一起销毁
+                this._panelVideoOpening = Date.now();
+            } else {
+                // 非迁移模式：关闭浮窗 + 重建面板视频
+                var vp = this._standaloneVideoPath;
+                var vs = this._standaloneSubtitleUrl;
+                // ★ 保存浮窗当前播放进度
+                var _rfSaVideo = document.getElementById('cd-standalone-video-el') || document.getElementById('cd-video-el');
+                var _rfSavedTime = 0;
+                if (_rfSaVideo && _rfSaVideo.currentTime > 0) { _rfSavedTime = _rfSaVideo.currentTime; }
+                this._closeStandalonePlayer();
+                var that = this;
+                setTimeout(function() {
+                    if (_rfSavedTime > 0) { that._videoPendingSeek = _rfSavedTime; }
+                    that._openVideoInPanel(vp, vs, true);
+                }, 100);
+            }
+        }
+        // ★ 从浮窗关闭切回面板的场景：_standaloneVideoPath 已被清除，
+        // 但 _videoCurrentPath + _restoreVideoOnRender 保留了视频状态
+        else if (this._videoCurrentPath && this._restoreVideoOnRender) {
+            var vp2 = this._videoCurrentPath;
+            var vs2 = this._videoSubtitleUrl;
+            this._restoreVideoOnRender = false;
+            var that = this;
+            setTimeout(function() {
+                that._openVideoInPanel(vp2, vs2, true);
+            }, 100);
+        }
+
         if (!this.dockPanel || !this.dockPanel.element) return;
+
+        // ★ 如果 _openVideoInPanel 正在执行（设置 _panelVideoOpening 时间戳锁），跳过 innerHTML DOM 重建
+        // 否则 innerHTML 会销毁 _openVideoInPanel 已获取的 videoEl，导致 mpegts.js 对 null 元素调 play 报错
+        // 超时保护：锁超过 10 秒自动失效（防止异常路径忘记解锁导致永久阻塞）
+        if (this._panelVideoOpening && (Date.now() - this._panelVideoOpening) < 10000) {
+            this._log('renderFileTree: 跳过 innerHTML 重建（_openVideoInPanel 正在执行）');
+            return;
+        }
+        this._panelVideoOpening = 0; // 超时或正常时清零
         
         // Docker/浏览器版：构造函数执行时 window.siyuan.config.system 可能还没就绪，
         // 导致平台被错误检测为 win32。Dock 面板渲染时重新检测并修正。
@@ -633,7 +755,7 @@ class LocalBrowsePlugin extends Plugin {
             '<div id="cd-panel-local" style="display:' + (activeTab === 'local' ? 'flex' : 'none') + ';flex-direction:column;flex:1;overflow:hidden;position:relative">' +
                 '<div style="margin-bottom:2px;display:flex;align-items:center;flex-shrink:0;gap:2px;height:28px">' +
                     '<select id="cd-drive-select" style="padding:3px 6px;font-size:12px;border:1px solid var(--b3-border,#ddd);border-radius:4px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);cursor:pointer;outline:none;min-width:60px"></select>' +
-                    '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0;white-space:nowrap" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
+                    '<button id="cd-syncroot-pill" style="padding:2px 6px;font-size:11px;background:var(--b3-theme-surface,#f0f0f0);color:#4caf50;border:1px solid #4caf50;border-radius:10px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' + (isDocker ? 'opacity:0.35;cursor:not-allowed;' : 'cursor:pointer;opacity:0.7;transition:opacity 0.2s;') + 'flex-shrink:0" title="' + (isDocker ? 'Docker浏览器环境不支持跨端同步' : '右键添加同步文件夹') + '" ' + (isDocker ? 'disabled' : 'onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.7"') + '>🔄 跨端同步文件夹</button>' +
                     '<button id="cd-fav-tree-toggle" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0;display:flex;align-items:center;justify-content:center" title="展开/收起收藏夹" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6"><svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/><polygon points="12 7 14 12 19 12.5 15.5 16 16.5 20.5 12 18 7.5 20.5 8.5 16 5 12.5 10 12" fill="currentColor"/></svg></button>' +
                     '<div id="cd-favorites-list" style="flex:1;display:flex;align-items:center;gap:4px;overflow:hidden;min-width:0"></div>' +
                     '<button id="cd-view-toggle" style="padding:4px 8px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:4px;cursor:pointer;opacity:0.6;transition:opacity 0.2s;flex-shrink:0" title="切换为图标视图" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.6">☰</button>' +
@@ -648,10 +770,10 @@ class LocalBrowsePlugin extends Plugin {
                         '<span style="font-size:12px;color:var(--b3-theme-on-background,#333);font-weight:700">跨端同步文件夹</span>' +
                         '<span style="font-size:10px;padding:1px 6px;background:var(--b3-theme-background,#fff);border:1px solid var(--b3-border,#ddd);border-radius:8px;color:var(--b3-theme-secondary,#888);line-height:1.4" title="' + this._getDeviceId() + '">' + this.platformName + '</span>' +
                     '</div>' +
-                    '<div style="font-size:9px;color:var(--b3-theme-secondary,#888);margin-bottom:4px;line-height:1.3">选择网盘同步目录的父文件夹，将自动创建 LocalBrowseSync 子文件夹</div>' +
+                    '<div style="font-size:9px;color:var(--b3-theme-secondary,#888);margin-bottom:4px;line-height:1.3">选择同步盘中的同步文件夹（各设备需指向同一文件夹，路径可不同）</div>' +
                     '<div style="display:flex;gap:4px;align-items:center">' +
-                        '<input id="cd-syncroot-path" type="text" placeholder="如 D:\\BaiduSyncdisk（自动拼接 LocalBrowseSync）" style="flex:1;min-width:0;padding:3px 6px;font-size:11px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
-                        '<button id="cd-syncroot-browse" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="浏览选择父文件夹">📂</button>' +
+                        '<input id="cd-syncroot-path" type="text" placeholder="如 D:\\BaiduSyncdisk\\MySync" style="flex:1;min-width:0;padding:3px 6px;font-size:11px;border:1px solid var(--b3-border,#ddd);border-radius:3px;background:var(--b3-theme-background,#fff);color:var(--b3-theme-on-background,#333);outline:none">' +
+                        '<button id="cd-syncroot-browse" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-secondary,#999);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="浏览选择同步文件夹">📂</button>' +
                         '<button id="cd-syncroot-save" style="padding:3px 8px;font-size:11px;background:#ccc;color:#888;border:none;border-radius:3px;cursor:default;flex-shrink:0">保存</button>' +
                         '<button id="cd-syncroot-clear" style="padding:3px 6px;font-size:11px;background:transparent;color:var(--b3-theme-error,#d32f2f);border:1px solid var(--b3-border,#ddd);border-radius:3px;cursor:pointer;flex-shrink:0" title="清除同步文件夹">✕</button>' +
                     '</div>' +
@@ -707,8 +829,8 @@ class LocalBrowsePlugin extends Plugin {
             // === 视频播放栏（底部，和音频播放器互斥） ===
             '<div id="cd-video-bar" style="display:none;flex-shrink:0;border-top:1px solid var(--b3-border,#eee);background:var(--b3-theme-background,#fff);flex-direction:column;width:100%;position:relative;z-index:5;transform:translateZ(0)">' +
                 '<div id="cd-video-wrap" style="position:relative;background:#000;cursor:pointer;flex-shrink:0;overflow:hidden;height:350px;min-height:150px;width:100%">' +
-                    '<div id="cd-video-resize-handle" style="position:absolute;top:0;left:0;right:0;height:6px;cursor:ns-resize;z-index:20;background:transparent;transition:background 0.2s" onmouseover="this.style.background=\'var(--b3-theme-primary,#4285f4)\'" onmouseout="this.style.background=\'transparent\'"></div>' +
-                    '<video id="cd-video-el" style="position:absolute;top:0;left:0;width:100%;height:100%;outline:none;background:#000;object-fit:contain;-webkit-object-fit:contain" preload="auto"></video>' +
+                    '<div id="cd-video-resize-handle" style="position:absolute;top:0;left:0;right:0;height:8px;cursor:ns-resize;z-index:20;background:transparent;transition:background 0.2s" onmouseover="this.style.background=\'var(--b3-theme-primary,#4285f4)\'" onmouseout="this.style.background=\'transparent\'"></div>' +
+                    '<video id="cd-video-el" style="position:absolute;top:0;left:0;width:100%;height:100%;outline:none;background:#000;object-fit:contain;-webkit-object-fit:contain;z-index:1" preload="auto" playsinline webkit-playsinline></video>' +
                     '<div id="cd-video-play-overlay" style="position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;transition:opacity 0.3s">' +
                         '<svg viewBox="0 0 24 24" width="48" height="48" style="opacity:0.8"><polygon points="8,5 19,12 8,19" fill="#fff"/></svg>' +
                     '</div>' +
@@ -718,6 +840,7 @@ class LocalBrowsePlugin extends Plugin {
                     '<span id="cd-video-play" class="cd-video-btn cd-video-btn-play" title="播放/暂停"><svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>' +
                     '<span id="cd-video-forward" class="cd-video-btn" title="快进5秒"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" fill="currentColor"/></svg></span>' +
                     '<span id="cd-video-name" style="flex:1;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--b3-theme-on-background,#333);cursor:pointer" title="定位到文件位置">未播放</span>' +
+                    '<span id="cd-video-transcode-status" style="display:none;font-size:10px;color:var(--b3-theme-primary,#4285f4);white-space:nowrap;flex-shrink:0;opacity:0.85"></span>' +
                     '<span id="cd-video-sub-toggle" class="cd-video-btn" title="字幕开关"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H5V6h14v12zM7 10h2v2H7v2h4v-2H9v-2h2V8H7v2zm6 0h2v2h-2v2h4v-2h-2v-2h2V8h-4v2z" fill="currentColor"/></svg></span>' +
                     '<span id="cd-video-timestamp" class="cd-video-btn" title="插入时间戳到笔记"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" fill="currentColor"/></svg></span>' +
                     '<span id="cd-video-loop-seg" class="cd-video-btn" title="循环片段：1️⃣点击标记起点"><svg viewBox="0 0 24 24" width="12" height="12"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" fill="currentColor"/></svg></span>' +
@@ -824,36 +947,29 @@ class LocalBrowsePlugin extends Plugin {
                 var pathInput = el.querySelector('#cd-syncroot-path');
                 var val = (pathInput && pathInput.value || '').trim();
                 if (val) {
-                    // 自动确保路径以 LocalBrowseSync 结尾
-                    var syncFolderName = 'LocalBrowseSync';
-                    var pathBasename = val.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
-                    var finalPath = val;
-                    if (pathBasename !== syncFolderName) {
-                        // 用户输入的是父目录，自动拼接 LocalBrowseSync
-                        finalPath = val.replace(/[\\/]+$/, '') + (that.isWindows ? '\\' : '/') + syncFolderName;
-                    }
-
-                    // 检查父目录是否存在
-                    var parentDir = finalPath.replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join(that.isWindows ? '\\' : '/');
-                    try {
-                        var stat = fs.statSync(parentDir);
-                        if (!stat.isDirectory()) {
-                            that.showToastMsg('父目录不是文件夹');
-                            return;
-                        }
-                    } catch (e) {
-                        that.showToastMsg('父目录不存在或无法访问');
+                    // 用户直接指定同步文件夹，不再强制拼接 LocalBrowseSync
+                    // 路径深度校验：拒绝盘符根（D:\、C:）和系统根（/），至少要有 1 层具体文件夹名
+                    var pathNorm = val.replace(/[\\/]+$/, '');
+                    if (pathNorm === '' || pathNorm === '/' || /^[A-Za-z]:$/.test(pathNorm)) {
+                        that.showToastMsg('路径过浅，请选择具体的同步文件夹（不能是盘符根目录）');
                         return;
                     }
+                    var finalPath = val;
 
-                    // 如果 LocalBrowseSync 子文件夹不存在，自动创建
+                    // 检查文件夹是否存在，不存在则尝试创建（需父目录存在）
                     try {
                         if (!fs.existsSync(finalPath)) {
+                            var parentDir = finalPath.replace(/[\\/]+$/, '').split(/[\\/]/).slice(0, -1).join(that.isWindows ? '\\' : '/');
+                            var pstat = fs.statSync(parentDir);
+                            if (!pstat.isDirectory()) {
+                                that.showToastMsg('父目录不是文件夹');
+                                return;
+                            }
                             fs.mkdirSync(finalPath, { recursive: true });
-                            that.showToastMsg('已创建 ' + syncFolderName + ' 文件夹');
+                            that.showToastMsg('已创建同步文件夹');
                         }
                     } catch (e) {
-                        that.showToastMsg('无法创建 ' + syncFolderName + ' 文件夹：' + (e.message || e));
+                        that.showToastMsg('无法访问或创建该文件夹：' + (e.message || e));
                         return;
                     }
 
@@ -899,14 +1015,9 @@ class LocalBrowsePlugin extends Plugin {
         if (syncBrowseBtn) {
             syncBrowseBtn.addEventListener('click', function() {
                 that._browseSyncFolder(el, function(selectedDir) {
-                    // 浏览选择的是父目录，自动拼接 LocalBrowseSync
-                    var syncFolderName = 'LocalBrowseSync';
+                    // 浏览选择的就是同步文件夹本身，原样填入
                     if (selectedDir) {
-                        var basename = selectedDir.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
                         var finalPath = selectedDir;
-                        if (basename !== syncFolderName) {
-                            finalPath = selectedDir.replace(/[\\/]+$/, '') + (that.isWindows ? '\\' : '/') + syncFolderName;
-                        }
                         var pathInput = el.querySelector('#cd-syncroot-path');
                         if (pathInput) pathInput.value = finalPath;
                     }
@@ -975,6 +1086,7 @@ class LocalBrowsePlugin extends Plugin {
         var favTreeToggleBtn = el.querySelector('#cd-fav-tree-toggle');
         var favTreeWrap = el.querySelector('#cd-fav-tree-wrap');
         if (favTreeToggleBtn && favTreeWrap) {
+            // 鼠标悬停自动展开
             favTreeToggleBtn.addEventListener('mouseenter', function() {
                 if (favTreeWrap.style.display === 'none') {
                     // 打开收藏夹面板时，关闭搜索历史下拉框（避免重叠）
@@ -984,6 +1096,40 @@ class LocalBrowsePlugin extends Plugin {
                     that.renderFavTree();
                 }
             });
+            // ★ 点击切换：点击按钮打开/关闭面板（sticky 模式，不会随鼠标移开自动收起）
+            favTreeToggleBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (favTreeWrap.style.display === 'none') {
+                    that._hideSearchHistory();
+                    favTreeWrap.style.display = 'flex';
+                    that._favSidebarVisible = true;
+                    that.renderFavTree();
+                    // ★ 点击打开时设为 sticky，不会因鼠标移出面板而自动关闭
+                    that._favKeepOpenUntil = Date.now() + 86400000; // 24 小时
+                } else {
+                    favTreeWrap.style.display = 'none';
+                    that._favSidebarVisible = false;
+                    that._favKeepOpenUntil = 0;
+                }
+            });
+            // ★ 鼠标离开按钮时延迟关闭面板（解决向上/横向离开按钮时面板不消失的问题）
+            // 使用实例属性而非局部变量，确保 renderFileTree 重建 DOM 后仍能清理旧定时器
+            favTreeToggleBtn.addEventListener('mouseleave', function() {
+                if (that._favCloseTimer) clearTimeout(that._favCloseTimer);
+                // 延时 200ms 检查：如果鼠标没有进入面板且不是 sticky 模式，关闭面板
+                that._favCloseTimer = setTimeout(function() {
+                    if (that._favSidebarVisible && !that._favMenuOpen && !that._favEditing && !that._favDragging && Date.now() > that._favKeepOpenUntil) {
+                        favTreeWrap.style.display = 'none';
+                        that._favSidebarVisible = false;
+                    }
+                }, 200);
+            });
+            // ★ 如果鼠标在延时内进入了面板，取消关闭
+            if (favTreeWrap) {
+                favTreeWrap.addEventListener('mouseenter', function() {
+                    if (that._favCloseTimer) { clearTimeout(that._favCloseTimer); that._favCloseTimer = null; }
+                });
+            }
         }
         // 鼠标离开收藏树面板后自动收起（但菜单打开、正在编辑或刚操作完时不收起）
         if (favTreeWrap) {
@@ -1367,6 +1513,11 @@ class LocalBrowsePlugin extends Plugin {
             clearTimeout(this._searchRenderTimer);
             this._searchRenderTimer = null;
         }
+        // ★ 清理滚动渲染定时器，避免切换目录后旧回调在错误的文件列表上渲染
+        if (this._scrollTimer) {
+            clearTimeout(this._scrollTimer);
+            this._scrollTimer = null;
+        }
 
         // 保存当前目录的滚动位置，便于返回时恢复
         if (this.currentPath) {
@@ -1472,6 +1623,7 @@ class LocalBrowsePlugin extends Plugin {
             rootSpan.id = 'cd-breadcrumb-home';
             rootSpan.innerHTML = homeIcon;
             rootSpan.style.display = 'inline-block';
+            rootSpan.style.flexShrink = '0';
             rootSpan.addEventListener('click', function(e) {
                 e.stopPropagation();
                 if (that._expandedDirs && that._expandedDirs.size > 0) {
@@ -1513,19 +1665,35 @@ class LocalBrowsePlugin extends Plugin {
                     sep.style.display = 'inline-block';
                     sep.style.margin = '0 5px';
                     sep.style.color = 'var(--b3-theme-primary,#4285f4)';
+                    sep.style.flexShrink = '1';
+                    sep.style.minWidth = '0';
                     breadcrumbEl.appendChild(sep);
 
                     var span = document.createElement('span');
                     span.textContent = segments[i];
                     span.style.display = 'inline-block';
+                    span.title = segments[i]; // ★ 悬停显示完整名称
                     if (isLast) {
                         span.style.fontWeight = 'bold';
                         span.style.color = 'var(--b3-theme-on-background,#333)';
+                        span.style.cursor = 'pointer';
+                        span.style.flexShrink = '0';    // ★ 末段永远不压缩
+                        span.style.whiteSpace = 'nowrap';
+                        (function(targetPath) {
+                            span.addEventListener('click', function(e) {
+                                e.stopPropagation();
+                                that.loadDirectory(targetPath);
+                            });
+                        })(accumulated);
                     } else {
                         span.style.cursor = 'pointer';
                         span.style.color = 'var(--b3-theme-primary,#4285f4)';
                         span.style.textDecoration = 'underline';
-                        span.style.marginRight = '2px';
+                        span.style.overflow = 'hidden';           // ★ CSS 截断
+                        span.style.textOverflow = 'ellipsis';     // ★ 显示 ...
+                        span.style.whiteSpace = 'nowrap';
+                        span.style.minWidth = '1em';              // ★ 至少 1 字
+                        span.style.flexShrink = '1';              // ★ 可压缩
                         (function(targetPath) {
                             span.addEventListener('click', function(e) {
                                 e.stopPropagation();
@@ -2058,6 +2226,11 @@ class LocalBrowsePlugin extends Plugin {
         // 如果正在搜索，先取消上一次
         if (this._deepSearchAbort) {
             this._deepSearchAbort.cancelled = true;
+        }
+        // ★ 同时清理上一次搜索的渲染定时器，避免旧回调在新搜索中执行
+        if (this._searchRenderTimer) {
+            clearTimeout(this._searchRenderTimer);
+            this._searchRenderTimer = null;
         }
 
         // 保存搜索前的目录，用于返回
@@ -2830,6 +3003,135 @@ class LocalBrowsePlugin extends Plugin {
 
         filtered = this.sortFiles(filtered);
         this.doRender(filtered, this.cachedPath, query, this.isDeepSearchMode);
+    }
+
+    /**
+     * ★ 预绑定视频 UI 核心事件（resize、双击全屏、键盘、进度条等）
+     *    在 _openVideoInPanel 任何分支执行前调用，确保事件始终有效
+     *    使用 _videoUIEventsReady 标志防止重复绑定
+     */
+    _ensureVideoUIEvents() {
+        var that = this;
+        var videoWrap = document.getElementById('cd-video-wrap');
+        var videoEl = document.getElementById('cd-video-el');
+        if (!videoWrap || !videoEl) return;
+
+        // 防止重复绑定
+        if (videoWrap._resizeBound) return;
+        videoWrap._resizeBound = true;
+
+        // 拖拽调整高度（顶部 8px）
+        videoWrap.addEventListener('mousedown', function(e) {
+            var rect = videoWrap.getBoundingClientRect();
+            if (e.clientY - rect.top > 8) return;
+            e.preventDefault();
+            var startY = e.clientY;
+            var startH = videoWrap.offsetHeight;
+            function onMove(ev) {
+                var deltaY = startY - ev.clientY;
+                var newH = startH + deltaY;
+                if (newH < 100) newH = 100;
+                if (deltaY > 0) {
+                    var panel = document.getElementById('cd-panel-local');
+                    if (panel) {
+                        var statsBar = document.getElementById('cd-stats-bar');
+                        var statsH = statsBar ? statsBar.offsetHeight : 30;
+                        var maxH = panel.offsetHeight - statsH;
+                        if (newH >= maxH) return;
+                    }
+                }
+                videoWrap.style.height = newH + 'px';
+                videoWrap.style.flex = 'none';
+                that._applyBottomPadding();
+            }
+            function onUp() {
+                try {
+                    var finalH = videoWrap.offsetHeight;
+                    if (finalH && finalH > 50) {
+                        localStorage.setItem('cd-video-bar-height', finalH);
+                        if (typeof that.saveData === 'function') {
+                            that.saveData('cd_video_height_' + that.platform, finalH).catch(function() {});
+                        }
+                    }
+                } catch(_e) {}
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+        // 顶部区域光标变化
+        videoWrap.addEventListener('mousemove', function(e) {
+            var rect2 = videoWrap.getBoundingClientRect();
+            videoWrap.style.cursor = (e.clientY - rect2.top <= 8) ? 'ns-resize' : 'pointer';
+        });
+        videoWrap.addEventListener('mouseleave', function() {
+            videoWrap.style.cursor = 'pointer';
+        });
+
+        // 双击全屏
+        videoEl.addEventListener('dblclick', function() {
+            that._toggleVideoFullscreen();
+        });
+
+        // 键盘快捷键（只绑定一次）
+        if (!this._videoKeyHandler) {
+            this._videoKeyHandler = function(e) {
+                var vBar = document.getElementById('cd-video-bar');
+                if (!vBar || vBar.style.display === 'none') return;
+                var ve = document.getElementById('cd-video-el');
+                if (!ve) return;
+                switch (e.key) {
+                    case ' ':
+                        e.preventDefault();
+                        if (ve.paused) { ve.play(); } else { ve.pause(); }
+                        break;
+                    case 'ArrowLeft':
+                        e.preventDefault();
+                        if (ve.duration) ve.currentTime = Math.max(0, ve.currentTime - 5);
+                        break;
+                    case 'ArrowRight':
+                        e.preventDefault();
+                        if (ve.duration) ve.currentTime = Math.min(ve.duration, ve.currentTime + 5);
+                        break;
+                    case 'ArrowUp':
+                        e.preventDefault();
+                        ve.volume = Math.min(1, ve.volume + 0.1);
+                        that._syncVolumeUI(ve.volume);
+                        break;
+                    case 'ArrowDown':
+                        e.preventDefault();
+                        ve.volume = Math.max(0, ve.volume - 0.1);
+                        that._syncVolumeUI(ve.volume);
+                        break;
+                    case 'f': case 'F':
+                        e.preventDefault();
+                        that._toggleVideoFullscreen();
+                        break;
+                }
+            };
+            document.addEventListener('keydown', this._videoKeyHandler);
+        }
+
+        // 时间戳插入（视频界面内的按钮）
+        var tsBtn = document.getElementById('cd-video-timestamp');
+        if (tsBtn && !tsBtn._tsBound) {
+            tsBtn._tsBound = true;
+            tsBtn.addEventListener('click', function() {
+                var ve = document.getElementById('cd-video-el');
+                that._insertVideoTimestamp(ve ? ve.currentTime : 0);
+            });
+        }
+
+        // 循环片段按钮
+        var loopBtn = document.getElementById('cd-video-loop-seg');
+        if (loopBtn && !loopBtn._loopBound) {
+            loopBtn._loopBound = true;
+            loopBtn.addEventListener('click', function() {
+                var ve = document.getElementById('cd-video-el');
+                that._handleLoopSegmentClick(ve);
+            });
+        }
     }
 
     /**
@@ -3719,6 +4021,11 @@ class LocalBrowsePlugin extends Plugin {
                     if (that._previewTimer) {
                         clearTimeout(that._previewTimer);
                         that._previewTimer = null;
+                    }
+                    // ★ 同时取消单击图片预览定时器，避免鼠标离开后仍弹出预览
+                    if (that._imageClickTimer) {
+                        clearTimeout(that._imageClickTimer);
+                        that._imageClickTimer = null;
                     }
                     // 鼠标离开图片文件时，关闭预览
                     var name = item.dataset.name;
@@ -5026,8 +5333,9 @@ class LocalBrowsePlugin extends Plugin {
             return;
         }
 
-        // 不能移动到自身内部
-        if (targetDir.indexOf(srcPath) === 0) {
+        // 不能移动到自身内部（需精确匹配路径分隔符，避免 "C:\Users" 误匹配 "C:\UsersBackup"）
+        var _sep = this.isWindows ? '\\' : '/';
+        if (isDir && targetDir.indexOf(srcPath + _sep) === 0) {
             this.showToastMsg('不能将文件夹移动到自身内部');
             return;
         }
@@ -5122,8 +5430,9 @@ class LocalBrowsePlugin extends Plugin {
         var srcName = this._clipboardCut.name;
         var isDir = this._clipboardCut.isDir;
 
-        // 不能粘贴到自身子目录
-        if (targetDir.indexOf(srcPath) === 0) {
+        // 不能粘贴到自身子目录（需精确匹配路径分隔符）
+        var _sep2 = this.isWindows ? '\\' : '/';
+        if (isDir && targetDir.indexOf(srcPath + _sep2) === 0) {
             this.showToastMsg('不能将文件夹粘贴到自身内部');
             return;
         }
@@ -5204,7 +5513,15 @@ class LocalBrowsePlugin extends Plugin {
             var entry = entries[i];
             var srcPath = path.join(src, entry.name);
             var destPath = path.join(dest, entry.name);
-            if (entry.isDirectory()) {
+            // ★ 符号链接：读取链接目标并复制链接本身（而非跟随链接复制内容）
+            if (entry.isSymbolicLink && entry.isSymbolicLink()) {
+                try {
+                    var linkTarget = fs.readlinkSync(srcPath);
+                    fs.symlinkSync(linkTarget, destPath);
+                } catch(e) {
+                    // 符号链接读取失败则跳过
+                }
+            } else if (entry.isDirectory()) {
                 this.copyDirectorySync(srcPath, destPath);
             } else {
                 fs.copyFileSync(srcPath, destPath);
@@ -5221,7 +5538,10 @@ class LocalBrowsePlugin extends Plugin {
         for (var i = 0; i < entries.length; i++) {
             var entry = entries[i];
             var fullPath = path.join(dirPath, entry.name);
-            if (entry.isDirectory()) {
+            // ★ 先检查符号链接，避免递归删除链接目标目录
+            if (entry.isSymbolicLink && entry.isSymbolicLink()) {
+                fs.unlinkSync(fullPath);
+            } else if (entry.isDirectory()) {
                 this.removeDirectorySync(fullPath);
             } else {
                 fs.unlinkSync(fullPath);
@@ -5802,15 +6122,147 @@ class LocalBrowsePlugin extends Plugin {
      */
     _openVideoInPanel(filePath, subtitleUrl, autoPlay) {
         var that = this;
+
+        // ★ 重置播放器关闭标记（必须在视频设置代码之前！否则 _playNativeVideo / canplay 回调会因 _videoPlayerClosed=true 而跳过播放）
+        that._videoPlayerClosed = false;
+
+        // ★ 防止 renderFileTree 的 innerHTML 在视频打开过程中重建 DOM
+        // （否则会导致已获取的 videoEl 被移除，mpegts.js 对 null 元素调 play 报错）
+        that._panelVideoOpening = Date.now(); // 时间戳锁，renderFileTree 中超 10 秒自动失效
+
+        // ★ 如果浮窗有视频（迁移或非迁移），先强制销毁浮窗（否则面板和浮窗会同时有视频）
+        // 不走 switchToPanel 逻辑——因为接下来要开新视频，不需要把旧视频搬回面板播放
+        if (that._standaloneVideoPath) {
+            // 迁移模式下：cd-video-wrap 在浮窗里，需要先搬回面板 DOM（否则 _openVideoInPanel 找不到 cd-video-el）
+            if (that._standaloneIsMigrated) {
+                var _vw = document.getElementById('cd-video-wrap');
+                var _vb = document.getElementById('cd-video-bar');
+                if (_vw && _vb) {
+                    // 恢复面板样式
+                    _vw.style.position = 'relative';
+                    _vw.style.top = '';
+                    _vw.style.left = '';
+                    _vw.style.width = '';
+                    _vw.style.height = '';
+                    _vw.style.minHeight = '150px';
+                    var _savedH2 = null;
+                    try { _savedH2 = localStorage.getItem('cd-video-bar-height'); } catch(e2) {}
+                    if (_savedH2 && parseInt(_savedH2) > 50) {
+                        _vw.style.height = _savedH2 + 'px';
+                    } else {
+                        _vw.style.height = '350px';
+                    }
+                    if (_vb.firstChild) {
+                        _vb.insertBefore(_vw, _vb.firstChild);
+                    } else {
+                        _vb.appendChild(_vw);
+                    }
+                    // 暂停旧视频（后面会被新视频替换）
+                    var _oldVe = document.getElementById('cd-video-el');
+                    if (_oldVe) { try { _oldVe.pause(); _oldVe.src = ''; } catch(e3) {} }
+                }
+            }
+            // 销毁浮窗专属的 flvPlayer（面板的 _flvPlayer 在迁移时已被清空）
+            if (that._standaloneFlvPlayer) {
+                try { that._standaloneFlvPlayer.destroy(); } catch(e) {}
+                that._standaloneFlvPlayer = null;
+            }
+            // 清理浮窗 DOM（cd-video-wrap 已搬回面板，浮窗容器可以直接 remove）
+            var _saWrap = document.getElementById('cd-standalone-video-wrap');
+            if (_saWrap) {
+                if (_saWrap._resizeObserver) _saWrap._resizeObserver.disconnect();
+                _saWrap.remove();
+            }
+            // 清理浮窗状态
+            that._standaloneVideoPath = null;
+            that._standaloneIsMigrated = false;
+            that._standaloneIsFlvMode = false;
+            that._standaloneVideoName = null;
+            that._standaloneSubtitleUrl = null;
+            that._standaloneSeekTime = 0;
+        }
+
+        // 面板不可见 → 在文档下方弹出独立播放器
+        if (!that._isPanelVisible()) {
+            that._showStandalonePlayer(filePath, subtitleUrl);
+            that._panelVideoOpening = 0;
+            return;
+        }
+
         var videoBar = document.getElementById('cd-video-bar');
         var videoEl = document.getElementById('cd-video-el');
         if (!videoBar || !videoEl) {
             that._error('_openVideoInPanel: 视频播放栏元素不存在，降级到对话框');
             that._openVideoInDialog(filePath, subtitleUrl);
+            that._panelVideoOpening = 0;
             return;
         }
-        // autoPlay 默认为 true（正常打开时自动播放，恢复状态时不自动播放）
         if (autoPlay === undefined) autoPlay = true;
+
+        // ★ 确保核心 UI 绑定（close/play/time/progress）——early return 路径可能跳过主绑定块
+        if (!that._videoUIBound) {
+            that._videoUIBound = true;
+            var _quickClose = document.getElementById('cd-video-close');
+            if (_quickClose) _quickClose.addEventListener('click', function() {
+                that._videoPlayerClosed = true;
+                that._saveVideoState(null, null);
+                that._videoCurrentPath = null;
+                that._videoCurrentName = null;
+                that._closeVideoPlayer();
+            });
+            var _quickPlay = document.getElementById('cd-video-play');
+            if (_quickPlay) _quickPlay.addEventListener('click', function() {
+                var _ve = document.getElementById('cd-video-el');
+                if (_ve) { if (_ve.paused) _ve.play(); else _ve.pause(); }
+            });
+            // 进度条点击
+            var _quickProgress = document.getElementById('cd-video-progress-wrap');
+            if (_quickProgress) _quickProgress.addEventListener('click', function(e) {
+                var _ve2 = document.getElementById('cd-video-el');
+                if (!_ve2) return;
+                var _sdur = _ve2.duration;
+                if ((!_sdur || !isFinite(_sdur)) && that._videoEstimatedDuration > 0) _sdur = that._videoEstimatedDuration;
+                if (!_sdur || !isFinite(_sdur)) return;
+                var _rect = _quickProgress.getBoundingClientRect();
+                var _pct = Math.max(0, Math.min(1, (e.clientX - _rect.left) / _rect.width));
+                _ve2.currentTime = _pct * _sdur;
+            });
+            // timeupdate
+            var _quickVideo = document.getElementById('cd-video-el');
+            if (_quickVideo) _quickVideo.addEventListener('timeupdate', function() {
+                var _ve3 = document.getElementById('cd-video-el');
+                if (!_ve3) return;
+                var _curEl = document.getElementById('cd-video-time-current');
+                var _totEl = document.getElementById('cd-video-time-total');
+                var _progEl = document.getElementById('cd-video-progress');
+                var _thEl = document.getElementById('cd-video-progress-thumb');
+                var _dur = _ve3.duration;
+                if ((!_dur || !isFinite(_dur)) && that._videoEstimatedDuration > 0) _dur = that._videoEstimatedDuration;
+                if (_curEl) _curEl.textContent = that._formatDuration(_ve3.currentTime);
+                if (!_dur) return;
+                var _pct2 = (_ve3.currentTime / _dur * 100).toFixed(1);
+                if (_progEl) _progEl.style.width = _pct2 + '%';
+                if (_thEl) _thEl.style.left = _pct2 + '%';
+                if (_totEl) _totEl.textContent = that._formatDuration(_dur);
+            });
+            // 播放/暂停状态更新按钮图标 + 点击画面切换
+            var _qv2 = document.getElementById('cd-video-el');
+            if (_qv2) {
+                _qv2.addEventListener('play', function() { that._updateVideoPlayBtn('pause'); });
+                _qv2.addEventListener('pause', function() { that._updateVideoPlayBtn('play'); });
+                _qv2.addEventListener('ended', function() { that._updateVideoPlayBtn('play'); });
+                // 点击画面切换播放/暂停（用实例级别标记防双绑定冲突）
+                _qv2.addEventListener('click', function() {
+                    if (that._videoClickBusy) return;
+                    that._videoClickBusy = true;
+                    setTimeout(function() {
+                        that._videoClickBusy = false;
+                        var _v = document.getElementById('cd-video-el');
+                        if (_v) { if (_v.paused) _v.play(); else _v.pause(); }
+                    }, 250);
+                });
+            }
+        }
 
         // 切换视频时重置文档高亮状态
         that._docHighlightLastIdx = -1;
@@ -5854,13 +6306,31 @@ class LocalBrowsePlugin extends Plugin {
             cleanFilePath = filePath.replace(/[?&]t=[^&#]+/, '').replace(/\?$/, '');
             filePath = cleanFilePath;
         }
+        // ★ 保存时间戳 seek 目标（在 _playNativeVideo / _startFlvStreamingPlayback 中统一应用）
+        // 优先使用 _migrationSeekTime（浮窗→面板迁移时保存的精确进度）
+        if (that._migrationSeekTime && that._migrationSeekTime > 0) {
+            startTime = that._migrationSeekTime;
+            that._migrationSeekTime = 0;
+        }
+        // ★ 不覆盖调用方已设置的 _videoPendingSeek（如 _bindStandaloneControls 保存的浮窗进度）
+        // startTime > 0 → URL ?t= 参数或 _migrationSeekTime，优先级最高
+        // startTime === 0 → 无时间参数，保留调用方已设的 _videoPendingSeek
+        if (startTime > 0) {
+            that._videoPendingSeek = startTime;
+        }
 
         // 如果当前有视频在播放，先保存当前高度（切换视频时不会调用 _closeVideoPlayer）
         var existingWrap = document.getElementById('cd-video-wrap');
         if (existingWrap && videoBar.style.display !== 'none') {
             try {
                 var curH = existingWrap.offsetHeight;
-                if (curH && curH > 50) localStorage.setItem('cd-video-bar-height', curH);
+                if (curH && curH > 50) {
+                    localStorage.setItem('cd-video-bar-height', curH);
+                    // ★ 持久化到 saveData（重启后 localStorage 可能被清空）
+                    if (typeof this.saveData === 'function') {
+                        this.saveData('cd_video_height_' + this.platform, curH).catch(function() {});
+                    }
+                }
             } catch(e) {}
         }
 
@@ -5881,9 +6351,18 @@ class LocalBrowsePlugin extends Plugin {
         that._clearDocSegmentHighlight();
         that._saveAudioState(null, null);
 
+        // ★★★ 预绑定核心 UI 事件（在任何视频路径分支之前，确保始终有效）★★★
+        that._ensureVideoUIEvents();
+
         var fileUrl = this.toFileUrl(filePath);
+        // ★ proxyUrl 不再预计算，按需调用（避免原生播放时无谓的代理初始化）
+        var isHttpUrl = filePath.indexOf('http://') === 0 || filePath.indexOf('https://') === 0;
         var fileName = '';
-        try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        if (isHttpUrl) {
+            try { var u = new URL(filePath); fileName = u.pathname.split('/').pop(); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        } else {
+            try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        }
 
         // 显示视频播放栏：恢复用户上次调节的高度
         videoBar.style.display = 'flex';
@@ -5907,14 +6386,97 @@ class LocalBrowsePlugin extends Plugin {
                 videoWrap.style.height = savedNum + 'px';
             } else {
                 videoWrap.style.height = '';  // 回退到 HTML 默认 350px
+                // ★ localStorage 为空，尝试从 saveData 读取持久化高度（重启后 localStorage 可能被清空）
+                var heightKey = 'cd_video_height_' + that.platform;
+                if (typeof that.loadData === 'function') {
+                    that.loadData(heightKey).then(function(h) {
+                        if (h && h > 50) {
+                            videoWrap.style.height = h + 'px';
+                            // 回写 localStorage 缓存，后续直接读取
+                            try { localStorage.setItem('cd-video-bar-height', h); } catch(e) {}
+                            that._log('_openVideoInPanel: 从 saveData 恢复高度=' + h);
+                        }
+                    }).catch(function() {});
+                }
             }
         }
 
         // 检测 FLV 格式（浏览器原生不支持，需要 mpegts.js）
         var videoExt = '';
-        try { videoExt = require('path').extname(filePath).toLowerCase(); } catch(e) {
+        try {
+            if (isHttpUrl) {
+                var dotIdx3 = filePath.lastIndexOf('.');
+                videoExt = dotIdx3 >= 0 ? filePath.substring(dotIdx3).toLowerCase() : '';
+            } else {
+                videoExt = require('path').extname(filePath).toLowerCase();
+            }
+        } catch(e) {
             var dotIdx = filePath.lastIndexOf('.');
             videoExt = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
+        }
+
+        // ★★★ 立即停止旧视频（避免切换时旧视频继续播放，等检测完才切换的体验问题）★★★
+        // 注意：同一视频只跳转时间戳时不需要停止（下面 isSameVideo 分支会直接 seek）
+        var _prevPath = that._videoCurrentPath ? that._videoCurrentPath.split('?')[0] : null;
+        var _isDifferentVideo = !_prevPath || _prevPath !== cleanFilePath;
+        if (_isDifferentVideo) {
+            if (videoEl && !videoEl.paused) {
+                try { videoEl.pause(); } catch(e) {}
+            }
+            if (videoEl && videoEl.src) {
+                try { videoEl.removeAttribute('src'); videoEl.load(); } catch(e) {}
+            }
+            // 立即停止 FLV 播放器（mpegts.js）
+            if (this._flvPlayer) {
+                try { this._flvPlayer.pause(); } catch(e) {}
+                try { this._flvPlayer.unload(); } catch(e) {}
+            }
+            // 立即停止转码进程
+            if (this._flvTranscodeProc) {
+                try { this._flvTranscodeProc.kill(); } catch(e) {}
+                this._flvTranscodeProc = null;
+            }
+            // 立即停止流式播放相关
+            if (this._streamingFlvPath) {
+                // ★ 删除孤儿流式 FLV 临时文件（避免 tmp 目录垃圾堆积）
+                try { require('fs').unlinkSync(this._streamingFlvPath); } catch(_) {}
+                this._streamingFlvPath = null;
+            }
+            // ★★★ Bug修复：清除转码轮询定时器（避免切换视频后旧定时器继续运行）★★★
+            if (this._transcodePollInterval) {
+                clearInterval(this._transcodePollInterval);
+                this._transcodePollInterval = null;
+            }
+            // ★★★ Bug修复：清理 growing files 字典（避免切换视频时残留）★★★
+            if (this._growingFiles) {
+                var _gfKeys = Object.keys(this._growingFiles);
+                for (var _gfi = 0; _gfi < _gfKeys.length; _gfi++) {
+                    delete this._growingFiles[_gfKeys[_gfi]];
+                }
+            }
+            // ★★★ Bug修复：中止旧的事件控制器，以便新视频重新绑定事件监听器 ★★★
+            if (this._videoEventController) {
+                this._videoEventController.abort();
+                this._videoEventController = null;
+            }
+            this._videoEventsBound = false;
+            // ★★★ Bug修复：清除自动播放超时兜底（避免旧定时器在新视频上下文触发）★★★
+            if (this._autoPlayTimeout) {
+                clearTimeout(this._autoPlayTimeout);
+                this._autoPlayTimeout = null;
+            }
+            // ★★★ 关键修复：切换视频时重置流式播放状态，防止新视频错误被静默吞掉 ★★★
+            this._isStreamingPlayback = false;
+            this._isFlvMode = false;
+            // ★★★ 清理 MSE srcObject（mpegts.js 设置了 MediaSource，load() 不会清除）★★★
+            if (videoEl && videoEl.srcObject) {
+                try { videoEl.srcObject = null; } catch(_) {}
+            }
+            // ★★★ 隐藏旧视频的转码进度（防止切换后残留 "转码中 5%" 显示）★★★
+            var _oldStatus = document.getElementById('cd-video-transcode-status');
+            if (_oldStatus) _oldStatus.style.display = 'none';
+            // ★★★ 清除旧视频的估算时长（防止新视频时间显示为旧视频的时长）★★★
+            this._videoEstimatedDuration = 0;
         }
 
         // 清理之前的 FLV 播放器及 Blob URL
@@ -5932,6 +6494,11 @@ class LocalBrowsePlugin extends Plugin {
         }
         // 清除旧的音视频同步定时器
         if (this._videoAvSyncTimer) { clearInterval(this._videoAvSyncTimer); this._videoAvSyncTimer = null; }
+        // 清除 A/V 时钟漂移修正定时器
+        if (this._avDriftTimer) { clearInterval(this._avDriftTimer); this._avDriftTimer = null; }
+        // 清除旧的智能缓冲定时器和清理函数
+        if (this._bufferMonitorTimer) { clearInterval(this._bufferMonitorTimer); this._bufferMonitorTimer = null; }
+        if (this._smartBufferCleanup) { this._smartBufferCleanup(); this._smartBufferCleanup = null; }
 
         // 更新文件名
         var nameEl = document.getElementById('cd-video-name');
@@ -5957,43 +6524,345 @@ class LocalBrowsePlugin extends Plugin {
             // 显示播放栏（如果隐藏了）
             videoBar.style.display = 'flex';
             that._applyBottomPadding();
+            that._panelVideoOpening = 0;
             return;
         }
 
         if (videoExt === '.flv') {
             // FLV 格式：使用 mpegts.js 播放
             this._isFlvMode = true;
-            this._playFlvVideo(videoEl, filePath, autoPlay);
+            this._playFlvVideo(videoEl, filePath, autoPlay, startTime);
         } else {
-            // 普通视频格式：直接设置 src
+            // 普通视频格式：先做编码预检测，再决定播放路径
             this._isFlvMode = false;
-            videoEl.autoplay = autoPlay;
-            videoEl.src = fileUrl;
-            // 如果有时间参数，加载后自动跳转
-            if (startTime > 0) {
-                videoEl.addEventListener('loadedmetadata', function onMeta() {
-                    videoEl.removeEventListener('loadedmetadata', onMeta);
-                    videoEl.currentTime = startTime;
-                }, { signal: that._videoEventController ? that._videoEventController.signal : undefined });
-            }
-            // 显式调用 play() 确保在用户交互上下文中立即播放（仅当 autoPlay 为 true 时）
-            if (autoPlay) {
-                var playPromise = videoEl.play();
-                if (playPromise && typeof playPromise.catch === 'function') {
-                    playPromise.catch(function(err) {
-                        that._log('视频自动播放被阻止（可能需要静音）:', err.message || err);
-                        // 尝试静音后再次播放
-                        videoEl.muted = true;
-                        videoEl.play().then(function() {
-                            that._log('静音后自动播放成功');
-                            // 短暂延迟后取消静音（部分浏览器允许）
-                            setTimeout(function() { videoEl.muted = false; }, 300);
-                        }).catch(function() {
-                            that._log('静音后仍无法自动播放，等待用户点击');
-                        });
+
+            // ★ 检测是否为思源本地服务器 URL（assets 路径）
+            if (isHttpUrl) {
+                console.warn('[LocalBrowse] _openVideoInPanel: 检测到 http URL，直接使用思源服务器地址播放');
+                videoEl.autoplay = false;
+                videoEl.preload = 'auto';
+                videoEl.src = filePath; // http URL 直接使用，无需代理
+                console.warn('[LocalBrowse] _openVideoInPanel: video src =', filePath);
+                // http URL 不需要文件头检测、智能缓冲（已是 HTTP 流）
+                if (startTime > 0) {
+                    videoEl.addEventListener('loadedmetadata', function onMeta() {
+                        videoEl.removeEventListener('loadedmetadata', onMeta);
+                        videoEl.currentTime = startTime;
+                    }, { signal: that._videoEventController ? that._videoEventController.signal : undefined });
+                }
+                // ★ 自动播放（处理浏览器自动播放策略）
+                if (autoPlay) {
+                    videoEl.addEventListener('canplay', function onCanPlay() {
+                        videoEl.removeEventListener('canplay', onCanPlay);
+                        that._autoPlayWithFallback(videoEl, 'Panel-http');
                     });
                 }
-            }
+            } else {
+                videoEl.autoplay = false; // ★ 网盘视频先不自动播放，等缓冲足够
+                videoEl.preload = 'auto'; // ★ 尽可能多缓冲
+
+                // ★ 慢速存储（网盘挂载）优化路径：
+                //    原生格式(.mp4/.mkv/.webm/.mov) → 跳过检测，直接 file:// 播放
+                //    .ts/.mts/.m2ts → 跳过检测，直接 FLV 流式拷贝（边拷边播）
+                //    原因：网盘上 _detectVideoContainer 和 _probeVideoCodecs 都是同步网络IO，卡 2~10 秒
+                var isSlow = that._isSlowStorage(filePath);
+                // ★ Chromium 原生支持的容器格式（file:// 直接播放）
+                var nativeExts = ['.mp4', '.m4v', '.mkv', '.webm', '.mov'];
+                var isNativeExt = nativeExts.indexOf(videoExt) >= 0;
+                // ★ 需要转码的容器格式（Chromium 不支持，必须 FLV 流式拷贝或重编码）
+                var transcodeExts = ['.ts', '.mts', '.m2ts'];
+                var isTranscodeExt = transcodeExts.indexOf(videoExt) >= 0;
+
+                if (isSlow && isNativeExt) {
+                    // ★★★ 快速路径：跳过所有同步检测，直接播放 ★★★
+                    that._log('_openVideoInPanel: 慢速存储+常见格式，跳过检测直接播放(' + videoExt + ')');
+                    try {
+                        videoEl.src = 'file:///' + filePath.replace(/\\/g, '/');
+                    } catch(_fastErr) {
+                        videoEl.src = that.toProxyUrl(filePath);
+                    }
+                    // error 事件兜底：原生播放失败自动转码
+                    var _fastErrHandler = function() {
+                        if (that._videoPlayerClosed) {
+                            videoEl.removeEventListener('error', _fastErrHandler);
+                            return;
+                        }
+                        var err = videoEl.error;
+                        if (err && (err.code === 3 || err.code === 4)) {
+                            videoEl.removeEventListener('error', _fastErrHandler);
+                            that._log('_openVideoInPanel: 慢速存储快速路径播放失败(code=' + err.code + ')，走转码');
+                            // ★ 重要：构建完整 codecInfo，包含 container！
+                            //    之前缺少 container 导致 _transcodeFlvAndPlay 无法匹配 .ts 流式拷贝路径
+                            that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, {
+                                videoCodec: '',
+                                audioCodec: '',
+                                container: videoExt.replace('.', ''),  // ★ 从扩展名推断容器
+                                videoSupported: false,
+                                audioSupported: true,
+                                scanComplete: false  // ★ 允许 _transcodeFlvAndPlay 自行探测
+                            });
+                        }
+                    };
+                    videoEl.addEventListener('error', _fastErrHandler);
+
+                    // ★ 慢速存储智能缓冲（含自动播放 + seek，不重复加 canplay 监听）
+                    that._setupSmartBuffer(videoEl, autoPlay, startTime);
+                } else if (isSlow && isTranscodeExt) {
+                    // ★★★ 慢速存储 + .ts/.mts/.m2ts 专用路径 ★★★
+                    //    跳过 _detectVideoContainer 和 _probeVideoCodecs（同步网络IO，卡 2~10 秒）
+                    //    直接走 FLV 流式拷贝（-c copy -f flv），边拷边播，零重编码
+                    that._log('_openVideoInPanel: 慢速存储+.ts格式，跳过检测直接FLV流式拷贝');
+
+                    // ★★★ 伴随 MP4 缓存检查：原视频同目录下的 .ts.transcoded.mp4 ★★★
+                    var _tsSidecarDirectPlay = false;
+                    var _tsSidecarMp4 = filePath + '.transcoded.mp4';
+                    try {
+                        if (require('fs').existsSync(_tsSidecarMp4)) {
+                            var _tsScStat = require('fs').statSync(_tsSidecarMp4);
+                            if (_tsScStat.size > 1024) {
+                                // ★ 验证 MP4 文件头（防止转码中断残留的不完整文件导致浏览器卡死）
+                                var _scValidMp4 = true;
+                                try {
+                                    var _scFd = require('fs').openSync(_tsSidecarMp4, 'r');
+                                    var _scBuf = Buffer.alloc(8);
+                                    require('fs').readSync(_scFd, _scBuf, 0, 8, 0);
+                                    require('fs').closeSync(_scFd);
+                                    if (_scBuf.slice(4, 8).toString() !== 'ftyp') {
+                                        that._log('_openVideoInPanel: 伴随缓存 MP4 头无效，删除并重新转码');
+                                        try { require('fs').unlinkSync(_tsSidecarMp4); } catch(_) {}
+                                        _scValidMp4 = false;
+                                    }
+                                } catch(_) {}
+                                if (_scValidMp4) {
+                                    that._log('_openVideoInPanel: 伴随缓存命中 → ' + _tsSidecarMp4 + ' (' + (_tsScStat.size / 1024 / 1024).toFixed(1) + 'MB)');
+                                    _tsSidecarDirectPlay = true;
+                                }
+                            }
+                        }
+                    } catch(_) {}
+
+                    // ★★★ 关键修复：跳过 UI 事件绑定的问题 ★★★
+                    //    sidecar 命中时需要直接播放，但不能 return（会跳过 UI 事件绑定）
+                    //    因此设置标志并跳过转码设置，让代码继续执行到 UI 事件绑定
+                    if (_tsSidecarDirectPlay) {
+                        that._log('_openVideoInPanel: 伴随缓存直接播放（不 return，继续绑定 UI 事件）');
+                        that._playNativeVideo(videoEl, _tsSidecarMp4, autoPlay);
+                        that._videoPlayerClosed = false;
+                        that._videoCurrentPath = filePath;
+                        that._videoCurrentName = fileName;
+                        that._saveVideoState(filePath, fileName);
+                        // ★ 不 return！继续到 UI 事件绑定
+                    } else {
+                        // ★ 慢速存储跳过同步 ffprobe（网盘上 execSync 阻塞 5~30s），用默认编码猜测
+                        var _tsProbedCodecInfo = {
+                            videoCodec: 'h264',   // .ts 大概率 H.264
+                            audioCodec: 'aac',
+                            container: videoExt.replace('.', '')
+                        };
+                        // ★ 转码输出到同目录伴随 MP4（永久缓存）
+                        var _tsCachedMp4 = filePath + '.transcoded.mp4';
+                        // 进度显示：使用控制栏内联元素 #cd-video-transcode-status
+                        var _tsShowProgress = function(phase, pct, extra) {
+                            var statusEl = document.getElementById('cd-video-transcode-status');
+                            if (!statusEl) return;
+                            statusEl.textContent = '转码中 ' + Math.min(100, Math.round(pct)) + '%';
+                            statusEl.style.display = 'inline';
+                        };
+                        var _tsHideProgress = function() {
+                            var statusEl = document.getElementById('cd-video-transcode-status');
+                            if (statusEl) statusEl.style.display = 'none';
+                        };
+                        that._transcodeFlvStreamCopy(videoEl, filePath, autoPlay, _tsProbedCodecInfo, _tsCachedMp4, _tsShowProgress, _tsHideProgress);
+                    }
+                } else {
+                    // ★★★ 缓存优先检查：已有转码产物的直接播放，跳过耗时的同步 ffprobe
+                    var _qsSidecarDirectPlay = false;
+                    var _qsSidecar = filePath + '.transcoded.mp4';
+                    try {
+                        if (require('fs').existsSync(_qsSidecar)) {
+                            var _qsScStat = require('fs').statSync(_qsSidecar);
+                            if (_qsScStat.size > 1024) {
+                                var _qsScValid = true;
+                                try {
+                                    var _qsScFd = require('fs').openSync(_qsSidecar, 'r');
+                                    var _qsScBuf = Buffer.alloc(8);
+                                    require('fs').readSync(_qsScFd, _qsScBuf, 0, 8, 0);
+                                    require('fs').closeSync(_qsScFd);
+                                    if (_qsScBuf.slice(4, 8).toString() !== 'ftyp') { _qsScValid = false; }
+                                } catch(_qsHe) { _qsScValid = false; }
+                                if (_qsScValid) {
+                                    _qsSidecarDirectPlay = true;
+                                }
+                            }
+                        }
+                    } catch(_qsCe) {}
+                    // ★★★ 关键修复：sidecar 命中时不 return，继续到 UI 事件绑定 ★★★
+                    if (_qsSidecarDirectPlay) {
+                        that._log('_openVideoInPanel: 缓存命中→ ' + _qsSidecar + ' (跳过ffprobe及后续检测)');
+                        that._playNativeVideo(videoEl, _qsSidecar, autoPlay);
+                        that._videoPlayerClosed = false;
+                        that._videoCurrentPath = filePath;
+                        that._videoCurrentName = fileName;
+                        that._saveVideoState(filePath, fileName);
+                        // ★ 不 return！继续到 UI 事件绑定
+                    } else {
+                    // ★★★ 转码格式快速通道：.ts/.mts/.m2ts 已知需要转码，跳过同步 ffprobe 避免阻塞主线程
+                    //    原因：execSync('ffprobe') 阻塞 1~5 秒会导致 UI 冻结、切换视频卡顿、音频初始化异常
+                    //    _transcodeFlvAndPlay 内部会自行异步探测编码，不依赖此处的同步结果
+                    if (isTranscodeExt) {
+                        that._log('_openVideoInPanel: 转码格式快速通道(' + videoExt + ')，跳过同步ffprobe');
+                        that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, {
+                            videoCodec: '',
+                            audioCodec: 'unknown',
+                            container: videoExt.replace('.', ''),
+                            videoSupported: false,
+                            audioSupported: true,
+                            scanComplete: false
+                        });
+                        // ★ 保存状态
+                        that._videoPlayerClosed = false;
+                        that._videoCurrentPath = filePath;
+                        that._videoCurrentName = fileName;
+                        that._saveVideoState(filePath, fileName);
+                        // ★ 不 return！继续到 UI 事件绑定
+                    } else {
+                    // ★ 常规路径：先检测再播放
+                    // ★ 文件头检测：确认扩展名和实际容器格式是否一致
+                    var actualContainer = that._detectVideoContainer(filePath);
+                    var extFromPath = '';
+                    try { extFromPath = require('path').extname(filePath).toLowerCase().replace('.', ''); } catch(e) {}
+                    console.warn('[LocalBrowse] 文件头检测: 扩展名=' + extFromPath + ', 实际容器=' + actualContainer);
+                    if (actualContainer !== 'unknown' && actualContainer !== extFromPath) {
+                    console.warn('[LocalBrowse] ⚠️ 扩展名和实际格式不一致！文件可能是 ' + actualContainer + ' 格式但扩展名为 .' + extFromPath);
+                }
+
+                // ★ 编码预检测：在设置 src 前判断浏览器是否支持该编码
+                var playCap = that._checkVideoPlaybackCapability(filePath);
+                that._log('_openVideoInPanel: 播放能力检测结果:', JSON.stringify(playCap));
+
+                if (!playCap.canPlay) {
+                    // ★ 浏览器不支持该编码 → 直接走转码/WASM 路径，跳过无谓的原生尝试
+                    that._log('_openVideoInPanel: 编码不支持(' + playCap.reason + ')，跳过原生播放');
+
+                    if (playCap.needWasm && that._wasmHevcAvailable()) {
+                        // ★ HEVC WASM 软解路径
+                        that._log('_openVideoInPanel: 尝试 WASM HEVC 软解');
+                        that._playHevcWasm(videoEl, filePath, autoPlay, playCap.codecInfo);
+                    } else {
+                        // ★ FFmpeg 转码路径
+                        that._log('_openVideoInPanel: 走 FFmpeg 转码路径');
+                        var transCodecInfo = playCap.codecInfo || {
+                            videoCodec: '',       // ★ 空字符串让下游自行探测
+                            audioCodec: 'unknown',
+                            container: videoExt.replace('.', ''),  // ★ 从扩展名推断容器
+                            videoSupported: false,
+                            audioSupported: true,
+                            scanComplete: false     // ★ 允许 _transcodeFlvAndPlay 自行 ffprobe
+                        };
+                        that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, transCodecInfo);
+                    }
+                } else {
+                    // ★ 浏览器支持（或可能支持）→ 原生播放 + error 事件兜底
+                    // ★ 统一使用 file:// 协议（Electron 原生支持，零内存拷贝、零 fd、秒开）
+                    try {
+                        videoEl.src = 'file:///' + filePath.replace(/\\/g, '/');
+                        that._log('_openVideoInPanel: 原生播放使用 file://');
+                    } catch(_readErr) {
+                        // file:// 设置失败（理论上不应该发生），回退到 HTTP 代理
+                        that._error('_openVideoInPanel: file:// 失败，回退代理:', _readErr.message);
+                        videoEl.src = that.toProxyUrl(filePath); // 按需调用
+                    }
+                    console.warn('[LocalBrowse] _openVideoInPanel: video src =', (videoEl.src || '').substring(0, 120));
+
+                    // ★ 视频加载错误监听：解码错误/格式不支持时自动转码回退
+                    var _onVideoError = function() {
+                        var err = videoEl.error;
+
+                        // ★ 播放器已关闭：忽略所有 error 事件（关闭时设置 src='' 会触发 error）
+                        if (that._videoPlayerClosed) {
+                            that._log('_onVideoError: 忽略 error（播放器已关闭）, code=' + (err ? err.code : 'null'));
+                            videoEl.removeEventListener('error', _onVideoError);
+                            return;
+                        }
+
+                        // ★ 防重入守卫：如果正在流式播放或已开始转码，忽略此 error 事件
+                        //    流式播放期间代理服务器返回的数据可能触发暂时的网络错误，
+                        //    不应因此重复启动转码流程（否则会导致 src 被反复重置 → play interrupted）
+                        if (that._isStreamingPlayback || that._flvTranscodeProc) {
+                            that._log('_onVideoError: 忽略 error（正在流式播放/转码中）, code=' + (err ? err.code : 'null'));
+                            return;
+                        }
+
+                        var errCodes = {1:'ABORTED',2:'NETWORK',3:'DECODE',4:'SRC_NOT_SUPPORTED'};
+                        console.warn('[LocalBrowse] ========== Video ERROR 事件 ==========');
+                        console.warn('[LocalBrowse] Video error code:', err ? (err.code + ' (' + errCodes[err.code] + ')') : 'null');
+                        console.warn('[LocalBrowse] Video error message:', err ? err.message : 'null');
+                        console.warn('[LocalBrowse] Video src:', videoEl.src);
+                        console.warn('[LocalBrowse] 错误含义: 1=用户中止, 2=网络错误(代理返回异常), 3=解码错误(编码不支持), 4=源不支持(格式/编码问题)');
+                        console.warn('[LocalBrowse] ==========================================');
+                        videoEl.removeEventListener('error', _onVideoError);
+
+                        // ★ 错误码3(解码)或4(格式不支持)：自动降级处理
+                        if (err && (err.code === 3 || err.code === 4)) {
+                            // ★ HEVC 解码失败：尝试 WASM 软解兜底
+                            if (playCap.codecInfo && (playCap.codecInfo.videoCodec === 'hevc' || playCap.codecInfo.videoCodec === 'h265') && that._wasmHevcAvailable()) {
+                                that._log('HEVC 硬解失败，尝试 WASM 软解...');
+                                that._playHevcWasm(videoEl, filePath, autoPlay, playCap.codecInfo);
+                            } else {
+                                // ★ 其他编码：FFmpeg 转码回退
+                                // ★ 构建 codecInfo 时必须包含 container（否则 .ts 无法匹配流式拷贝路径）
+                                that._log('视频播放失败(错误码' + err.code + ')，尝试自动转码为 MP4...');
+                                var _errExt = videoExt.replace('.', '');
+                                var transCodecInfo = playCap.codecInfo || {
+                                    videoCodec: '',       // ★ 空字符串让下游自行探测，不传扩展名冒充编码
+                                    audioCodec: 'unknown',
+                                    container: _errExt,    // ★ 从扩展名推断容器（ts/m2ts 等）
+                                    videoSupported: false,
+                                    audioSupported: true,
+                                    scanComplete: false     // ★ 允许 _transcodeFlvAndPlay 自行 ffprobe 探测
+                                };
+                                that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, transCodecInfo);
+                            }
+                        }
+                    };
+                    videoEl.addEventListener('error', _onVideoError);
+
+                    // ★ 智能缓冲系统：检测是否网盘挂载的慢速视频
+                    var isSlowStorage = that._isSlowStorage(filePath);
+                    if (isSlowStorage) {
+                        console.warn('[LocalBrowse] 检测到网盘/慢速存储，启用智能缓冲');
+                        that._setupSmartBuffer(videoEl, autoPlay, startTime);
+                    } else {
+                        // 本地磁盘：直接播放
+                        if (startTime > 0) {
+                            videoEl.addEventListener('loadedmetadata', function onMeta() {
+                                videoEl.removeEventListener('loadedmetadata', onMeta);
+                                videoEl.currentTime = startTime;
+                            }, { signal: that._videoEventController ? that._videoEventController.signal : undefined });
+                        }
+                        if (autoPlay) {
+                            // ★ 等 canplay 事件再播放，避免 play() interrupted by new load request
+                            var onCanPlayLocal = function() {
+                                videoEl.removeEventListener('canplay', onCanPlayLocal);
+                                // ★ 播放器已关闭时不触发播放
+                                if (that._videoPlayerClosed) return;
+                                that._autoPlayWithFallback(videoEl, 'Panel-local');
+                            };
+                            videoEl.addEventListener('canplay', onCanPlayLocal);
+                            // ★ 5秒超时兜底（file:// 通常很快，但大文件可能慢）
+                            that._autoPlayTimeout = setTimeout(function() {
+                                that._autoPlayTimeout = null;
+                                if (!videoEl.paused) return;
+                                if (that._videoPlayerClosed) return;
+                                videoEl.removeEventListener('canplay', onCanPlayLocal);
+                                that._log('_openVideoInPanel: 5秒超时兜底播放');
+                                that._autoPlayWithFallback(videoEl, 'Panel-local-timeout');
+                            }, 5000);
+                        }
+                    }
+                }
+                } // end of else (常规路径：先检测再播放)
+            } // end of else (non-http)
         } // end of else (non-FLV)
 
         // 清除旧字幕轨道
@@ -6004,8 +6873,10 @@ class LocalBrowsePlugin extends Plugin {
         for (var ti = 0; ti < embeddedTracks.length; ti++) { embeddedTracks[ti].mode = 'hidden'; }
 
         // 提前创建 AbortController（字幕回调可能同步执行，需要确保 controller 已存在）
-        if (!that._videoEventsBound) {
-            that._videoEventController = new AbortController();
+        // ★ 必须在 isTranscodeExt/_qsSidecarDirectPlay 条件块之前创建，
+        //   否则转码路径（如 .flv）会跳过创建，导致行 6855 访问 null.signal 报错
+        if (!this._videoEventController) {
+            this._videoEventController = new AbortController();
         }
 
         // 注入字幕
@@ -6038,8 +6909,8 @@ class LocalBrowsePlugin extends Plugin {
                     videoEl.addEventListener('loadedmetadata', forceShowSubtitles, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
                     videoEl.addEventListener('canplay', forceShowSubtitles, { once: true, signal: that._videoEventController ? that._videoEventController.signal : undefined });
                     // 延迟强制显示（有时 loadedmetadata 触发太早）
-                    setTimeout(forceShowSubtitles, 500);
-                    setTimeout(forceShowSubtitles, 1500);
+                    that._subtitleShowTimers.push(setTimeout(forceShowSubtitles, 500));
+                    that._subtitleShowTimers.push(setTimeout(forceShowSubtitles, 1500));
                     // 字幕轨道已添加，立即更新字幕按钮状态
                     var subBtn = document.getElementById('cd-video-sub-toggle');
                     if (subBtn) {
@@ -6065,6 +6936,8 @@ class LocalBrowsePlugin extends Plugin {
                 subToggle.style.pointerEvents = 'none';
             }
         }
+        } // ★ 闭合 isTranscodeExt 的 else 块
+        } // ★ 闭合 _qsSidecarDirectPlay 的 else 块
 
         // 根据 autoPlay 参数设置播放按钮初始状态
         that._updateVideoPlayBtn(autoPlay ? 'pause' : 'play');
@@ -6073,8 +6946,9 @@ class LocalBrowsePlugin extends Plugin {
         if (!that._videoEventsBound) {
             // AbortController 已提前创建（确保字幕回调可用）
             // 临时覆盖 addEventListener，自动注入 signal，避免手动添加到每个调用
+            // ⚠️ 此块执行期间，其他并发代码也会受影响，但绑定时间极短（<1ms），实际风险低
             var _origAEL = EventTarget.prototype.addEventListener;
-            var _sig = that._videoEventController.signal;
+            var _sig = (that._videoEventController || (that._videoEventController = new AbortController())).signal;
             EventTarget.prototype.addEventListener = function(type, listener, options) {
                 if (options && typeof options === 'object') {
                     if (!options.signal) options.signal = _sig;
@@ -6091,47 +6965,150 @@ class LocalBrowsePlugin extends Plugin {
                 var thumbEl = document.getElementById('cd-video-progress-thumb');
                 var curEl = document.getElementById('cd-video-time-current');
                 var totEl = document.getElementById('cd-video-time-total');
-                if (!videoEl.duration) return;
-                var pct = (videoEl.currentTime / videoEl.duration * 100).toFixed(1);
+                // ★ FLV 流式播放时 mpegts.js 不会给 duration 赋值（0/NaN），用 ffprobe 估算值兜底
+                var dur = videoEl.duration;
+                if (!dur || !isFinite(dur)) {
+                    if (that._videoEstimatedDuration && that._videoEstimatedDuration > 0) {
+                        dur = that._videoEstimatedDuration;
+                    }
+                }
+                // 最少更新当前时间（即使没有 duration 也要显示 time 在走）
+                if (curEl) curEl.textContent = that._formatDuration(videoEl.currentTime);
+                if (!dur) return;
+                var pct = (videoEl.currentTime / dur * 100).toFixed(1);
                 if (progressEl) progressEl.style.width = pct + '%';
                 if (thumbEl) thumbEl.style.left = pct + '%';
-                if (curEl) curEl.textContent = that._formatDuration(videoEl.currentTime);
-                if (totEl) totEl.textContent = that._formatDuration(videoEl.duration);
+                if (totEl) totEl.textContent = that._formatDuration(dur);
                 // 循环片段：到达终点时跳回起点
                 if (that._loopPlayEnd !== null && that._loopPlayStart !== null && videoEl.currentTime >= that._loopPlayEnd) {
                     videoEl.currentTime = that._loopPlayStart;
                 }
                 // 自动定位文档中对应的字幕片段
                 that._highlightDocSegment(videoEl.currentTime, that._videoCurrentPath);
+                // ★★★ 面板可见性检测（核心功能！视频播放时自动弹出/收回浮窗）
+                // 用 timeupdate 轮询面板可见性，比任何 Observer 都可靠：
+                // - 只在视频播放时检测，不浪费资源
+                // - 每秒 ~4 次，响应足够快
+                // - 不管用户用什么方式隐藏面板都能捕获
+                if ((that._videoCurrentPath || that._standaloneVideoPath) && videoEl.readyState >= 2) {
+                    var _panelVisible = that._isPanelVisible();
+                    // 延迟初始化：第一次检测时记录状态
+                    if (typeof that._lastPanelVisible === 'undefined') {
+                        that._lastPanelVisible = _panelVisible;
+                    }
+                    // ★ 在面板还可见时持续保存位置（提前缓存，隐藏后 getBoundingClientRect 就不准了）
+                    if (_panelVisible && !that._standaloneVideoPath) {
+                        var _savePEl = that.dockPanel && that.dockPanel.element;
+                        var _saveVW = document.getElementById('cd-video-wrap');
+                        if (_savePEl && _saveVW) {
+                            try {
+                                var _pr2 = _savePEl.getBoundingClientRect();
+                                var _wr2 = _saveVW.getBoundingClientRect();
+                                if (_pr2.width > 0) {
+                                    that._cachedPanelPos = { left: _pr2.left, top: _wr2.top, w: _pr2.width, h: _wr2.height + 60 };
+                                }
+                            } catch(_ex2) {}
+                        }
+                    }
+                    // ★ 面板从可见变为不可见 → 迁移到浮窗
+                    if (that._lastPanelVisible && !_panelVisible && !that._standaloneVideoPath) {
+                        that._lastPanelVisible = false;
+                        console.log('[LocalBrowse] Panel hidden, migrating video to standalone...');
+                        // 用之前缓存的位置（面板可能已经 hidden 了）
+                        if (that._cachedPanelPos) {
+                            try { localStorage.setItem('cd-standalone-pos', JSON.stringify(that._cachedPanelPos)); } catch(_ex3) {}
+                        }
+                        that._migratePanelToStandalone(that._videoSubtitleUrl);
+                        return; // 本次 timeupdate 不再处理后续逻辑（DOM 已变）
+                    }
+                    // ★ 面板从不可见变为可见 → 浮窗迁回面板
+                    if (!that._lastPanelVisible && _panelVisible && that._standaloneVideoPath) {
+                        that._lastPanelVisible = true;
+                        console.log('[LocalBrowse] Panel visible, migrating standalone back to panel...');
+                        if (that._standaloneIsMigrated) {
+                            // 迁移模式：直接 DOM reparenting
+                            that._migrateStandaloneToPanel();
+                        } else {
+                            // 非迁移模式：关闭浮窗 + 重建面板视频
+                            var _vp2 = that._standaloneVideoPath;
+                            var _vs2 = that._standaloneSubtitleUrl;
+                            var _savedTime2 = 0;
+                            var _saVe2 = document.getElementById('cd-video-el') || document.getElementById('cd-standalone-video-el');
+                            if (_saVe2 && _saVe2.currentTime > 0) { _savedTime2 = _saVe2.currentTime; }
+                            that._closeStandalonePlayer();
+                            setTimeout(function() {
+                                that._videoPlayerClosed = false;
+                                if (_savedTime2 > 0) { that._videoPendingSeek = _savedTime2; }
+                                that._openVideoInPanel(_vp2, _vs2, true);
+                            }, 150);
+                        }
+                    }
+                }
+                // ★ 网盘缓冲监控：每 5 秒检查一次缓冲健康度
+                var now = Date.now();
+                if (!that._videoBufferCheckTime || now - that._videoBufferCheckTime > 5000) {
+                    that._videoBufferCheckTime = now;
+                    var buffered = videoEl.buffered;
+                    if (buffered && buffered.length > 0) {
+                        var bufEnd = buffered.end(buffered.length - 1);
+                        var bufAhead = bufEnd - videoEl.currentTime;
+                        if (bufAhead < 3) {
+                            console.warn('[LocalBrowse] LOW BUFFER:', bufAhead.toFixed(1) + 's ahead, readyState=' + videoEl.readyState);
+                        }
+                    }
+                }
             });
 
             // 音视频不同步修复：Chromium 在 DOM 操作或渲染压力大时视频帧会滞后
-            // 定期短暂 pause+play 触发重新同步（仅对原生视频，FLV 模式由 mpegts.js 自行管理）
-            // 注意：此定时器在 _videoEventsBound 块内创建，仅在首次绑定时执行
-            that._startVideoAvSyncTimer(videoEl);
+            // 定期短暂 micro-seek 触发重新同步（仅对原生视频，FLV 模式由 mpegts.js 自行管理）
+            // 注意：定时器在外部（第6803行）统一创建，这里不重复调用
 
             // 播放/暂停状态变化（A/V 同步期间的 pause+play 不更新按钮）
             videoEl.addEventListener('play', function() { if (!that._isAvSyncing) that._updateVideoPlayBtn('pause'); });
             videoEl.addEventListener('pause', function() { if (!that._isAvSyncing) that._updateVideoPlayBtn('play'); });
             videoEl.addEventListener('ended', function() { that._updateVideoPlayBtn('play'); });
 
+            // waiting：网盘缓冲中，显示加载状态
+            videoEl.addEventListener('waiting', function() {
+                that._updateVideoPlayBtn('loading');
+                that._log('Video waiting (buffering from cloud drive)');
+            });
+            // playing：缓冲结束恢复播放
+            videoEl.addEventListener('playing', function() {
+                if (!that._isAvSyncing) that._updateVideoPlayBtn('pause');
+            });
+            // stalled：网络中断/读取失败
+            videoEl.addEventListener('stalled', function() {
+                that._log('Video stalled (network/read issue)');
+            });
+            // error：播放错误
+            videoEl.addEventListener('error', function() {
+                that._error('Video playback error:', videoEl.error);
+            });
+
             // 点击视频画面 → 播放/暂停 + 短暂显示大图标
+            // ★ 单击延迟 250ms，避免双击全屏时也触发播放/暂停
             videoEl.addEventListener('click', function() {
-                if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
-                // 显示大播放/暂停图标
-                var overlay = document.getElementById('cd-video-play-overlay');
-                if (overlay) {
-                    var svg = overlay.querySelector('svg');
-                    if (svg) {
-                        if (videoEl.paused) {
-                            svg.innerHTML = '<polygon points="8,5 19,12 8,19" fill="#fff"/>';
-                        } else {
-                            svg.innerHTML = '<rect x="6" y="5" width="4" height="14" rx="1" fill="#fff"/><rect x="14" y="5" width="4" height="14" rx="1" fill="#fff"/>';
+                if (that._videoClickBusy) return;
+                that._videoClickBusy = true;
+                setTimeout(function() {
+                    that._videoClickBusy = false;
+                    if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+                    // 显示大播放/暂停图标
+                    var overlay = document.getElementById('cd-video-play-overlay');
+                    if (overlay) {
+                        var svg = overlay.querySelector('svg');
+                        if (svg) {
+                            if (videoEl.paused) {
+                                svg.innerHTML = '<polygon points="8,5 19,12 8,19" fill="#fff"/>';
+                            } else {
+                                svg.innerHTML = '<rect x="6" y="5" width="4" height="14" rx="1" fill="#fff"/><rect x="14" y="5" width="4" height="14" rx="1" fill="#fff"/>';
+                            }
                         }
+                        overlay.style.opacity = '0.8';
+                        setTimeout(function() { overlay.style.opacity = '0'; }, 600);
                     }
-                    overlay.style.opacity = '0.8';
-                    setTimeout(function() { overlay.style.opacity = '0'; }, 600);
-                }
+                }, 250);
             });
 
             // 双击视频画面 → 全屏
@@ -6217,7 +7194,7 @@ class LocalBrowsePlugin extends Plugin {
                 });
                 // 点击任意位置关闭菜单
                 function closeMenu() { menu.remove(); document.removeEventListener('click', closeMenu); document.removeEventListener('contextmenu', closeMenu); }
-                setTimeout(function() { document.addEventListener('click', closeMenu); document.addEventListener('contextmenu', closeMenu); }, 10);
+                setTimeout(function() { document.addEventListener('click', closeMenu); document.addEventListener('contextmenu', closeMenu); }, 0);
             });
 
             // 播放按钮
@@ -6258,9 +7235,10 @@ class LocalBrowsePlugin extends Plugin {
                 closeBtn.addEventListener('click', function() {
                     // 标记用户手动关闭，下次启动不再恢复播放器
                     that._videoPlayerClosed = true;
+                    // ★ 先保存播放位置，再清除状态（否则 _closeVideoPlayer 中位置检查会失败）
+                    that._saveVideoState(null, null);
                     that._videoCurrentPath = null;
                     that._videoCurrentName = null;
-                    that._saveVideoState(null, null);
                     that._closeVideoPlayer();
                 });
             }
@@ -6312,10 +7290,12 @@ class LocalBrowsePlugin extends Plugin {
                     case 'ArrowUp':
                         e.preventDefault();
                         videoEl.volume = Math.min(1, videoEl.volume + 0.1);
+                        that._syncVolumeUI(videoEl.volume);
                         break;
                     case 'ArrowDown':
                         e.preventDefault();
                         videoEl.volume = Math.max(0, videoEl.volume - 0.1);
+                        that._syncVolumeUI(videoEl.volume);
                         break;
                     case 'f':
                     case 'F':
@@ -6380,13 +7360,8 @@ class LocalBrowsePlugin extends Plugin {
                 updateSubBtnState();
             }
 
-            // 时间戳按钮（不使用闭包的 filePath/fileName，避免切换视频后插入旧链接）
-            var timestampBtn = document.getElementById('cd-video-timestamp');
-            if (timestampBtn) {
-                timestampBtn.addEventListener('click', function() {
-                    that._insertVideoTimestamp(videoEl.currentTime);
-                });
-            }
+            // 时间戳按钮：已由 _ensureVideoUIEvents 绑定（行3080），此处不再重复绑定
+            // 否则点击一次生成两个时间戳
 
             // 截图按钮
             var screenshotBtn = document.getElementById('cd-video-screenshot');
@@ -6525,18 +7500,32 @@ class LocalBrowsePlugin extends Plugin {
             var progressTip = document.getElementById('cd-video-progress-tip');
             if (progressWrap) {
                 progressWrap.addEventListener('click', function(e) {
-                    if (!videoEl.duration) return;
+                    var _seekDur = videoEl.duration;
+                    if ((!_seekDur || !isFinite(_seekDur)) && that._videoEstimatedDuration && that._videoEstimatedDuration > 0) {
+                        _seekDur = that._videoEstimatedDuration;
+                    }
+                    if (!_seekDur || !isFinite(_seekDur)) return;
                     var rect = progressWrap.getBoundingClientRect();
                     var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                    videoEl.currentTime = pct * videoEl.duration;
+                    var targetTime = pct * _seekDur;
+                    // ★ FLV 模式下优先使用 mpegts.js 的 seek API
+                    if (that._isFlvMode && that._flvPlayer && that._flvPlayer.seek) {
+                        try { that._flvPlayer.seek(targetTime); } catch(_) { videoEl.currentTime = targetTime; }
+                    } else {
+                        videoEl.currentTime = targetTime;
+                    }
                 });
                 // 鼠标悬停显示对应时间
                 if (progressTip) {
                     progressWrap.addEventListener('mousemove', function(e) {
-                        if (!videoEl.duration) return;
+                        var _tipDur = videoEl.duration;
+                        if ((!_tipDur || !isFinite(_tipDur)) && that._videoEstimatedDuration && that._videoEstimatedDuration > 0) {
+                            _tipDur = that._videoEstimatedDuration;
+                        }
+                        if (!_tipDur) return;
                         var rect = progressWrap.getBoundingClientRect();
                         var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-                        var time = that._formatDuration(pct * videoEl.duration);
+                        var time = that._formatDuration(pct * _tipDur);
                         progressTip.textContent = time;
                         progressTip.style.left = (pct * 100) + '%';
                         progressTip.style.opacity = '1';
@@ -6547,10 +7536,12 @@ class LocalBrowsePlugin extends Plugin {
                 }
             }
 
-            // 拖拽调整视频区域高度
-            var resizeHandle = document.getElementById('cd-video-resize-handle');
-            if (resizeHandle) {
-                resizeHandle.addEventListener('mousedown', function(e) {
+            // 拖拽调整视频区域高度（绑定在 videoWrap 上，避免 z-index / 元素覆盖问题）
+            if (videoWrap) {
+                videoWrap.addEventListener('mousedown', function(e) {
+                    // 仅在鼠标位于顶部 8px 范围内时才触发拖拽
+                    var rect = videoWrap.getBoundingClientRect();
+                    if (e.clientY - rect.top > 8) return;
                     e.preventDefault();
                     var startY = e.clientY;
                     var startH = videoWrap.offsetHeight;
@@ -6578,7 +7569,11 @@ class LocalBrowsePlugin extends Plugin {
                             var finalH = videoWrap.offsetHeight;
                             if (finalH && finalH > 50) {
                                 localStorage.setItem('cd-video-bar-height', finalH);
-                                // 同步到 saveData 持久化（如果当前有视频在播放）
+                                // ★ 持久化到 saveData（重启后 localStorage 可能被清空）
+                                if (typeof that.saveData === 'function') {
+                                    that.saveData('cd_video_height_' + that.platform, finalH).catch(function() {});
+                                }
+                                // 同步到 _saveVideoState（如果当前有视频在播放）
                                 if (that._videoCurrentPath && that._videoCurrentName && !that._videoPlayerClosed) {
                                     that._saveVideoState(that._videoCurrentPath, that._videoCurrentName);
                                 }
@@ -6589,6 +7584,14 @@ class LocalBrowsePlugin extends Plugin {
                     }
                     document.addEventListener('mousemove', onMove);
                     document.addEventListener('mouseup', onUp);
+                });
+                // ★ 鼠标移动到顶部 8px 时显示调节光标
+                videoWrap.addEventListener('mousemove', function(e) {
+                    var rect2 = videoWrap.getBoundingClientRect();
+                    videoWrap.style.cursor = (e.clientY - rect2.top <= 8) ? 'ns-resize' : 'pointer';
+                });
+                videoWrap.addEventListener('mouseleave', function() {
+                    videoWrap.style.cursor = 'pointer';
                 });
             }
 
@@ -6732,6 +7735,7 @@ class LocalBrowsePlugin extends Plugin {
         that._videoPlayerClosed = false;
         that._videoCurrentPath = filePath;
         that._videoCurrentName = fileName;
+        that._lastPanelVisible = undefined; // 重置面板可见性检测状态
         that._saveVideoState(filePath, fileName);
 
         that._log('_openVideoInPanel: 视频播放栏已打开, videoBar显示=' + videoBar.style.display + ', videoBar尺寸=' + videoBar.offsetWidth + 'x' + videoBar.offsetHeight + ', videoWrap高度=' + (videoWrap ? (videoWrap.style.height || '350px(默认)') : 'N/A'));
@@ -6744,12 +7748,22 @@ class LocalBrowsePlugin extends Plugin {
     _updateVideoPlayBtn(state) {
         var btn = document.getElementById('cd-video-play');
         if (!btn) return;
-        if (state === 'pause') {
+        // 避免频繁切换同一状态导致 DOM 抖动（网盘缓冲时 waiting/playing 可能交替触发）
+        var newState = state === 'loading' ? 'loading' : (state === 'pause' ? 'playing' : 'paused');
+        if (btn.getAttribute('data-play-state') === newState) return;
+        btn.setAttribute('data-play-state', newState);
+        if (state === 'loading') {
+            btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2.5" stroke-dasharray="8 4" stroke-linecap="round"/></svg>';
+            btn.title = '加载中...';
+            btn.classList.add('cd-loading');
+        } else if (state === 'pause') {
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor"/></svg>';
             btn.title = '暂停';
+            btn.classList.remove('cd-loading');
         } else {
             btn.innerHTML = '<svg viewBox="0 0 24 24" width="14" height="14"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg>';
             btn.title = '播放';
+            btn.classList.remove('cd-loading');
         }
     }
 
@@ -6781,21 +7795,984 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         // 清除旧的定时器
         if (that._videoAvSyncTimer) { clearInterval(that._videoAvSyncTimer); that._videoAvSyncTimer = null; }
-        that._videoAvSyncTimer = setInterval(function() {
+        if (that._avDriftTimer) { clearInterval(that._avDriftTimer); that._avDriftTimer = null; }
+        
+        // 记录上次状态用于漂移检测
+        that._avSyncLastTime = 0;
+        that._avSyncLastFrames = { total: 0, dropped: 0 };
+        that._avSyncStallCount = 0;
+        
+        // ★★★ A/V 同步核心机制 ★★★
+        // 根本原因：浏览器视频解码器会逐渐落后于音频时钟（丢帧/时钟漂移）
+        // playbackRate 调整无效（同时加速音视频，相对偏移不变）
+        // currentTime = currentTime 无效（浏览器视为 no-op）
+        // 唯一有效方法：真正的 micro-seek（稍微偏移 currentTime），强制浏览器重对齐 A/V
+        // 这直接模拟用户手动"快进"行为（用户反馈：快进后暂时同步）
+        
+        var _lastSeekTime = 0;    // 上次微seek的时间（防抖）
+        var _lastDropCount = 0;   // 上次检查的丢帧数
+        var _resyncCount = 0;     // 本轮播放的resync次数
+        
+        // ★ 微 seek 函数：真正的 seek（偏移 >0），强制浏览器刷新解码管线
+        function doMicroSeek(reason) {
+            if (!videoEl || videoEl.paused || videoEl.ended || videoEl.readyState < 2) return;
+            var now = Date.now();
+            // 防抖：5秒内不重复 seek
+            if (now - _lastSeekTime < 5000) return;
+            // 边界检查：接近视频结尾时不 seek（避免触发 ended 事件）
+            var cur = videoEl.currentTime;
+            if (videoEl.duration && cur + 0.05 >= videoEl.duration - 0.1) return;
+            _lastSeekTime = now;
+            _resyncCount++;
+            
+            // ★ 关键：+0.05 秒（50ms，约1帧@25fps）
+            // 必须有实际偏移才能触发真正的 seek（0偏移是no-op）
+            // 50ms 在45分钟视频里完全感知不到，但足以强制浏览器重对齐 A/V 时钟
+            videoEl.currentTime = cur + 0.05;
+            // console.log('[LocalBrowse] A/V微seek同步 #' + _resyncCount + ': ' + reason + ' @' + cur.toFixed(2) + 's → ' + (cur + 0.05).toFixed(2) + 's');
+        }
+        
+        // ★ 定时器1：每10秒检测丢帧，丢帧时立即微seek
+        // FLV 模式也跳过（由 mpegts.js 自行管理）
+        that._avDriftTimer = setInterval(function() {
+            if (!videoEl || videoEl.paused || videoEl.ended || videoEl.readyState < 2) return;
             if (that._isFlvMode) return;
-            if (!videoEl || videoEl.paused || videoEl.ended || videoEl.readyState < 4) return;
             try {
-                var cur = videoEl.currentTime;
-                that._isAvSyncing = true;
-                videoEl.pause();
-                videoEl.currentTime = cur;
-                videoEl.play();
-                // play() 是异步的，短暂延迟后重置标记
-                setTimeout(function() { that._isAvSyncing = false; }, 100);
-            } catch(e) {
-                that._isAvSyncing = false;
+                // 方法1：getVideoPlaybackQuality 检测丢帧
+                if (typeof videoEl.getVideoPlaybackQuality === 'function') {
+                    var q = videoEl.getVideoPlaybackQuality();
+                    var newDropped = q.droppedVideoFrames - _lastDropCount;
+                    _lastDropCount = q.droppedVideoFrames;
+                    
+                    // 累积丢帧 > 5 → 立即微seek
+                    if (newDropped > 5) {
+                        doMicroSeek('丢帧' + newDropped + '(总' + q.droppedVideoFrames + ')');
+                        return;
+                    }
+                    // 持续少量丢帧（连续3次检查都有丢帧）→ 微seek
+                    if (newDropped > 0) {
+                        that._avSyncStallCount = (that._avSyncStallCount || 0) + 1;
+                        if (that._avSyncStallCount >= 3) {
+                            doMicroSeek('持续丢帧(' + that._avSyncStallCount + '次)');
+                            that._avSyncStallCount = 0;
+                        }
+                    } else {
+                        that._avSyncStallCount = 0;
+                    }
+                }
+            } catch(e) {}
+        }, 10000);
+        
+        // ★ 定时器2：每30秒无条件微seek（保底机制）
+        // 即使没有检测到丢帧，也定期强制 resync（防止时钟漂移型不同步）
+        that._videoAvSyncTimer = setInterval(function() {
+            if (!videoEl || videoEl.paused || videoEl.ended || videoEl.readyState < 2) return;
+            
+            if (that._isFlvMode) {
+                // FLV 模式：检测 mpegts.js 缓冲区健康度
+                if (that._flvPlayer) {
+                    var stats = that._flvPlayer.statistics_info;
+                    if (stats && stats.speed < 10 && videoEl.readyState < 3) {
+                        if (typeof that._flvPlayer.recoverMediaError === 'function') {
+                            that._flvPlayer.recoverMediaError();
+                            console.warn('[LocalBrowse] FLV low speed, recoverMediaError triggered');
+                        }
+                    }
+                }
+                return;
             }
+            
+            // ★ 无条件微seek（保底：每30秒一次）
+            doMicroSeek('定期resync(30s)');
         }, 30000);
+    }
+
+    /**
+     * 启动本地 HTTP 代理服务器，用于视频播放
+     * 将 file:/// 协议转为 HTTP 流，支持标准 Range 请求（视频 seek）和边转码边播放
+     */
+    _startVideoProxyServer() {
+        var that = this;
+        if (that._videoProxyServer) return; // 已启动
+        try {
+            var http = require('http');
+            var fs = require('fs');
+            var path = require('path');
+            var url = require('url');
+
+            that._videoProxyServer = http.createServer(function(req, res) {
+                // ★ 并发连接数限制（视频 seek/失败重试会产生大量 Range 请求，严格限制防止 EMFILE）
+                //    单个视频播放器正常播放需要 2-3 个连接，失败重试时可能激增到 5+
+                if (!that._proxyConnectionCount) that._proxyConnectionCount = 0;
+                if (that._proxyConnectionCount >= 5) {
+                    res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '2' });
+                    res.end('Too many connections');
+                    return;
+                }
+                that._proxyConnectionCount++;
+                res.on('finish', function() { that._proxyConnectionCount--; });
+                res.on('close', function() { that._proxyConnectionCount--; });
+
+                try {
+                    // ★ 修复：绕开 url.parse(..., true) 的自动解码，直接从原始 URL 提取 path 参数
+                    // 避免 query 解析器对 UTF-8 多字节中文解码出错（如 %C3%A0 类乱码问题）
+                    var rawUrl = req.url || '';
+                    var pathMatch = rawUrl.match(/[?&]path=([^&]*)/);
+                    var rawPath = pathMatch ? pathMatch[1] : '';
+                    var filePath = '';
+                    try {
+                        filePath = decodeURIComponent(rawPath);
+                    } catch (deErr) {
+                        console.warn('[LocalBrowse] 代理 decodeURIComponent 失败，尝试用 querystring 解码:', deErr.message);
+                        var qs = require('querystring');
+                        filePath = qs.unescape(rawPath);
+                    }
+                    if (!filePath) {
+                        console.warn('[LocalBrowse] 代理 400: Missing path parameter, rawUrl=' + rawUrl.substring(0, 200));
+                        res.writeHead(400, { 'Content-Type': 'text/plain' });
+                        res.end('Missing path parameter');
+                        return;
+                    }
+
+                    // 安全检查：只允许绝对路径，禁止 ../ 穿越
+                    var normalized = path.normalize(filePath);
+                    if (!path.isAbsolute(normalized)) {
+                        console.warn('[LocalBrowse] 代理 403: Invalid path ' + normalized);
+                        res.writeHead(403, { 'Content-Type': 'text/plain' });
+                        res.end('Invalid path');
+                        return;
+                    }
+
+                    // ★ 减少 I/O 开销：只在出错时打印日志，正常请求静默
+                    // 之前每个请求打 5-6 条 console.warn，高频视频请求时严重拖慢传输
+                    var _debugProxy = false; // 调试时设为 true
+
+                    fs.stat(normalized, function(err, stats) {
+                        if (err || !stats.isFile()) {
+                            console.warn('[LocalBrowse] 代理 404: ' + normalized + ', err=' + (err ? err.message : 'not file'));
+                            res.writeHead(404, { 'Content-Type': 'text/plain' });
+                            res.end('File not found');
+                            return;
+                        }
+
+                        var mimeType = that._getVideoMimeType(normalized);
+                        var totalSize = stats.size;
+                        var range = req.headers.range;
+
+                        // ★ 流式传输模式：文件正在被 ffmpeg 写入（转码中）
+                        // 此时文件大小在增长，用 chunked 传输代替 Content-Length
+                        var isStreamingFile = that._growingFiles && that._growingFiles[normalized];
+
+                        if (_debugProxy) {
+                            console.warn('[LocalBrowse] 代理: ' + req.method + ' size=' + totalSize + ' range=' + (range || 'none') + ' streaming=' + !!isStreamingFile);
+                        }
+
+                        if (isStreamingFile) {
+                            // ★ 流式传输：文件还在被 ffmpeg 写入
+                            var streamInfo = isStreamingFile;
+                            var writtenBytes = streamInfo.writtenBytes || totalSize;
+                            // ★ 估算总大小：让浏览器知道文件还没结束，会持续请求数据
+                            var estimatedTotal = streamInfo.estimatedTotalSize || Math.max(writtenBytes * 3, totalSize * 2);
+
+                            if (range) {
+                                // ★ Range 请求：返回已写入范围内的数据，但报告估算总大小
+                                var parts2 = range.replace(/bytes=/, '').split('-');
+                                var sStart = parseInt(parts2[0], 10);
+                                var requestedEnd = parts2[1] ? parseInt(parts2[1], 10) : estimatedTotal - 1;
+                                if (isNaN(sStart) || sStart < 0) sStart = 0;
+
+                                // ★ 异步等待数据：如果请求范围超出已写入，等待 ffmpeg 写入更多
+                                var serveRangeAsync = function() {
+                                    var currentWritten = streamInfo.writtenBytes || writtenBytes;
+                                    // 转码完成后用实际大小
+                                    var reportTotal = streamInfo.done ? currentWritten : estimatedTotal;
+                                    var sEnd = Math.min(requestedEnd, currentWritten - 1);
+
+                                    if (sStart > sEnd) {
+                                        if (!streamInfo.done) {
+                                            // 数据还没写入，等 300ms 再试
+                                            setTimeout(serveRangeAsync, 300);
+                                            return;
+                                        }
+                                        // 转码已完成，没有更多数据
+                                        res.writeHead(416, { 'Content-Range': 'bytes */' + currentWritten });
+                                        res.end();
+                                        return;
+                                    }
+
+                                    var sChunkSize = sEnd - sStart + 1;
+                                    res.writeHead(206, {
+                                        'Content-Range': 'bytes ' + sStart + '-' + sEnd + '/' + reportTotal,
+                                        'Accept-Ranges': 'bytes',
+                                        'Content-Length': sChunkSize,
+                                        'Content-Type': mimeType,
+                                        'Cache-Control': 'no-cache'
+                                    });
+                                    var sStream;
+                                    try {
+                                        sStream = fs.createReadStream(normalized, { start: sStart, end: sEnd });
+                                    } catch (openErr) {
+                                        // ★ EMFILE 保护：文件描述符耗尽时返回 503，让浏览器重试
+                                        if (openErr.code === 'EMFILE') {
+                                            console.warn('[LocalBrowse] 代理 Range EMFILE，返回 503 让客户端重试');
+                                            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '2' });
+                                            res.end('Server busy');
+                                        } else {
+                                            if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                            res.end();
+                                        }
+                                        return;
+                                    }
+                                    sStream.pipe(res);
+                                    sStream.on('error', function(err) {
+                                        if (sStream && !sStream.destroyed) sStream.destroy();
+                                        // ★ EMFILE 保护：返回 503 让浏览器自动重试
+                                        if (err.code === 'EMFILE' && !res.headersSent) {
+                                            res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '3' });
+                                            res.end('Server busy');
+                                            return;
+                                        }
+                                        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                        res.end();
+                                    });
+                                    res.on('close', function() {
+                                        if (sStream && !sStream.destroyed) sStream.destroy();
+                                    });
+                                };
+                                serveRangeAsync();
+                            } else {
+                                // ★ 非Range请求：渐进式流传输，保持连接持续发送新数据
+                                res.writeHead(200, {
+                                    'Content-Type': mimeType,
+                                    'Accept-Ranges': 'bytes',
+                                    'Cache-Control': 'no-cache',
+                                    'Transfer-Encoding': 'chunked'
+                                });
+
+                                var streamOffset = 0;
+                                var streamClosed = false;
+
+                                // 当客户端断开时停止轮询
+                                var stopStreaming = function() { streamClosed = true; };
+                                req.on('close', stopStreaming);
+                                res.on('close', stopStreaming);
+
+                                var pollAndStream = function() {
+                                    if (streamClosed || res.finished) return;
+
+                                    var currentBytes = streamInfo.writtenBytes;
+
+                                    if (streamOffset < currentBytes) {
+                                        // 有新数据，发送
+                                        var chunk = fs.createReadStream(normalized, { start: streamOffset, end: currentBytes - 1 });
+                                        streamOffset = currentBytes;
+                                        chunk.pipe(res, { end: false });
+                                        chunk.on('end', function() {
+                                            if (chunk && !chunk.destroyed) chunk.destroy();
+                                            if (streamInfo.done && streamOffset >= streamInfo.writtenBytes) {
+                                                // 转码完成且所有数据已发送
+                                                res.end();
+                                            } else {
+                                                // ★ 轮询间隔加大到 1.5s，减少并发 fd 占用
+                                                setTimeout(pollAndStream, 1500);
+                                            }
+                                        });
+                                        chunk.on('error', function() {
+                                            if (chunk && !chunk.destroyed) chunk.destroy();
+                                            res.end();
+                                        });
+                                    } else if (streamInfo.done) {
+                                        // 转码完成，所有数据已发送
+                                        res.end();
+                                    } else {
+                                        // ★ 轮询间隔加大到 1.5s，减少并发 fd 占用
+                                        setTimeout(pollAndStream, 1500);
+                                    }
+                                };
+                                pollAndStream();
+                            }
+                            return;
+                        }
+
+                        if (range) {
+                            // 解析 Range 请求头，支持分段读取（视频 seek 必需）
+                            var parts = range.replace(/bytes=/, '').split('-');
+                            var start = parseInt(parts[0], 10);
+                            var end = parts[1] ? parseInt(parts[1], 10) : totalSize - 1;
+                            if (isNaN(start) || start < 0) start = 0;
+                            if (isNaN(end) || end >= totalSize) end = totalSize - 1;
+                            if (start > end) start = end;
+                            var chunkSize = end - start + 1;
+
+                            if (_debugProxy) console.warn('[LocalBrowse] 代理 206: bytes=' + start + '-' + end + '/' + totalSize);
+                            res.writeHead(206, {
+                                'Content-Range': 'bytes ' + start + '-' + end + '/' + totalSize,
+                                'Accept-Ranges': 'bytes',
+                                'Content-Length': chunkSize,
+                                'Content-Type': mimeType,
+                                'Cache-Control': 'private, max-age=3600'  // ★ 允许缓存1小时，减少重复请求
+                            });
+                            var stream;
+                            try {
+                                stream = fs.createReadStream(normalized, { start: start, end: end });
+                            } catch (openErr) {
+                                if (openErr.code === 'EMFILE') {
+                                    console.warn('[LocalBrowse] 代理 Range EMFILE，返回 503');
+                                    res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '2' });
+                                    res.end('Server busy');
+                                } else {
+                                    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                    res.end();
+                                }
+                                return;
+                            }
+                            stream.pipe(res);
+                            stream.on('error', function(err) {
+                                if (stream && !stream.destroyed) stream.destroy();
+                                // ★ EMFILE 保护：返回 503 让浏览器自动重试，避免 500 导致播放彻底失败
+                                if (err.code === 'EMFILE' && !res.headersSent) {
+                                    console.warn('[LocalBrowse] 代理 Range EMFILE(503重试):', err.message);
+                                    res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '3' });
+                                    res.end('Server busy');
+                                    return;
+                                }
+                                console.warn('[LocalBrowse] 代理 Range 读取错误:', err.message);
+                                if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                res.end();
+                            });
+                            res.on('close', function() {
+                                if (stream && !stream.destroyed) stream.destroy();
+                            });
+                        } else {
+                            if (_debugProxy) console.warn('[LocalBrowse] 代理 200: 全量传输 ' + totalSize + ' bytes');
+                            res.writeHead(200, {
+                                'Content-Length': totalSize,
+                                'Content-Type': mimeType,
+                                'Accept-Ranges': 'bytes',
+                                'Cache-Control': 'private, max-age=3600'  // ★ 允许缓存1小时
+                            });
+                            var stream;
+                            try {
+                                stream = fs.createReadStream(normalized);
+                            } catch (openErr) {
+                                if (openErr.code === 'EMFILE') {
+                                    console.warn('[LocalBrowse] 代理全量 EMFILE，返回 503');
+                                    res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '2' });
+                                    res.end('Server busy');
+                                } else {
+                                    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                    res.end();
+                                }
+                                return;
+                            }
+                            stream.pipe(res);
+                            stream.on('error', function(err) {
+                                if (stream && !stream.destroyed) stream.destroy();
+                                if (err.code === 'EMFILE' && !res.headersSent) {
+                                    console.warn('[LocalBrowse] 代理全量 EMFILE(503重试):', err.message);
+                                    res.writeHead(503, { 'Content-Type': 'text/plain', 'Retry-After': '3' });
+                                    res.end('Server busy');
+                                    return;
+                                }
+                                console.warn('[LocalBrowse] 代理全量读取错误:', err.message);
+                                if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'text/plain' });
+                                res.end();
+                            });
+                            res.on('close', function() {
+                                if (stream && !stream.destroyed) stream.destroy();
+                            });
+                        }
+                    });
+                } catch(e) {
+                    console.warn('[LocalBrowse] 代理 500:', e.message || e);
+                    res.writeHead(500, { 'Content-Type': 'text/plain' });
+                    res.end('Internal error');
+                }
+            });
+
+            that._videoProxyServer.listen(0, '127.0.0.1', function() {
+                var addr = that._videoProxyServer.address();
+                that._videoProxyPort = addr.port;
+                that._log('Video proxy server started on http://127.0.0.1:' + addr.port);
+            });
+
+            that._videoProxyServer.on('error', function(err) {
+                that._log('Video proxy server error:', err);
+                that._videoProxyServer = null;
+                that._videoProxyPort = 0;
+            });
+        } catch(e) {
+            that._log('Failed to start video proxy server:', e);
+        }
+    }
+
+    /**
+     * 关闭视频代理服务器
+     */
+    _stopVideoProxyServer() {
+        if (this._videoProxyServer) {
+            try { this._videoProxyServer.close(); } catch(e) {}
+            this._videoProxyServer = null;
+            this._videoProxyPort = 0;
+            this._log('Video proxy server stopped');
+        }
+    }
+
+    /**
+     * 将本地文件路径转为代理服务器 URL（用于视频播放）
+     * 如果代理服务器未启动，回退到 file:/// 原始 URL
+     */
+    toProxyUrl(filePath) {
+        if (!filePath) return '';
+        // ★ 如果传入的已经是 http(s) URL 或 Blob URL，直接返回
+        if (filePath.indexOf('http://') === 0 || filePath.indexOf('https://') === 0 || filePath.indexOf('blob:') === 0) {
+            console.warn('[LocalBrowse] toProxyUrl: 传入已是 URL，直接使用 ' + filePath.substring(0, 200));
+            return filePath;
+        }
+        if (this._videoProxyPort > 0) {
+            var url = 'http://127.0.0.1:' + this._videoProxyPort + '/?path=' + encodeURIComponent(filePath);
+            console.warn('[LocalBrowse] toProxyUrl: 使用代理 ' + url);
+            return url;
+        }
+        console.warn('[LocalBrowse] toProxyUrl: ⚠️ 代理未启动，回退到 file:///');
+        return this.toFileUrl(filePath);
+    }
+
+    /**
+     * 根据文件扩展名获取视频 MIME 类型
+     */
+    _getVideoMimeType(filePath) {
+        var ext = '';
+        try {
+            ext = require('path').extname(filePath).toLowerCase();
+        } catch(e) {
+            var dotIdx = filePath.lastIndexOf('.');
+            ext = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
+        }
+        var mimeMap = {
+            '.mp4': 'video/mp4',
+            '.m4v': 'video/mp4',
+            '.webm': 'video/webm',
+            '.ogg': 'video/ogg',
+            '.ogv': 'video/ogg',
+            '.mkv': 'video/x-matroska',
+            '.avi': 'video/x-msvideo',
+            '.wmv': 'video/x-ms-wmv',
+            '.mov': 'video/quicktime',
+            '.flv': 'video/x-flv',
+            '.ts': 'video/mp2t',
+            '.m3u8': 'application/vnd.apple.mpegurl',
+            '.mpg': 'video/mpeg',
+            '.mpeg': 'video/mpeg',
+            '.3gp': 'video/3gpp'
+        };
+        return mimeMap[ext] || 'video/mp4';
+    }
+
+    /**
+     * 检测视频文件的实际容器格式（通过读取文件头）
+     * 用于识别扩展名和实际格式不一致的情况（如 MKV 伪装成 MP4）
+     * 返回检测到的格式标识字符串
+     */
+    _detectVideoContainer(filePath) {
+        try {
+            var fd = require('fs').openSync(filePath, 'r');
+            var buf = Buffer.alloc(16);
+            var bytesRead = require('fs').readSync(fd, buf, 0, 16, 0);
+            require('fs').closeSync(fd);
+            if (bytesRead < 8) return 'unknown';
+            // 打印文件头 hex，便于诊断
+            var hexStr = buf.slice(0, Math.min(bytesRead, 8)).toString('hex').toUpperCase();
+            console.warn('[LocalBrowse] 文件头检测: path=' + filePath.substring(0, 80) + ', hex=' + hexStr);
+
+            // 检查常见文件签名（magic bytes）
+            // MP4/M4V/MOV: offset 4-7 为 "ftyp"
+            if (buf[4] === 0x66 && buf[5] === 0x74 && buf[6] === 0x79 && buf[7] === 0x70) return 'mp4';
+            // MKV/WebM: EBML 头 0x1A 0x45 0xDF 0xA3
+            if (buf[0] === 0x1A && buf[1] === 0x45 && buf[2] === 0xDF && buf[3] === 0xA3) return 'mkv';
+            // AVI: "RIFF"..."AVI "
+            if (buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46) return 'avi';
+            // FLV: "FLV"
+            if (buf[0] === 0x46 && buf[1] === 0x4C && buf[2] === 0x56) return 'flv';
+            // MPEG-TS: sync byte 0x47 at offset 0 (也可能在 offset 1 用于某些封装)
+            if (buf[0] === 0x47) return 'ts';
+            // WMV/ASF: 0x30 0x26 B2 75 (GUID)
+            if (buf[0] === 0x30 && buf[1] === 0x26 && buf[2] === 0xB2 && buf[3] === 0x75) return 'wmv';
+            // OGG: "OggS"
+            if (buf[0] === 0x4F && buf[1] === 0x67 && buf[2] === 0x67 && buf[3] === 0x53) return 'ogg';
+            // WebM (EBML 已覆盖，但 WebM 也是 EBML)
+
+            return 'unknown';
+        } catch(e) {
+            console.warn('[LocalBrowse] 文件头检测失败: path=' + (filePath ? filePath.substring(0, 80) : 'undefined') + ', err=' + e.message);
+            return 'unknown';
+        }
+    }
+
+    /**
+     * 使用 ffprobe 检测视频文件的音视频编码格式
+     * @param {string} filePath - 视频文件路径
+     * @returns {object|null} {videoCodec, audioCodec, container} 或 null（检测失败）
+     */
+    _probeVideoCodecs(filePath) {
+        try {
+            // ★ 缓存检查：避免同一文件重复 ffprobe（网盘文件每次 probe 要过网络，很慢）
+            var fs = require('fs');
+            var cacheKey = null;
+            try {
+                var stat = fs.statSync(filePath);
+                cacheKey = filePath + '_' + stat.mtimeMs;
+            } catch(e) {}
+            if (cacheKey && this._probeCache && this._probeCache[cacheKey]) {
+                this._log('_probeVideoCodecs: 缓存命中，跳过 ffprobe');
+                return this._probeCache[cacheKey];
+            }
+
+            var { execSync } = require('child_process');
+            // 获取视频编码
+            var vProbe = execSync(
+                'ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "' + filePath + '"',
+                { timeout: 5000, encoding: 'utf8' }
+            );
+            var videoCodec = vProbe.trim().toLowerCase();
+            // 获取音频编码
+            var aProbe = execSync(
+                'ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "' + filePath + '"',
+                { timeout: 5000, encoding: 'utf8' }
+            );
+            var audioCodec = aProbe.trim().toLowerCase();
+            // 获取容器格式
+            var container = this._detectVideoContainer(filePath);
+            this._log('_probeVideoCodecs: video=' + videoCodec + ', audio=' + audioCodec + ', container=' + container);
+            var result = {
+                videoCodec: videoCodec,
+                audioCodec: audioCodec,
+                container: container
+            };
+            // ★ 缓存结果
+            if (cacheKey) {
+                if (!this._probeCache) this._probeCache = {};
+                this._probeCache[cacheKey] = result;
+                // 限制缓存大小（最多 200 条，防止内存泄漏）
+                var keys = Object.keys(this._probeCache);
+                if (keys.length > 200) {
+                    for (var ci = 0; ci < 50; ci++) { delete this._probeCache[keys[ci]]; }
+                }
+            }
+            return result;
+        } catch(e) {
+            this._log('_probeVideoCodecs: ffprobe 不可用或检测失败: ' + (e.message || e));
+            return null;
+        }
+    }
+
+    /**
+     * 检测浏览器是否能原生播放指定的视频编码
+     * 利用 HTML5 canPlayType API + PlatformHEVCDecoderSupport（思源已启用）
+     * @param {string} videoCodec - 视频编码名（h264, hevc, vp8, vp9, av1 等）
+     * @param {string} audioCodec - 音频编码名（aac, mp3, opus, vorbis 等）
+     * @param {string} container - 容器格式（mp4, mkv, webm 等）
+     * @returns {string} 'probably' | 'maybe' | '' (空字符串表示不支持)
+     */
+    _canPlayNatively(videoCodec, audioCodec, container) {
+        var videoEl = document.getElementById('cd-video-el') || document.createElement('video');
+        // 根据编码构建 MIME type（含 codecs 参数更准确）
+        var mimeType = this._buildMimeTypeWithCodecs(videoCodec, audioCodec, container);
+        if (!mimeType) return '';
+        var result = videoEl.canPlayType(mimeType);
+        this._log('_canPlayNatively: mime=' + mimeType + ', result=' + result);
+        return result;
+    }
+
+    /**
+     * 根据编码格式构建完整的 MIME type（含 codecs 参数）
+     * canPlayType 带 codecs 参数检测更准确
+     * @param {string} videoCodec - 视频编码名
+     * @param {string} audioCodec - 音频编码名
+     * @param {string} container - 容器格式
+     * @returns {string} MIME type 字符串
+     */
+    _buildMimeTypeWithCodecs(videoCodec, audioCodec, container) {
+        // 视频编码 → RFC 6381 codecs 参数名
+        var vCodecMap = {
+            'h264': 'avc1.64001f',   // High Profile Level 3.1（最常见）
+            'avc': 'avc1.64001f',
+            'hevc': 'hev1.1.6.L93.B0', // HEVC Main Profile
+            'h265': 'hev1.1.6.L93.B0',
+            'vp8': 'vp8',
+            'vp9': 'vp9',
+            'av1': 'av01.0.01M.08',
+            'theora': 'theora',
+            'mpeg4': 'mp4v.20.9',     // MPEG-4 Visual (XVID/DIVX)
+            'msmpeg4v3': 'mp4v.20.9',
+            'xvid': 'mp4v.20.9',
+            'wmv3': 'wmv3',
+            'wmv2': 'wmv2'
+        };
+        // 音频编码 → RFC 6381 codecs 参数名
+        var aCodecMap = {
+            'aac': 'mp4a.40.2',       // AAC-LC
+            'mp3': 'mp4a.40.34',      // MP3 in MP4
+            'opus': 'opus',
+            'vorbis': 'vorbis',
+            'flac': 'fLaC',
+            'pcm_s16le': 'pcm',
+            'ac3': 'ac-3',
+            'eac3': 'ec-3'
+        };
+
+        var vParam = vCodecMap[videoCodec] || '';
+        var aParam = aCodecMap[audioCodec] || '';
+
+        // 容器格式 → MIME type
+        var containerMime = {
+            'mp4': 'video/mp4',
+            'mkv': 'video/x-matroska',
+            'webm': 'video/webm',
+            'avi': 'video/x-msvideo',
+            'wmv': 'video/x-ms-wmv',
+            'mov': 'video/quicktime',
+            'ogg': 'video/ogg',
+            'ts': 'video/mp2t',
+            'mpeg': 'video/mpeg',
+            '3gp': 'video/3gpp',
+            'flv': 'video/x-flv'
+        };
+
+        var baseMime = containerMime[container] || 'video/mp4';
+
+        // 构建 codecs 参数
+        var codecs = [];
+        if (vParam) codecs.push(vParam);
+        if (aParam) codecs.push(aParam);
+
+        if (codecs.length > 0) {
+            return baseMime + '; codecs="' + codecs.join(', ') + '"';
+        }
+        return baseMime;
+    }
+
+    /**
+     * 综合检测视频是否能原生播放，返回决策结果
+     * @param {string} filePath - 视频文件路径
+     * @returns {object} {canPlay: boolean, codecInfo: object|null, reason: string}
+     */
+    _checkVideoPlaybackCapability(filePath) {
+        var that = this;
+
+        // 1. FLV 格式不走原生检测，走 mpegts.js 专用路径
+        var ext = '';
+        try { ext = require('path').extname(filePath).toLowerCase(); } catch(e) {
+            var dotIdx = filePath.lastIndexOf('.');
+            ext = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
+        }
+        if (ext === '.flv') {
+            return { canPlay: false, codecInfo: null, reason: 'flv', needMpegts: true };
+        }
+
+        // 2. 尝试用 ffprobe 检测编码
+        var codecInfo = that._probeVideoCodecs(filePath);
+
+        if (!codecInfo || !codecInfo.videoCodec) {
+            // ffprobe 不可用或检测失败，保守地尝试原生播放（等 error 事件兜底）
+            return { canPlay: true, codecInfo: null, reason: 'probe_failed_fallback_native' };
+        }
+
+        // 3. 检查是否为已知不支持原生播放的编码（快速判断）
+        var unsupportedVideoCodecs = ['mpeg4', 'msmpeg4v1', 'msmpeg4v2', 'msmpeg4v3', 'xvid', 'divx', 'wmv1', 'wmv2', 'wmv3', 'rv40', 'h263', 'mpeg1video', 'mpeg2video'];
+        if (unsupportedVideoCodecs.indexOf(codecInfo.videoCodec) >= 0) {
+            that._log('_checkVideoPlaybackCapability: 视频编码 ' + codecInfo.videoCodec + ' 原生不支持');
+            return { canPlay: false, codecInfo: codecInfo, reason: 'codec_unsupported_' + codecInfo.videoCodec };
+        }
+
+        // 3.5 ★ 已知可播放白名单：Chromium 实际支持但 canPlayType 可能误报为不支持的编码+容器组合
+        //    注意：.ts/.m2ts 容器不在此列！Chromium 原生不支持 MPEG-TS 容器，
+        //    即使编码是 H.264 也不行，必须走转码路径（FLV 流式拷贝或重编码）
+        var nativeWhitelist = [
+            { vcodec: 'h264', containers: ['mp4', 'mkv', 'mov'] },
+            { vcodec: 'avc',   containers: ['mp4', 'mkv', 'mov'] },
+            { vcodec: 'vp8',   containers: ['webm', 'mkv'] },
+            { vcodec: 'vp9',   containers: ['webm', 'mkv'] }
+        ];
+        var inWhitelist = false;
+        for (var wi = 0; wi < nativeWhitelist.length; wi++) {
+            var rule = nativeWhitelist[wi];
+            if (rule.vcodec === codecInfo.videoCodec && rule.containers.indexOf(codecInfo.container) >= 0) {
+                inWhitelist = true;
+                break;
+            }
+            // 音频-only 白名单
+            if (rule.audioOnly && rule.vcodec === codecInfo.audioCodec && rule.containers.indexOf(codecInfo.container) >= 0) {
+                inWhitelist = true;
+                break;
+            }
+        }
+        if (inWhitelist) {
+            that._log('_checkVideoPlaybackCapability: 编码+容器组合在原生播放白名单中(' + codecInfo.videoCodec + '/' + codecInfo.container + ')，直接原生播放');
+            return { canPlay: true, codecInfo: codecInfo, reason: 'whitelist_native_' + codecInfo.videoCodec + '_' + codecInfo.container, needErrorFallback: true };
+        }
+
+        // 4. 用 canPlayType 检测浏览器原生支持
+        var canPlayResult = that._canPlayNatively(codecInfo.videoCodec, codecInfo.audioCodec, codecInfo.container);
+        if (canPlayResult === 'probably' || canPlayResult === 'maybe') {
+            return { canPlay: true, codecInfo: codecInfo, reason: 'native_supported' };
+        }
+
+        // 5. HEVC 特殊处理：canPlayType 可能返回空（系统未安装解码器），但实际可能通过硬解播放
+        //    思源已启用 PlatformHEVCDecoderSupport，部分 Windows 系统确实能播
+        if (codecInfo.videoCodec === 'hevc' || codecInfo.videoCodec === 'h265') {
+            // ★ 准确的容器 MIME 映射（之前的 'video/x-matroska' 回退对 .ts 是错的）
+            var containerMimeMap = {
+                'mp4': 'video/mp4',
+                'mov': 'video/mp4',
+                'mkv': 'video/x-matroska',
+                'webm': 'video/webm',
+                'ts': 'video/mp2t',
+                'm2ts': 'video/mp2t'
+            };
+            var videoEl = document.getElementById('cd-video-el') || document.createElement('video');
+            var containerMime = containerMimeMap[codecInfo.container] || 'video/mp4';
+            var basicResult = videoEl.canPlayType(containerMime);
+            if (basicResult && codecInfo.container !== 'ts' && codecInfo.container !== 'm2ts') {
+                // ★ 仅对 MP4/MKV/WebM 容器尝试硬解；TS 容器中的 HEVC 浏览器几乎不支持
+                that._log('_checkVideoPlaybackCapability: HEVC 容器格式被支持(' + basicResult + ')，尝试硬解播放');
+                return { canPlay: true, codecInfo: codecInfo, reason: 'hevc_try_hardware', needErrorFallback: true };
+            }
+            // HEVC 确认不支持 → 需要 WASM 软解或转码
+            return { canPlay: false, codecInfo: codecInfo, reason: 'hevc_not_supported', needWasm: true };
+        }
+
+        // 6. 其他编码不支持 → 转码
+        return { canPlay: false, codecInfo: codecInfo, reason: 'codec_not_supported' };
+    }
+
+    /**
+     * 检测文件路径是否来自慢速存储（网盘挂载等）
+     * 通过路径关键词判断：百度网盘、阿里云盘、OneDrive、网络驱动器等
+     */
+    _isSlowStorage(filePath) {
+        var lower = filePath.toLowerCase();
+        var slowKeywords = [
+            'baidunetdisk', '百度网盘', '百度云', 'aliyundrive', '阿里云盘',
+            'onedrive', 'dropbox', 'googledrive', '坚果云', '天翼云盘',
+            'quark', '夸克网盘', '115', 'lanzou', '蓝奏云',
+            'webdav', 'davfs', 'rclone', 'cloudfs', 'raidrive'
+        ];
+        for (var i = 0; i < slowKeywords.length; i++) {
+            if (lower.indexOf(slowKeywords[i].toLowerCase()) >= 0) return true;
+        }
+        // 检测网络驱动器路径（Windows 下 \\server\share 或映射的网络盘）
+        if (lower.indexOf('\\\\') === 0) return true;
+        return false;
+    }
+
+    /**
+     * 轻量缓冲辅助：即点即播模式（不预缓冲等待）
+     * 原理：浏览器原生 <video> 已有边下边播能力，无需手动等缓冲
+     * 只在播放过程中遇到卡顿(stalled/waiting事件)时才显示提示
+     */
+    _setupSmartBuffer(videoEl, autoPlay, startTime) {
+        var that = this;
+        var hasStarted = false;
+
+        // 创建/获取缓冲提示 UI（仅用于播放中卡顿提示）
+        var bufferOverlay = null;
+        var parentWrap = videoEl.closest('#cd-video-wrap') || videoEl.parentElement;
+        if (parentWrap) {
+            bufferOverlay = parentWrap.querySelector('.cd-video-buffer-overlay');
+            if (!bufferOverlay) {
+                bufferOverlay = document.createElement('div');
+                bufferOverlay.id = 'cd-video-buffer-overlay';
+                bufferOverlay.className = 'cd-video-buffer-overlay';
+                bufferOverlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.5);color:#fff;display:none;align-items:center;justify-content:center;z-index:100;font-size:14px;pointer-events:none;';
+                parentWrap.style.position = 'relative';
+                parentWrap.appendChild(bufferOverlay);
+            }
+        }
+
+        // ★ 核心改动：canplay 就立即播放（不等 canplaythrough，不预缓冲）
+        var doPlay = function() {
+            if (hasStarted || that._videoPlayerClosed) return;
+            hasStarted = true;
+            if (bufferOverlay) bufferOverlay.style.display = 'none';
+            if (startTime > 0 && videoEl.duration) {
+                try { videoEl.currentTime = startTime; } catch(e) {}
+            }
+            if (autoPlay) {
+                that._autoPlayWithFallback(videoEl, 'smartBuffer');
+            }
+        };
+
+        // canplay：浏览器已有足够数据渲染第一帧 → 立刻播放
+        var onCanplay = function() { doPlay(); };
+        videoEl.addEventListener('canplay', onCanplay);
+
+        // 兜底：loadedmetadata 后 3 秒如果还没 canplay，强制播放（防止某些格式不触发 canplay）
+        var fallbackTimer = setTimeout(function() {
+            if (!hasStarted && !that._videoPlayerClosed) {
+                that._log('_setupSmartBuffer: canplay 未触发，超时强制播放');
+                doPlay();
+            }
+        }, 3000);
+
+        // ★ 播放中卡顿检测（用浏览器原生的 waiting/stalled 事件，不用定时器轮询）
+        var hideStallHint = function() {
+            if (bufferOverlay) bufferOverlay.style.display = 'none';
+        };
+        var showStallHint = function() {
+            if (!hasStarted || that._videoPlayerClosed) return;
+            if (bufferOverlay && !videoEl.paused) {
+                bufferOverlay.textContent = '缓冲中...';
+                bufferOverlay.style.display = 'flex';
+            }
+        };
+        // waiting 事件：浏览器因缺数据暂停了
+        videoEl.addEventListener('waiting', showStallHint);
+        // playing 事件：恢复播放
+        videoEl.addEventListener('playing', hideStallHint);
+        // stalled 事件：浏览器尝试取数据但失败
+        videoEl.addEventListener('stalled', showStallHint);
+
+        // 清理函数
+        that._smartBufferCleanup = function() {
+            clearTimeout(fallbackTimer);
+            videoEl.removeEventListener('canplay', onCanplay);
+            videoEl.removeEventListener('waiting', showStallHint);
+            videoEl.removeEventListener('playing', hideStallHint);
+            videoEl.removeEventListener('stalled', showStallHint);
+            hideStallHint();
+        };
+    }
+
+    /**
+     * 启动播放中缓冲监控：当剩余缓冲不足时自动暂停等待
+     */
+    _startBufferMonitor(videoEl) {
+        var that = this;
+        if (that._bufferMonitorTimer) clearInterval(that._bufferMonitorTimer);
+
+        var BUFFER_MIN = 5; // 播放中最低保留 5 秒缓冲
+        var wasPausedByBuffer = false;
+        var pauseCount = 0;       // ★ 因缓冲不足暂停的次数
+        var MAX_PAUSE_COUNT = 3;  // ★ 最多自动暂停3次，超过后提示用户
+
+        that._bufferMonitorTimer = setInterval(function() {
+            if (videoEl.paused || videoEl.ended) return;
+            if (!videoEl.buffered || videoEl.buffered.length === 0) return;
+
+            var cur = videoEl.currentTime || 0;
+            var ahead = 0;
+            for (var i = 0; i < videoEl.buffered.length; i++) {
+                if (videoEl.buffered.start(i) <= cur && videoEl.buffered.end(i) >= cur) {
+                    ahead = videoEl.buffered.end(i) - cur;
+                    break;
+                }
+            }
+
+            if (ahead < BUFFER_MIN && !wasPausedByBuffer) {
+                // 缓冲不足，暂停等待
+                pauseCount++;
+                if (pauseCount > MAX_PAUSE_COUNT) {
+                    // ★ 超过最大暂停次数，提示用户网速不足
+                    wasPausedByBuffer = true;
+                    videoEl.pause();
+                    var overlay = document.getElementById('cd-video-buffer-overlay');
+                    if (overlay) {
+                        overlay.textContent = '网速不足，视频加载缓慢。点击播放按钮继续，或等待缓冲...';
+                        overlay.style.display = 'flex';
+                        overlay.style.pointerEvents = 'auto';
+                        overlay.style.cursor = 'pointer';
+                        overlay.onclick = function() {
+                            pauseCount = 0; // 重置计数
+                            overlay.style.pointerEvents = 'none';
+                            overlay.style.cursor = '';
+                            overlay.onclick = null;
+                            videoEl.play().catch(function() {});
+                            overlay.style.display = 'none';
+                            wasPausedByBuffer = false;
+                        };
+                    }
+                    console.log('[LocalBrowse] 缓冲暂停超过' + MAX_PAUSE_COUNT + '次，提示用户');
+                    return;
+                }
+                wasPausedByBuffer = true;
+                videoEl.pause();
+                console.log('[LocalBrowse] 缓冲不足（剩余 ' + ahead.toFixed(1) + 's），自动暂停等待... (' + pauseCount + '/' + MAX_PAUSE_COUNT + ')');
+                var overlay = document.getElementById('cd-video-buffer-overlay');
+                if (overlay) {
+                    overlay.textContent = '网盘加载中... 剩余 ' + ahead.toFixed(1) + 's';
+                    overlay.style.display = 'flex';
+                    overlay.style.pointerEvents = 'none';
+                }
+            } else if (ahead >= BUFFER_MIN && wasPausedByBuffer) {
+                // 缓冲恢复，继续播放
+                wasPausedByBuffer = false;
+                videoEl.play().catch(function() {});
+                var overlay = document.getElementById('cd-video-buffer-overlay');
+                if (overlay) {
+                    overlay.style.display = 'none';
+                    overlay.style.pointerEvents = 'none';
+                }
+                console.log('[LocalBrowse] 缓冲恢复（剩余 ' + ahead.toFixed(1) + 's），继续播放');
+            }
+        }, 1000);
+    }
+
+    /**
+     * 自动播放视频，带静音回退（浏览器 autoplay 策略兼容）
+     * Panel 和 Dialog 共用的自动播放逻辑，避免重复代码
+     * @param {HTMLVideoElement} videoEl 视频元素
+     * @param {string} source 播放来源标识（用于日志，如 'Panel' / 'Dialog'）
+     */
+    _autoPlayWithFallback(videoEl, source) {
+        var that = this;
+
+        // ★ 内部辅助函数：带自动退避的 play() 调用
+        //    使用闭包变量 attempt 跟踪重试次数，避免 map key 不匹配导致的无限循环
+        function doPlay(attempt) {
+            var playPromise = videoEl.play();
+            if (playPromise && typeof playPromise.catch === 'function') {
+                playPromise.catch(function(err) {
+                    var errMsg = err.message || err || '';
+                    console.log('[LocalBrowse] ' + source + (attempt > 0 ? ' 重试#' + attempt : '') + ' 自动播放被阻止:', errMsg);
+
+                    // ★ 特殊处理：play() 被 new load request 中断
+                    if (errMsg.indexOf('interrupted') >= 0 || errMsg.indexOf('new load') >= 0) {
+                        var delays = [200, 500, 1000];  // 递增延迟
+
+                        if (attempt < delays.length) {
+                            // ★ 还有重试机会 — 用闭包变量 attempt+1 延迟再试
+                            var delay = delays[attempt];
+                            console.log('[LocalBrowse] ' + source + ' play 被 load 中断，第' + (attempt + 1) + '次重试 (' + delay + 'ms)...');
+                            setTimeout(function() {
+                                doPlay(attempt + 1);
+                            }, delay);
+                        } else {
+                            // ★ 重试耗尽 → 静音兜底
+                            console.log('[LocalBrowse] ' + source + ' 重试耗尽(3次)，尝试静音播放');
+                            videoEl.muted = true;
+                            videoEl.play().then(function() {
+                                console.log('[LocalBrowse] ' + source + ' 静音后自动播放成功');
+                                setTimeout(function() { videoEl.muted = false; }, 500);
+                            }).catch(function(e3) {
+                                console.log('[LocalBrowse] ' + source + ' 静音也失败:', e3.message || e3);
+                            });
+                        }
+                        return;
+                    }
+
+                    // 标准自动播放策略阻止 → 静音后重试
+                    videoEl.muted = true;
+                    videoEl.play().then(function() {
+                        console.log('[LocalBrowse] ' + source + ' 静音后自动播放成功');
+                        setTimeout(function() { videoEl.muted = false; }, 300);
+                    }).catch(function() {});
+                });
+            }
+        }
+
+        // ★ 从第0次尝试开始（attempt=0 表示首次）
+        doPlay(0);
     }
 
     /**
@@ -6935,6 +8912,14 @@ class LocalBrowsePlugin extends Plugin {
         if (audioWarn) audioWarn.remove();
         // 清除音视频同步定时器
         if (this._videoAvSyncTimer) { clearInterval(this._videoAvSyncTimer); this._videoAvSyncTimer = null; }
+        // 清除 A/V 时钟漂移修正定时器
+        if (this._avDriftTimer) { clearInterval(this._avDriftTimer); this._avDriftTimer = null; }
+        // 清除缓冲监控定时器
+        if (this._bufferMonitorTimer) { clearInterval(this._bufferMonitorTimer); this._bufferMonitorTimer = null; }
+        // 清除智能缓冲
+        if (this._smartBufferCleanup) { this._smartBufferCleanup(); this._smartBufferCleanup = null; }
+        // 重置 A/V 同步标记
+        this._isAvSyncing = false;
         // 清除循环片段状态 + 重置按钮视觉
         this._loopSegMarkStart = null;
         this._loopPlayStart = null;
@@ -6945,18 +8930,63 @@ class LocalBrowsePlugin extends Plugin {
         this._clearDocSegmentHighlight();
         this._docSegmentsCache = null;
         if (this._docSegmentsCacheTimer) { clearTimeout(this._docSegmentsCacheTimer); this._docSegmentsCacheTimer = null; }
+        // 清除字幕强制显示延迟定时器
+        if (this._subtitleShowTimers && this._subtitleShowTimers.length > 0) {
+            for (var _ssti = 0; _ssti < this._subtitleShowTimers.length; _ssti++) {
+                clearTimeout(this._subtitleShowTimers[_ssti]);
+            }
+            this._subtitleShowTimers = [];
+        }
         // 清除 FLV 自动播放超时定时器
         if (this._flvPlayTimer) { clearTimeout(this._flvPlayTimer); this._flvPlayTimer = null; }
+        // ★ 清除原生自动播放超时定时器（_openVideoInPanel 中设置）
+        if (this._autoPlayTimeout) { clearTimeout(this._autoPlayTimeout); this._autoPlayTimeout = null; }
+        // ★ 终止 FLV 转码进程 + 清理转码遮罩
+        if (this._flvTranscodeProc) {
+            try { this._flvTranscodeProc.kill(); } catch(e) {}
+            this._flvTranscodeProc = null;
+        }
+        // ★ 清理临时流式 FLV 文件（边转边播产生的 .streaming.flv）
+        if (this._streamingFlvPath) {
+            try { var _fs = require('fs'); if (_fs.existsSync(this._streamingFlvPath)) _fs.unlinkSync(this._streamingFlvPath); } catch(_) {}
+            this._streamingFlvPath = null;
+        }
+        // ★ 清理 growingFiles 注册（边转边播时代理服务器用）
+        if (this._growingFiles) {
+            var gKeys = Object.keys(this._growingFiles);
+            for (var gi = 0; gi < gKeys.length; gi++) {
+                delete this._growingFiles[gKeys[gi]];
+            }
+        }
+        // 清理转码进度
+        var transStatus = document.getElementById('cd-video-transcode-status');
+        if (transStatus) transStatus.style.display = 'none';
+        // 清理遗留的旧版转码遮罩（兼容）
+        var transOverlay = document.querySelector('.cd-video-transcode-overlay');
+        if (transOverlay) transOverlay.remove();
+        var dialogTransOverlay = document.querySelector('#cd-dialog-video');
+        if (dialogTransOverlay) {
+            var dTransOverlay = dialogTransOverlay.parentElement && dialogTransOverlay.parentElement.querySelector('.cd-video-transcode-overlay');
+            if (dTransOverlay) dTransOverlay.remove();
+        }
         // 销毁 FLV 播放器
         if (this._flvPlayer) {
             try { this._flvPlayer.destroy(); } catch(e) {}
             this._flvPlayer = null;
         }
         this._isFlvMode = false;
+        // ★ 清理流式播放标记
+        this._isStreamingPlayback = false;
+        this._streamingVideoEl = null;
         // 释放 FLV Blob URL
         if (this._flvBlobUrl) {
             try { URL.revokeObjectURL(this._flvBlobUrl); } catch(e) {}
             this._flvBlobUrl = null;
+        }
+        // ★ 释放原生视频 Blob URL（_openVideoInPanel 中创建）
+        if (this._nativeBlobUrl) {
+            try { URL.revokeObjectURL(this._nativeBlobUrl); } catch(e) {}
+            this._nativeBlobUrl = null;
         }
         // 清理对话框 FLV 播放器和 Blob URL
         if (this._dialogFlvPlayer) {
@@ -6966,6 +8996,11 @@ class LocalBrowsePlugin extends Plugin {
         if (this._dialogFlvBlobUrl) {
             try { URL.revokeObjectURL(this._dialogFlvBlobUrl); } catch(e) {}
             this._dialogFlvBlobUrl = null;
+        }
+        // ★ 释放对话框原生视频 Blob URL
+        if (this._dialogNativeBlobUrl) {
+            try { URL.revokeObjectURL(this._dialogNativeBlobUrl); } catch(e) {}
+            this._dialogNativeBlobUrl = null;
         }
         if (videoEl) {
             videoEl.pause();
@@ -6995,7 +9030,13 @@ class LocalBrowsePlugin extends Plugin {
                 // 真正关闭时：保存当前高度，然后清空
                 try {
                     var h = videoWrap.offsetHeight;
-                    if (h && h > 50) localStorage.setItem('cd-video-bar-height', h);
+                    if (h && h > 50) {
+                        localStorage.setItem('cd-video-bar-height', h);
+                        // ★ 持久化到 saveData（重启后 localStorage 可能被清空）
+                        if (typeof this.saveData === 'function') {
+                            this.saveData('cd_video_height_' + this.platform, h).catch(function() {});
+                        }
+                    }
                 } catch(e) {}
                 videoWrap.style.flex = '';
                 videoWrap.style.maxHeight = '';
@@ -7080,14 +9121,121 @@ class LocalBrowsePlugin extends Plugin {
         document.head.appendChild(script);
     }
 
+    // ============================================================
+    // ★ WASM HEVC 软解模块
+    // 当系统没有 HEVC 硬件解码器时，通过 WASM 在 CPU 上软解 HEVC
+    // 使用 libde265.js（MIT 开源，轻量~1MB）作为解码核心
+    // ============================================================
+
+    /**
+     * 检查 WASM HEVC 软解是否可用
+     * @returns {boolean}
+     */
+    _wasmHevcAvailable() {
+        // 需要支持 WebAssembly 和 SharedArrayBuffer（多线程解码）
+        // SharedArrayBuffer 需要 Cross-Origin-Isolation，Electron 环境通常支持
+        var hasWasm = typeof WebAssembly !== 'undefined' && typeof WebAssembly.instantiate === 'function';
+        // ★ 即使没有 SharedArrayBuffer，libde265.js 单线程模式也能用（稍慢）
+        return hasWasm;
+    }
+
+    /**
+     * 动态加载 libde265.js WASM HEVC 解码器
+     * @param {function} callback - 加载完成回调
+     */
+    _loadH265Decoder(callback) {
+        // ★ 检查是否已加载
+        if (typeof window._localbrowse_libde265 !== 'undefined') {
+            callback(window._localbrowse_libde265);
+            return;
+        }
+        if (this._h265Loading) {
+            var checkInterval = setInterval(function() {
+                if (typeof window._localbrowse_libde265 !== 'undefined') {
+                    clearInterval(checkInterval);
+                    callback(window._localbrowse_libde265);
+                }
+            }, 100);
+            setTimeout(function() { clearInterval(checkInterval); }, 15000);
+            return;
+        }
+        this._h265Loading = true;
+        var that = this;
+
+        var script = document.createElement('script');
+        // ★ libde265.js — MIT 开源 HEVC 解码器，WASM + SIMD 加速
+        script.src = 'https://cdn.jsdelivr.net/npm/libde265.js@1.0.11/dist/libde265.min.js';
+        script.onload = function() {
+            that._h265Loading = false;
+            // libde265.js 会将解码器挂载到全局
+            if (typeof libde265 !== 'undefined') {
+                window._localbrowse_libde265 = libde265;
+                that._log('_loadH265Decoder: libde265.js 加载成功');
+                callback(libde265);
+            } else {
+                that._error('_loadH265Decoder: libde265.js 加载后全局对象未找到');
+                callback(null);
+            }
+        };
+        script.onerror = function() {
+            that._h265Loading = false;
+            that._error('_loadH265Decoder: libde265.js 加载失败');
+            callback(null);
+        };
+        document.head.appendChild(script);
+    }
+
+    /**
+     * 使用 WASM HEVC 软解播放视频
+     * 流程：demux（ffprobe/ffmpeg 提取裸 HEVC 流）→ WASM 解码 → Canvas 渲染
+     * @param {HTMLVideoElement} videoEl - 原生 video 元素（用于获取父容器）
+     * @param {string} filePath - 视频文件路径
+     * @param {boolean} autoPlay - 是否自动播放
+     * @param {object} codecInfo - 编码信息
+     */
+    _playHevcWasm(videoEl, filePath, autoPlay, codecInfo) {
+        var that = this;
+
+        that._loadH265Decoder(function(decoder) {
+            if (!decoder) {
+                // WASM 加载失败，降级到 FFmpeg 转码
+                that._log('_playHevcWasm: WASM HEVC 解码器加载失败，降级到 FFmpeg 转码');
+                var transCodecInfo = codecInfo || {
+                    videoCodec: 'HEVC',
+                    audioCodec: 'unknown',
+                    videoSupported: false,
+                    audioSupported: true,
+                    scanComplete: true
+                };
+                that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, transCodecInfo);
+                return;
+            }
+
+            // ★ WASM HEVC 解码需要 Canvas 渲染，原生 <video> 不支持
+            // 当前版本：暂时降级到 FFmpeg 转码（WASM Canvas 播放器需要较大改动）
+            // TODO: 后续版本实现完整的 WASM Canvas 播放器
+            that._log('_playHevcWasm: WASM HEVC Canvas 播放器尚未完整实现，降级到 FFmpeg 转码');
+            that.showToastMsg('🔄 HEVC 软解播放器开发中，当前使用转码模式...');
+
+            var transCodecInfo = codecInfo || {
+                videoCodec: 'HEVC',
+                audioCodec: 'unknown',
+                videoSupported: false,
+                audioSupported: true,
+                scanComplete: true
+            };
+            that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, transCodecInfo);
+        });
+    }
+
     /**
      * 使用 mpegts.js 播放 FLV 格式视频
      * FLV 格式浏览器原生不支持，需要通过 MSE (Media Source Extensions) 解码播放
      */
-    _playFlvVideo(videoEl, filePath, autoPlay) {
+    _playFlvVideo(videoEl, filePath, autoPlay, startTime) {
         var that = this;
         that._loadMpegts(function() {
-            that._createFlvPlayer(videoEl, filePath, autoPlay);
+            that._createFlvPlayer(videoEl, filePath, autoPlay, startTime);
         });
     }
 
@@ -7099,7 +9247,14 @@ class LocalBrowsePlugin extends Plugin {
     _detectFlvCodecs(filePath) {
         try {
             var fs = require('fs');
-            var buf = fs.readFileSync(filePath);
+            // ★ 扫描范围扩大到 256KB：部分 FLV 文件的 onMetaData 标签很大（>64KB），
+            // 导致音视频 tag 在 64KB 之后才出现，之前扫描不到编解码信息
+            var SCAN_SIZE = 256 * 1024;
+            var fd = fs.openSync(filePath, 'r');
+            var headerBuf = Buffer.alloc(SCAN_SIZE);
+            var bytesRead = fs.readSync(fd, headerBuf, 0, SCAN_SIZE, 0);
+            fs.closeSync(fd);
+            var buf = headerBuf.slice(0, bytesRead);
             if (buf.length < 13) return null;
             // 检查 FLV 签名
             if (buf[0] !== 0x46 || buf[1] !== 0x4C || buf[2] !== 0x56) return null;
@@ -7111,12 +9266,12 @@ class LocalBrowsePlugin extends Plugin {
 
             var videoCodec = 'none';
             var audioCodec = 'none';
-            var videoSupported = true;
+            var videoSupported = true;   // 默认允许（检测失败时不误拦截）
             var audioSupported = true;
 
-            // 扫描前 50 个 tag 或最多 64KB 数据
-            var maxTags = 50;
-            var maxOffset = Math.min(buf.length, 65536);
+            // 扫描前 200 个 tag 或最多 256KB 数据
+            var maxTags = 200;
+            var maxOffset = Math.min(buf.length, SCAN_SIZE);
             for (var t = 0; t < maxTags && offset + 11 < maxOffset; t++) {
                 var tagType = buf[offset];
                 var dataSize = (buf[offset + 1] << 16) | (buf[offset + 2] << 8) | buf[offset + 3];
@@ -7126,9 +9281,9 @@ class LocalBrowsePlugin extends Plugin {
                 if (tagType === 9 && hasVideo && videoCodec === 'none') {
                     // Video tag: first nibble = frame type, second nibble = codec ID
                     var vCodecId = buf[dataOffset] & 0x0F;
-                    var vCodecMap = { 2: 'H.263', 3: 'Screen', 4: 'VP6', 5: 'VP6A', 6: 'ScreenV2', 7: 'H.264/AVC' };
+                    var vCodecMap = { 2: 'H.263', 3: 'Screen', 4: 'VP6', 5: 'VP6A', 6: 'ScreenV2', 7: 'H.264/AVC', 12: 'H.265/HEVC' };
                     videoCodec = vCodecMap[vCodecId] || ('Unknown(' + vCodecId + ')');
-                    videoSupported = (vCodecId === 7); // 只有 H.264/AVC 被支持
+                    videoSupported = (vCodecId === 7); // 只有 H.264/AVC 被支持（mpegts.js 不支持 H.265）
                 }
                 if (tagType === 8 && hasAudio && audioCodec === 'none') {
                     // Audio tag: first 4 bits = sound format
@@ -7144,7 +9299,17 @@ class LocalBrowsePlugin extends Plugin {
                 offset += 11 + dataSize + 4;
             }
 
-            return { videoCodec: videoCodec, audioCodec: audioCodec, videoSupported: videoSupported, audioSupported: audioSupported };
+            // ★ 检测到 none/none 时标记为"未知"，调用方据此决定是否放行
+            var scanComplete = (videoCodec !== 'none' || audioCodec !== 'none');
+            return {
+                videoCodec: videoCodec,
+                audioCodec: audioCodec,
+                videoSupported: videoSupported,
+                audioSupported: audioSupported,
+                scanComplete: scanComplete,
+                scannedBytes: bytesRead,
+                scannedTags: t
+            };
         } catch(e) {
             return null;
         }
@@ -7154,7 +9319,7 @@ class LocalBrowsePlugin extends Plugin {
      * 创建 mpegts.js FLV 播放器实例
      * 优先使用 file:// URL，失败时回退到 fs 读取 + Blob URL
      */
-    _createFlvPlayer(videoEl, filePath, autoPlay) {
+    _createFlvPlayer(videoEl, filePath, autoPlay, startTime) {
         var that = this;
         if (typeof mpegts === 'undefined') {
             that.showToastMsg('⚠️ FLV 播放组件加载失败，请检查网络连接');
@@ -7166,72 +9331,158 @@ class LocalBrowsePlugin extends Plugin {
         }
 
         // 预检测 FLV 文件编码格式，提前发现不支持的编码
-        var codecInfo = that._detectFlvCodecs(filePath);
+        // ★ 慢速存储跳过同步读取 256KB，避免阻塞主线程（mpegts.js 错误回调会兜底转码）
+        var codecInfo = null;
+        if (!that._isSlowStorage(filePath)) {
+            codecInfo = that._detectFlvCodecs(filePath);
+        } else {
+            that._log('_createFlvPlayer: 慢速存储，跳过同步 FLV 编码检测');
+        }
         if (codecInfo) {
             that._log('_createFlvPlayer: FLV 编码检测:', JSON.stringify(codecInfo));
-            if (!codecInfo.videoSupported || !codecInfo.audioSupported) {
-                var msg = '⚠️ FLV 编码不支持: ';
-                var parts = [];
-                if (!codecInfo.videoSupported) parts.push('视频(' + codecInfo.videoCodec + ')');
-                if (!codecInfo.audioSupported) parts.push('音频(' + codecInfo.audioCodec + ')');
-                msg += parts.join(' + ');
-                msg += '。仅支持 H.264 + AAC/MP3，建议转码为 MP4 后播放';
-                that.showToastMsg(msg);
+            // ★ 只有在明确检测到不支持的编码时才拦截；检测不到（none/none）时放行尝试播放
+            var hasUnsupported = false;
+            if (!codecInfo.scanComplete) {
+                that._log('_createFlvPlayer: FLV 编码扫描未完成(' + codecInfo.scannedTags + ' tags, ' + codecInfo.scannedBytes + ' bytes)，放行尝试播放');
+            } else {
+                // 扫描完成但编码不支持 → 自动转码回退（不直接拦截）
+                if (!codecInfo.videoSupported || !codecInfo.audioSupported) {
+                    hasUnsupported = true;
+                }
+            }
+            if (hasUnsupported) {
+                that._log('FLV 编码不支持(' + codecInfo.videoCodec + '/' + codecInfo.audioCodec + ')，启动自动转码...');
+                that._transcodeFlvAndPlay(videoEl, filePath, autoPlay, codecInfo);
                 return;
             }
         }
 
-        var fileUrl = that.toFileUrl(filePath);
+        // ★ 策略变更：FLV 播放优先使用 Blob URL（绕过代理服务器的 fd 消耗）
+        //    mpegts.js 完全支持 Blob URL，而且 Blob 方式不经过 HTTP 层，不会触发 EMFILE
+        //    只有当文件过大或 Blob 失败时才回退到 HTTP 代理
 
+        var flvFileSizeMB = 0;
         try {
-            var player = mpegts.createPlayer({
-                type: 'flv',
-                url: fileUrl
-            }, {
-                enableWorker: false,
-                enableStashBuffer: true,
-                stashInitialSize: 1024 * 384,
-                lazyLoadMaxDuration: 300,
-                seekType: 'range',
-                autoCleanupSourceBuffer: true
-            });
+            var _fs = require('fs');
+            var _fstat = _fs.statSync(filePath);
+            flvFileSizeMB = _fstat.size / 1024 / 1024;
+        } catch(_) {}
 
-            player.attachMediaElement(videoEl);
-            player.load();
+        // ★ 内部函数：用给定 URL 创建 FLV 播放器（支持 Blob/代理两种 URL）
+        function createFlvPlayerWithUrl(flvUrl, source) {
+            console.warn('[LocalBrowse] _createFlvPlayer: 使用 ' + source + ' (' + (flvFileSizeMB || '?') + 'MB)');
+            try {
+                var player = mpegts.createPlayer({
+                    type: 'flv',
+                    url: flvUrl
+                }, {
+                    enableWorker: false,
+                    enableStashBuffer: true,
+                    stashInitialSize: 1024 * 384,
+                    lazyLoadMaxDuration: 300,
+                    seekType: 'range',
+                    autoCleanupSourceBuffer: true
+                });
 
-            if (autoPlay) {
-                var doPlay = function() {
-                    player.play().catch(function(err) {
-                        that._log('FLV 自动播放失败:', err.message || err);
-                        videoEl.muted = true;
-                        player.play().then(function() {
-                            setTimeout(function() { videoEl.muted = false; }, 300);
-                        }).catch(function() {});
-                    });
-                };
-                // 等待足够数据后再播放
-                videoEl.addEventListener('canplay', doPlay, { once: true });
-                // 超时保底：3 秒后强制尝试播放
-                if (that._flvPlayTimer) { clearTimeout(that._flvPlayTimer); that._flvPlayTimer = null; }
-                that._flvPlayTimer = setTimeout(doPlay, 3000);
-            }
+                player.attachMediaElement(videoEl);
+                player.load();
 
-            player.on(mpegts.Events.ERROR, function(errType, errDetail, errInfo) {
-                that._error('FLV 播放错误:', errType, errDetail);
-                if (errType === mpegts.ErrorTypes.NETWORK_ERROR) {
-                    // file:// 可能不支持，尝试 fs 读取回退
-                    that._log('FLV 网络错误，尝试 fs 读取回退...');
-                    that._playFlvViaFs(videoEl, filePath, autoPlay, player);
-                } else if (errType === mpegts.ErrorTypes.MEDIA_ERROR) {
-                    that.showToastMsg('⚠️ FLV 媒体解码失败，格式可能不支持');
+                // ★ 时间戳跳转：缓冲区感知的 seek（支持 mpegts.js 流式播放）
+                if (startTime && startTime > 0) {
+                    var _cfpSeekRetries = 0;
+                    var _cfpSeekMax = 60;
+                    var _cfpSeekTimer = null;
+                    function doCfpSeek() {
+                        _cfpSeekRetries++;
+                        if (videoEl.buffered && videoEl.buffered.length > 0) {
+                            var bufEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+                            if (bufEnd >= startTime) {
+                                videoEl.currentTime = startTime;
+                                console.log('[LocalBrowse] _createFlvPlayer seek 成功:', startTime, 's');
+                                return;
+                            }
+                        }
+                        if (videoEl.duration && isFinite(videoEl.duration) && startTime < videoEl.duration) {
+                            videoEl.currentTime = startTime;
+                            console.log('[LocalBrowse] _createFlvPlayer seek (duration 已知):', startTime, 's');
+                            return;
+                        }
+                        if (_cfpSeekRetries < _cfpSeekMax) {
+                            _cfpSeekTimer = setTimeout(doCfpSeek, 500);
+                        } else {
+                            console.warn('[LocalBrowse] _createFlvPlayer seek 超时 (target=' + startTime + 's)');
+                        }
+                    }
+                    videoEl.addEventListener('canplay', function onCfpSeekStart() {
+                        videoEl.removeEventListener('canplay', onCfpSeekStart);
+                        doCfpSeek();
+                    }, { once: true });
                 }
-            });
 
-            that._flvPlayer = player;
-            that._log('_createFlvPlayer: FLV 播放器创建成功');
-        } catch(e) {
-            that._error('_createFlvPlayer: 创建 FLV 播放器失败:', e.message || e);
-            that.showToastMsg('⚠️ FLV 播放器创建失败: ' + (e.message || '未知错误'));
+                if (autoPlay) {
+                    var doPlay = function() {
+                        player.play().catch(function(err) {
+                            that._log('FLV 自动播放失败:', err.message || err);
+                            videoEl.muted = true;
+                            player.play().then(function() {
+                                setTimeout(function() { videoEl.muted = false; }, 300);
+                            }).catch(function() {});
+                        });
+                    };
+                    videoEl.addEventListener('canplay', doPlay, { once: true });
+                    if (that._flvPlayTimer) { clearTimeout(that._flvPlayTimer); that._flvPlayTimer = null; }
+                    that._flvPlayTimer = setTimeout(doPlay, 3000);
+                }
+
+                player.on(mpegts.Events.ERROR, function(errType, errDetail, errInfo) {
+                    that._error('FLV(' + source + ') 播放错误:', errType, errDetail);
+                    if (source === 'Blob') {
+                        // ★ Blob 失败 → 回退到代理
+                        that._log('FLV(Blob) 失败，回退到 HTTP 代理...');
+                        try { player.destroy(); } catch(_) {}
+                        that._flvPlayer = null;
+                        var proxyUrl2 = that.toProxyUrl(filePath);
+                        createFlvPlayerWithUrl(proxyUrl2, 'Proxy(Fallback)');
+                    } else {
+                        // ★ 代理也失败 → 回退到 fs+Blob（_playFlvViaFs）
+                        that._log('FLV(Proxy) 也失败，尝试 _playFlvViaFs...');
+                        that._playFlvViaFs(videoEl, filePath, autoPlay, player);
+                    }
+                });
+
+                that._flvPlayer = player;
+                that._log('_createFlvPlayer: FLV(' + source + ') 播放器创建成功');
+                return true;
+            } catch(e) {
+                that._error('_createFlvPlayer(' + source + '):', e.message || e);
+                return false;
+            }
+        }
+
+        // ★ 主路径：根据文件大小选择策略
+        if (flvFileSizeMB > 0 && flvFileSizeMB <= 300) {
+            // 中小文件：读取为 Blob，零 fd 消耗
+            try {
+                var flvFs = require('fs');
+                var flvBuf = flvFs.readFileSync(filePath);
+                var flvBlob = new Blob([flvBuf], { type: 'video/x-flv' });
+                var flvBlobUrl = URL.createObjectURL(flvBlob);
+                that._flvBlobUrl = flvBlobUrl;  // 保存引用以便释放
+                if (!createFlvPlayerWithUrl(flvBlobUrl, 'Blob')) {
+                    // Blob 创建播放器失败 → 回退到代理
+                    var proxyUrl = that.toProxyUrl(filePath);
+                    createFlvPlayerWithUrl(proxyUrl, 'Proxy-Fallback');
+                }
+            } catch(readErr) {
+                // ★ EMFILE 或其他文件读取错误 → 回退到代理
+                that._error('_createFlvPlayer: Blob 读取失败:', readErr.message);
+                var proxyUrl3 = that.toProxyUrl(filePath);
+                createFlvPlayerWithUrl(proxyUrl3, 'Proxy-EMFILE-Fallback');
+            }
+        } else {
+            // 大文件或未知大小：走代理（Range seek 更高效）
+            var fileUrl = that.toProxyUrl(filePath);
+            createFlvPlayerWithUrl(fileUrl, 'Proxy(LargeFile)');
         }
     }
 
@@ -7254,7 +9505,27 @@ class LocalBrowsePlugin extends Plugin {
 
         try {
             var fs = require('fs');
-            var buf = fs.readFileSync(filePath);
+            // ★ 分块读取文件，避免 2GB+ 文件直接 readFileSync 吃满内存
+            // 先获取文件大小，然后分块（每块 64MB）读取到 Buffer 数组
+            var stat = fs.statSync(filePath);
+            var fileSize = stat.size;
+            var CHUNK_SIZE = 64 * 1024 * 1024; // 64MB per chunk
+            var chunks = [];
+            var totalLen = 0;
+            var fd = fs.openSync(filePath, 'r');
+            try {
+                var readBuf = Buffer.alloc(CHUNK_SIZE);
+                while (totalLen < fileSize) {
+                    var toRead = Math.min(CHUNK_SIZE, fileSize - totalLen);
+                    var rd = fs.readSync(fd, readBuf, 0, toRead, totalLen);
+                    if (rd <= 0) break;
+                    chunks.push(Buffer.from(readBuf.slice(0, rd)));
+                    totalLen += rd;
+                }
+            } finally {
+                fs.closeSync(fd);
+            }
+            var buf = Buffer.concat(chunks, totalLen);
             var blob = new Blob([buf], { type: 'video/x-flv' });
             var blobUrl = URL.createObjectURL(blob);
             // 保存引用以便后续释放
@@ -7290,7 +9561,45 @@ class LocalBrowsePlugin extends Plugin {
 
             player.on(mpegts.Events.ERROR, function(errType, errDetail) {
                 that._error('FLV(Blob) 播放错误:', errType, errDetail);
-                that.showToastMsg('⚠️ FLV 播放失败，格式可能不支持');
+                // ★ 终极回退：尝试原生 HTML5 <video> 直接播放（不走 mpegts.js）
+                // 部分浏览器（尤其是 Chrome）对简单编码的 FLV 有一定原生支持
+                that._log('FLV mpegts.js 全部失败，尝试原生 HTML5 video 回退...');
+                try {
+                    if (player) { try { player.destroy(); } catch(_) {} }
+                    that._flvPlayer = null;
+                    // 用已有的 Blob URL 或重新创建
+                    var nativeUrl = that._flvBlobUrl;
+                    if (!nativeUrl) {
+                        var fs = require('fs');
+                        var stat = fs.statSync(filePath);
+                        var fbuf = Buffer.alloc(Math.min(stat.size, 100 * 1024 * 1024));
+                        var fd2 = fs.openSync(filePath, 'r');
+                        var br = fs.readSync(fd2, fbuf, 0, fbuf.length, 0);
+                        fs.closeSync(fd2);
+                        var nblob = new Blob([fbuf.slice(0, br)], { type: 'video/x-flv' });
+                        nativeUrl = URL.createObjectURL(nblob);
+                        that._flvBlobUrl = nativeUrl;
+                    }
+                    videoEl.removeAttribute('src');
+                    videoEl.load();
+                    videoEl.src = nativeUrl;
+                    if (autoPlay) {
+                        videoEl.play().catch(function(e3) {
+                            videoEl.muted = true;
+                            videoEl.play().catch(function() {});
+                        });
+                    }
+                    videoEl.addEventListener('error', function() {
+                        var codecHint = '';
+                        try { var _ci = that._detectFlvCodecs(filePath); if (_ci) codecHint = ' [视频:' + _ci.videoCodec + ' 音频:' + _ci.audioCodec + ( !_ci.scanComplete ? ' 扫描未完成' : '' ) + ']'; } catch(_) {}
+                        that.showToastMsg('⚠️ FLV 所有播放方式均失败' + codecHint + '，建议用 ffmpeg 转码: ffmpeg -i input.flv -c copy output.mp4');
+                    }, { once: true });
+                    that._log('FLV 原生 HTML5 video 回退成功');
+                } catch(nativeErr) {
+                    var codecHint = '';
+                    try { var _ci = that._detectFlvCodecs(filePath); if (_ci) codecHint = ' [视频:' + _ci.videoCodec + ' 音频:' + _ci.audioCodec + ']'; } catch(_) {}
+                    that.showToastMsg('⚠️ FLV 播放失败' + codecHint + '，格式可能不支持（仅支持 H.264+AAC/MP3）');
+                }
             });
 
             that._flvPlayer = player;
@@ -7298,6 +9607,1345 @@ class LocalBrowsePlugin extends Plugin {
         } catch(e) {
             that._error('_playFlvViaFs: 回退方案也失败:', e.message || e);
             that.showToastMsg('⚠️ FLV 播放失败: ' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * 自动转码不支持的视频为 MP4，然后用原生 HTML5 video 播放
+     * 触发场景：(1) FLV 检测到 H.263/VP6/H.265 等不支持编码 (2) AVI/MKV/WMV 等浏览器原生播放失败
+     * 转码结果缓存到临时目录，避免重复转码
+     * @param {HTMLVideoElement} videoEl - 视频 DOM 元素
+     * @param {string} filePath - 视频文件路径
+     * @param {boolean} autoPlay - 是否自动播放
+     * @param {object} codecInfo - 编码检测结果 { videoCodec, audioCodec, videoSupported, audioSupported, scanComplete }
+     */
+    _transcodeFlvAndPlay(videoEl, filePath, autoPlay, codecInfo) {
+        var that = this;
+        var fs = require('fs');
+        var path = require('path');
+        var { spawn, execSync } = require('child_process');
+        var os = require('os');
+
+        // ★ 播放器已关闭时不再启动转码
+        if (that._videoPlayerClosed) {
+            that._log('_transcodeFlvAndPlay: 播放器已关闭，跳过转码');
+            return;
+        }
+
+
+        /**
+         * 显示转码进度 — 简洁内联样式：仅在控制栏显示 "转码中 XX%"
+         */
+        function showTranscodeProgress(phase, pct, extra) {
+            var statusEl = document.getElementById('cd-video-transcode-status');
+            if (!statusEl) return;
+            statusEl.textContent = '转码中 ' + Math.min(100, Math.round(pct)) + '%';
+            statusEl.style.display = 'inline';
+        }
+
+        function hideTranscodeOverlay() {
+            var statusEl = document.getElementById('cd-video-transcode-status');
+            if (statusEl) statusEl.style.display = 'none';
+        }
+
+        // ★ 缓存目录：基于文件大小+修改时间的哈希，确保源文件变化时重新转码
+        // 注意：此方法同时服务 FLV 和其他格式（AVI/MKV/WMV 等），缓存目录名保持兼容
+        try {
+            // ★★★ 伴随 MP4 缓存检查（原视频同目录下的 .ext.transcoded.mp4，永久缓存）★★★
+            var sidecarMp4 = filePath + '.transcoded.mp4';
+            if (fs.existsSync(sidecarMp4)) {
+                var scStat = fs.statSync(sidecarMp4);
+                if (scStat.size > 1024) {
+                    // ★ 验证 MP4 文件头（防止转码中断残留的不完整文件导致浏览器卡死）
+                    var scMp4Valid = true;
+                    try {
+                        var scFd = fs.openSync(sidecarMp4, 'r');
+                        var scBuf = Buffer.alloc(8);
+                        fs.readSync(scFd, scBuf, 0, 8, 0);
+                        fs.closeSync(scFd);
+                        if (scBuf.slice(4, 8).toString() !== 'ftyp') {
+                            that._log('_transcodeFlvAndPlay: 伴随缓存 MP4 头无效，删除并重新转码');
+                            try { fs.unlinkSync(sidecarMp4); } catch(_) {}
+                            scMp4Valid = false;
+                        }
+                    } catch(_) { scMp4Valid = false; }
+                    if (scMp4Valid) {
+                        that._log('_transcodeFlvAndPlay: 伴随缓存命中 → ' + sidecarMp4 + ' (' + (scStat.size / 1024 / 1024).toFixed(1) + 'MB)');
+                        hideTranscodeOverlay();
+                        that._playNativeVideo(videoEl, sidecarMp4, autoPlay);
+                        return;
+                    }
+                }
+            }
+
+            // ★ 使用同目录伴随路径（不再使用 temp 缓存目录）
+            var cachedMp4 = sidecarMp4;
+
+            that._log('_transcodeFlvAndPlay: 开始 ffmpeg 转码:', filePath, '→', cachedMp4);
+
+            // ★★★ codecInfo 补全：当 videoCodec/container 为空时，自动探测 ★★★
+            //    场景：快速路径失败后传入 scanComplete:false + videoCodec:''
+            //    必须知道真实编码才能选择正确的转码路径（FLV流式拷贝 vs 重编码）
+            if (!codecInfo.videoCodec || !codecInfo.container) {
+                that._log('_transcodeFlvAndPlay: codecInfo 不完整，自动探测...');
+                var probedInfo = that._probeVideoCodecs(filePath);
+                if (probedInfo) {
+                    if (!codecInfo.videoCodec) codecInfo.videoCodec = probedInfo.videoCodec || '';
+                    if (!codecInfo.audioCodec || codecInfo.audioCodec === 'unknown') codecInfo.audioCodec = probedInfo.audioCodec || '';
+                    if (!codecInfo.container) codecInfo.container = probedInfo.container || '';
+                    that._log('_transcodeFlvAndPlay: 探测结果 video=' + codecInfo.videoCodec + ' audio=' + codecInfo.audioCodec + ' container=' + codecInfo.container);
+                } else {
+                    // ffprobe 不可用，从扩展名猜测
+                    var extGuess = path.extname(filePath).toLowerCase().replace('.', '');
+                    if (!codecInfo.container) codecInfo.container = extGuess;
+                    if (!codecInfo.videoCodec) codecInfo.videoCodec = extGuess === 'ts' ? 'h264' : extGuess; // .ts 大概率是 H.264
+                    that._log('_transcodeFlvAndPlay: ffprobe 不可用，从扩展名猜测: container=' + codecInfo.container + ' video=' + codecInfo.videoCodec);
+                }
+                codecInfo.scanComplete = true;
+            }
+
+            // ★ 智能判断：是否需要重编码（而非简单的容器格式转换 -c copy）
+            //    以下情况直接跳过 -c copy，进入重编码模式：
+            //    a) 编码明确为 HEVC/H.265/MPEG4 等（浏览器不一定有解码器）
+            //    b) 源容器为 .ts/.m2ts（ts→mp4 流复制常产生浏览器不兼容的 MP4 结构）
+            var vCodec = (codecInfo.videoCodec || '').toLowerCase();
+            var container = (codecInfo.container || '').toLowerCase();
+
+            // ★ 安全网：如果 container 为空，从文件扩展名推断（修复错误回退路径丢失 container 的 bug）
+            if (!container && filePath) {
+                try {
+                    var _pathExt = require('path').extname(filePath).toLowerCase().replace('.', '');
+                    if (_pathExt) { container = _pathExt; }
+                } catch(_) {}
+            }
+            var needDirectReencode = false;
+            var unsupportedForCopy = ['hevc', 'h265', 'mpeg4', 'msmpeg4v3', 'xvid', 'divx', 'wmv3', 'wmv2', 'rv40', 'h263', 'mpeg1video', 'mpeg2video'];
+            if (unsupportedForCopy.indexOf(vCodec) >= 0) {
+                needDirectReencode = true;
+                that._log('_transcodeFlvAndPlay: 编码 ' + vCodec + ' 不适合 -c copy，直接走重编码');
+            }
+            // ★ .ts/.m2ts 容器特殊处理：
+            //    H.264/VP8/VP9 等原生编码 → 走 FLV 流式拷贝（-c copy -f flv，边拷边播，零重编码）
+            //    HEVC/H.265 等非原生编码 → 仍走重编码（需要转码为 H.264）
+            var _nativeTsCodecs = ['h264', 'vp8', 'vp9', 'av1', 'theora'];
+            if ((container === 'ts' || container === 'm2ts') && _nativeTsCodecs.indexOf(vCodec) >= 0) {
+                // ★ 原生编码的 .ts 文件：FLV 流式拷贝（最快路径）
+                that._log('_transcodeFlvAndPlay: 源容器=' + container + ' 编码=' + vCodec + '，走 FLV 流式拷贝（边拷边播）');
+                that._transcodeFlvStreamCopy(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                return;
+            }
+            if (container === 'ts' || container === 'm2ts') {
+                needDirectReencode = true;
+                that._log('_transcodeFlvAndPlay: 源容器=' + container + ' 非原生编码，跳过 -c copy 直接重编码');
+            }
+
+            if (needDirectReencode) {
+                // ★ 跳过 -c copy，直接进入重编码模式
+                that._log('_transcodeFlvAndPlay: 跳过 -c copy，直接调用 _transcodeFlvReencode');
+                that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                return;  // ★ 重要：这里 return，不再执行后面的 -c copy 逻辑
+            }
+
+            // ★ 使用 -c copy 流复制（极快，只改容器格式），生成普通 MP4（faststart 让 moov 在前）
+            // 等转码完成后再播放，避免 fMP4 格式不兼容和 EMFILE 问题
+            var ffmpegArgs = [
+                '-i', filePath,
+                '-c', 'copy',
+                '-movflags', 'faststart',
+                '-y',
+                cachedMp4
+            ];
+
+            var startTime = Date.now();
+            var srcFormat = codecInfo.videoCodec || path.extname(filePath).replace('.', '').toUpperCase() || '视频';
+            showTranscodeProgress(srcFormat + ' 转码中 (→MP4)', 10, '准备中...');
+
+            // ★ 使用 spawn 替代 execFile，以便实时读取 stderr 获取进度
+            var ffmpegProc = spawn('ffmpeg', ffmpegArgs, {
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+            that._flvTranscodeProc = ffmpegProc; // 保存引用以便关闭时能终止
+
+            var copyDone = false;
+
+            // 解析 ffmpeg stderr 获取进度
+            var stderrBuf2 = '';
+            ffmpegProc.stderr.on('data', function(data) {
+                stderrBuf2 += data.toString();
+                var timeMatch = stderrBuf2.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
+                if (timeMatch && timeMatch.length > 0) {
+                    var lastTime = timeMatch[timeMatch.length - 1];
+                    var m = lastTime.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+                    if (m) {
+                        var secs = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+                        var sizePct = 50; // -c copy 无总时长信息，用固定值
+                        showTranscodeProgress(srcFormat + ' 转码中 (→MP4)', Math.round(sizePct), secs.toFixed(0) + 's 已处理');
+                    }
+                }
+            });
+
+            ffmpegProc.on('close', function(code) {
+                // ★ 视频已切换 → 静默退出旧转码回调
+                if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                    that._log('_transcodeFlvAndPlay(-c copy): 视频已切换');
+                    // 仅失败时删除缓存（成功转码产物是永久缓存，下次可直接复用）
+                    if (code !== 0) {
+                        try { if (require('fs').existsSync(cachedMp4)) require('fs').unlinkSync(cachedMp4); } catch(_) {}
+                    }
+                    return;
+                }
+                that._flvTranscodeProc = null;
+                if (copyDone) return;
+                copyDone = true;
+                // ★ 进程被外部 kill（如切换视频）→ 静默退出，不弹错误
+                if (code === null) return;
+                var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+                if (code !== 0) {
+                    // ★ 提取 ffmpeg stderr 最后几行用于诊断
+                    var stderrTail = '';
+                    if (stderrBuf2) {
+                        var errLines = stderrBuf2.split('\n').filter(function(l) { return l.trim(); });
+                        stderrTail = errLines.slice(-5).join(' | ');
+                    }
+                    that._error('_transcodeFlvAndPlay: ffmpeg -c copy 失败(', elapsed + 's), exit code:', code, ', stderr:', stderrTail);
+                    try { if (fs.existsSync(cachedMp4)) fs.unlinkSync(cachedMp4); } catch(_) {}
+                    that._log('尝试重编码模式...');
+                    that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                    return;
+                }
+                // 检查输出文件是否有效
+                try {
+                    var outStat = fs.statSync(cachedMp4);
+                    if (outStat.size < 1024) {
+                        that._error('_transcodeFlvAndPlay: 输出文件过小(' + outStat.size + ' bytes)，尝试重编码');
+                        try { if (fs.existsSync(cachedMp4)) fs.unlinkSync(cachedMp4); } catch(_) {}
+                        that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                        return;
+                    }
+                    // ★ 验证 -c copy 输出是否为有效 MP4（检查文件头 ftyp box）
+                    var needsReencode = false;
+                    try {
+                        var fd = fs.openSync(cachedMp4, 'r');
+                        var buf = Buffer.alloc(8);
+                        fs.readSync(fd, buf, 0, 8, 0);
+                        fs.closeSync(fd);
+                        // MP4 文件以 ftyp box 开头：前4字节是大小，后4字节是 'ftyp'
+                        var hasFtyp = buf.slice(4, 8).toString() === 'ftyp';
+                        if (!hasFtyp) {
+                            that._log('_transcodeFlvAndPlay: -c copy 输出文件头无效（非 MP4），走重编码');
+                            needsReencode = true;
+                        }
+                    } catch(headErr) {
+                        that._log('_transcodeFlvAndPlay: 读取文件头失败，保守起见走重编码:', headErr.message);
+                        needsReencode = true;
+                    }
+
+                    // ★ 检查 -c copy 输出的视频编码是否浏览器支持
+                    // -c copy 只换容器不换编码，XVID/MPEG-4 Visual 等编码虽然能放进 MP4 但浏览器解码不了 → 黑屏有声音
+                    if (!needsReencode) {
+                        try {
+                            var probeCopy = execSync('ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "' + cachedMp4 + '"', { timeout: 5000, encoding: 'utf8' });
+                            var vCodecName = probeCopy.trim().toLowerCase();
+                            that._log('_transcodeFlvAndPlay: -c copy 输出视频编码 =', vCodecName);
+                            // 浏览器原生确定支持的编码（不需要系统扩展即可播放）
+                            var supportedCodecs = ['h264', 'vp8', 'vp9', 'av1', 'theora'];
+                            if (!supportedCodecs.some(function(c) { return vCodecName.indexOf(c) >= 0; })) {
+                                that._log('_transcodeFlvAndPlay: 视频编码 ' + vCodecName + ' 浏览器不支持，需要重编码');
+                                needsReencode = true;
+                            }
+                        } catch(probeErr) {
+                            that._log('_transcodeFlvAndPlay: ffprobe 检查编码失败，保守起见走重编码:', probeErr.message);
+                            needsReencode = true;
+                        }
+                    }
+                    if (needsReencode) {
+                        // ★ 编码不支持，删除 copy 产物，走重编码
+                        try { if (fs.existsSync(cachedMp4)) fs.unlinkSync(cachedMp4); } catch(_) {}
+                        that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                        return;
+                    }
+                    showTranscodeProgress('转码完成', 100, '完成！');
+                    that._log('_transcodeFlvAndPlay: 转码完成(', elapsed + 's), 输出:', (outStat.size / 1024 / 1024).toFixed(1) + 'MB');
+
+                    // ★ 转码完成，直接播放（如果播放器未关闭）
+                    setTimeout(function() {
+                        hideTranscodeOverlay();
+                        if (!that._videoPlayerClosed) {
+                            that._playNativeVideo(videoEl, cachedMp4, autoPlay);
+                        } else {
+                            that._log('_transcodeFlvAndPlay: 播放器已关闭，仅保存缓存');
+                        }
+                    }, 100);
+                } catch(e) {
+                    that._error('_transcodeFlvAndPlay: 检查输出失败:', e.message);
+                    try { if (fs.existsSync(cachedMp4)) fs.unlinkSync(cachedMp4); } catch(_) {}
+                    that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4, showTranscodeProgress, hideTranscodeOverlay);
+                }
+            });
+
+            ffmpegProc.on('error', function(err) {
+                that._error('_transcodeFlvAndPlay: ffmpeg 未安装或不可用:', err.message);
+                showTranscodeProgress('ffmpeg 不可用', 0, '请安装 ffmpeg');
+                that.showToastMsg('⚠️ 视频需要转码但 ffmpeg 不可用。请安装 ffmpeg 或手动转换:\nffmpeg -i input.' + (codecInfo.videoCodec || 'video').toLowerCase() + ' -c:v libx264 -preset fast -crf 20 -c:a aac output.mp4');
+            });
+
+        } catch(e) {
+            that._error('_transcodeFlvAndPlay: 准备转码失败:', e.message || e);
+            that.showToastMsg('⚠️ 视频转码失败: ' + (e.message || '未知错误'));
+        }
+    }
+
+    /**
+     * 健壮 -c copy 重试：当源编码已是浏览器原生格式时，用多组 ffmpeg 参数重试 -c copy
+     * 避免 H.264→H.264 等无意义重编码（重编码慢 10 倍+且损失画质）
+     *
+     * 重试策略：
+     *   1. -c copy + faststart（标准方案）
+     *   2. -c copy + faststart + ignore_unknown（忽略未知流）
+     *   3. -c copy + faststart + map 0（显式映射所有流）
+     *   全部失败 → 直接播放原始文件（file://），放弃缓存
+     */
+    _robustCopyAndPlay(videoEl, filePath, autoPlay, codecInfo, outputPath, showProgress, hideProgress) {
+        var that = this;
+        var { spawn, execSync } = require('child_process');
+        var fs = require('fs');
+        var path = require('path');
+
+        var srcFormat = codecInfo.videoCodec || path.extname(filePath).replace('.', '').toUpperCase() || '视频';
+        if (showProgress) showProgress(srcFormat + ' 快速转码中', 20, '-c copy 重试...');
+
+        // 定义多组 ffmpeg 参数（按优先级排序）
+        var attemptSets = [
+            {
+                name: '标准 -c copy',
+                args: ['-i', filePath, '-c', 'copy', '-movflags', 'faststart', '-y', outputPath]
+            },
+            {
+                name: '忽略未知流',
+                args: ['-i', filePath, '-c', 'copy', '-movflags', 'faststart', '-ignore_unknown', '-y', outputPath]
+            },
+            {
+                name: '显式流映射',
+                args: ['-i', filePath, '-map', '0', '-c', 'copy', '-movflags', 'faststart', '-y', outputPath]
+            }
+        ];
+
+        function tryAttempt(index) {
+            if (index >= attemptSets.length) {
+                // ★ 所有 -c copy 都失败了 → 直接播放原始文件，不缓存
+                that._log('_robustCopyAndPlay: 所有 -c copy 重试均失败，直接播放原始文件');
+                if (showProgress) hideProgress();
+                that._playNativeVideo(videoEl, filePath, autoPlay);
+                return;
+            }
+
+            var attempt = attemptSets[index];
+            that._log('_robustCopyAndPlay: 尝试 #' + (index + 1) + ' [' + attempt.name + ']');
+
+            // 清理可能存在的旧输出
+            try { if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath); } catch(_) {}
+
+            var proc = spawn('ffmpeg', attempt.args, { stdio: ['pipe', 'pipe', 'pipe'] });
+            that._flvTranscodeProc = proc;
+
+            var stderrBuf = '';
+            proc.stderr.on('data', function(d) { stderrBuf += d.toString(); });
+
+            proc.on('close', function(code) {
+                // ★ 视频已切换 → 静默退出，不再尝试后续参数组
+                if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                    that._log('_robustCopyAndPlay: 视频已切换，静默退出');
+                    that._flvTranscodeProc = null;
+                    return;
+                }
+                that._flvTranscodeProc = null;
+                if (code === 0) {
+                    // 检查输出是否有效
+                    try {
+                        var stat = fs.statSync(outputPath);
+                        if (stat.size > 1024) {
+                            that._log('_robustCopyAndPlay: [' + attempt.name + '] 成功！输出=' + (stat.size / 1024 / 1024).toFixed(1) + 'MB');
+                            if (showProgress) showProgress('转码完成', 100, '完成！');
+                            setTimeout(function() {
+                                // ★ 确认视频未切换
+                                if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) return;
+                                if (showProgress) hideProgress();
+                                if (!that._videoPlayerClosed) {
+                                    that._playNativeVideo(videoEl, outputPath, autoPlay);
+                                }
+                            }, 100);
+                            return;
+                        }
+                    } catch(e) {}
+                    that._log('_robustCopyAndPlay: [' + attempt.name + '] exit=0 但输出无效，尝试下一组');
+                } else {
+                    that._log('_robustCopyAndPlay: [' + attempt.name + '] 失败 code=' + code);
+                }
+                // 尝试下一组
+                tryAttempt(index + 1);
+            });
+
+            proc.on('error', function(err) {
+                that._flvTranscodeProc = null;
+                that._log('_robustCopyAndPlay: [' + attempt.name + '] 错误:', err.message);
+                tryAttempt(index + 1);
+            });
+        }
+
+        // 从第 0 组开始尝试
+        tryAttempt(0);
+    }
+
+    /**
+     * FLV 流式拷贝：专用于 .ts/.m2ts 容器 + 原生编码（H.264/VP8/VP9）的极速转码方案
+     *
+     * 原理：
+     *   FFmpeg -c copy -f flv（零重编码，仅容器转换 ts→flv）
+     *   → 边写边播（mpegts.js 读取正在写入的 FLV 文件）
+     *   → 拷贝完成后转 MP4 缓存 → 切换原生 file:// 播放
+     *
+     * 对比重编码方案：1~3s vs 30~60s，且无画质损失
+     */
+    _transcodeFlvStreamCopy(videoEl, filePath, autoPlay, codecInfo, cachedMp4Path, showProgress, hideProgress) {
+        var that = this;
+        var { spawn, execSync } = require('child_process');
+        var fs = require('fs');
+        var path = require('path');
+
+        // 输出为 FLV 流式文件
+        var streamingFlvPath = require('path').join(require('os').tmpdir(), 'siyuan-video-transcode', require('path').basename(cachedMp4Path).replace(/\.mp4$/, '.streaming.flv'));
+        // 确保临时目录存在
+        try { require('fs').mkdirSync(require('path').join(require('os').tmpdir(), 'siyuan-video-transcode'), { recursive: true }); } catch(_) {}
+        that._streamingFlvPath = streamingFlvPath;
+
+        // 注册为 growing file
+        if (!that._growingFiles) that._growingFiles = {};
+        var growInfo = {
+            writtenBytes: 0,
+            done: false,
+            estimatedDuration: 0,
+            estimatedTotalSize: 0
+        };
+        that._growingFiles[path.normalize(streamingFlvPath)] = growInfo;
+
+        // 获取视频时长用于进度估算（慢速存储跳过同步 ffprobe，直接走文件大小估算）
+        var videoDuration = 0;
+        if (!that._isSlowStorage(filePath)) {
+            try {
+                var probeOut = execSync('ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + filePath + '"', { timeout: 5000, encoding: 'utf8' });
+                videoDuration = parseFloat(probeOut.trim());
+                if (isNaN(videoDuration) || videoDuration <= 0) videoDuration = 0;
+            } catch(_) {}
+        }
+        if (videoDuration > 0) growInfo.estimatedDuration = videoDuration;
+        that._videoEstimatedDuration = growInfo.estimatedDuration;
+
+        if (showProgress) showProgress('TS→FLV 快速拷贝中', 5, '准备流式拷贝...');
+
+        // ★ 核心：-c copy -f flv（零重编码，仅改容器）
+        var ffmpegArgs = [
+            '-i', filePath,
+            '-c', 'copy',
+            '-f', 'flv',
+            '-y',
+            streamingFlvPath
+        ];
+
+        var startTime = Date.now();
+        var proc = spawn('ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+        that._flvTranscodeProc = proc;
+
+        var copyDone = false;
+        var streamingStarted = false;
+        var stderrBuf = '';
+
+        proc.stderr.on('data', function(data) {
+            stderrBuf += data.toString();
+            // 解析 progress (time= or duration)
+            var timeMatches = stderrBuf.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
+            if (timeMatches && timeMatches.length > 0 && videoDuration > 0) {
+                var last = timeMatches[timeMatches.length - 1];
+                var m = last.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+                if (m) {
+                    var secs = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+                    var pct = Math.min(95, Math.round((secs / videoDuration) * 100));
+                    var elapsed = ((Date.now() - startTime) / 1000).toFixed(0);
+                    growInfo.estimatedDuration = secs;
+                    if (showProgress) showProgress('TS→FLV 拷贝中', pct, elapsed + 's (边拷边播)');
+                }
+            }
+        });
+
+        // ★ 轮询文件大小，低阈值快速启动流式播放（512KB ≈ 1-2 秒视频）
+        that._transcodePollInterval = setInterval(function() {
+            if (copyDone) { clearInterval(that._transcodePollInterval); return; }
+            try {
+                var flvStat = fs.statSync(streamingFlvPath);
+                growInfo.writtenBytes = flvStat.size;
+
+                // ★ 低阈值启动：512KB 就开始播（比重编码的 2MB 早很多）
+                if (!streamingStarted && flvStat.size >= 512 * 1024) {
+                    streamingStarted = true;
+                    that._log('_transcodeFlvStreamCopy: FLV 流式播放启动 (' + (flvStat.size / 1024).toFixed(0) + 'KB)');
+                    that._startFlvStreamingPlayback(videoEl, streamingFlvPath, autoPlay, growInfo);
+                }
+            } catch(_) {}
+        }, 300);  // 300ms 轮询（比重编码的 500ms 更频繁，响应更快）
+
+        proc.on('close', function(code) {
+            // ★ 视频已切换 → 静默退出旧转码回调（防止 Windows 上 kill 产生 code=1 而非 null 导致半拷贝被错误触发）
+            if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                that._log('_transcodeFlvStreamCopy: 视频已切换，静默退出旧转码');
+                try { if (require('fs').existsSync(streamingFlvPath)) require('fs').unlinkSync(streamingFlvPath); } catch(_) {}
+                return;
+            }
+            clearInterval(that._transcodePollInterval);
+            that._flvTranscodeProc = null;
+            if (copyDone) return;
+            copyDone = true;
+            // ★ 进程被外部 kill（如切换视频）→ 静默退出
+            if (code === null) return;
+
+            var playerWasClosed = that._videoPlayerClosed;
+            growInfo.done = true;
+            if (that._growingFiles) {
+                delete that._growingFiles[path.normalize(streamingFlvPath)];
+            }
+
+            var elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+
+            if (code !== 0) {
+                that._log('_transcodeFlvStreamCopy: FLV全拷贝失败 (' + elapsed + 's), exit code:', code);
+                // ★ 第一层回退：视频 copy + 音频转 AAC（常见原因：音频编码不被 FLV 支持，如 AC3/Opus/PCM）
+                //    这仍然非常快（几乎等同于纯拷贝），且保留视频零损
+                that._log('_transcodeFlvStreamCopy: 尝试半拷贝模式（视频copy + 音频→AAC）...');
+                try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+
+                var semiCopyArgs = [
+                    '-i', filePath,
+                    '-c:v', 'copy',           // 视频零损拷贝
+                    '-c:a', 'aac', '-b:a', '128k', '-ar', '44100', '-ac', '2',  // 音频转 AAC
+                    '-f', 'flv',
+                    '-y',
+                    streamingFlvPath
+                ];
+                var semiProc = spawn('ffmpeg', semiCopyArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+                that._flvTranscodeProc = semiProc;
+
+                var scStarted = false;
+                var scStderr = '';
+                that._transcodePollInterval = setInterval(function() {
+                    if (copyDone) { clearInterval(that._transcodePollInterval); return; }
+                    try {
+                        var scStat = fs.statSync(streamingFlvPath);
+                        growInfo.writtenBytes = scStat.size;
+                        if (!scStarted && scStat.size >= 512 * 1024) {
+                            scStarted = true;
+                            that._log('_transcodeFlvStreamCopy: 半拷贝模式流式播放启动 (' + (scStat.size / 1024).toFixed(0) + 'KB)');
+                            if (showProgress) showProgress('TS→FLV 半拷贝中', 10, '视频零损·音频转码中');
+                            that._startFlvStreamingPlayback(videoEl, streamingFlvPath, autoPlay, growInfo);
+                        }
+                        if (scStarted && videoDuration > 0 && scStat.size > 0) {
+                            var estPct = Math.min(90, Math.round((scStat.size / (videoDuration * 500 * 1024)) * 100));
+                            if (showProgress) showProgress('TS→FLV 半拷贝中', estPct, elapsed + 's');
+                        }
+                    } catch(_) {}
+                }, 300);
+
+                semiProc.on('close', function(scCode) {
+                    // ★ 视频已切换 → 静默退出旧转码回调
+                    if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                        that._log('_transcodeFlvStreamCopy(semiProc): 视频已切换，静默退出');
+                        return;
+                    }
+                    clearInterval(that._transcodePollInterval);
+                    that._flvTranscodeProc = null;
+                    if (copyDone) return;
+                    copyDone = true;
+                    // ★ 进程被外部 kill（如切换视频）→ 静默退出
+                    if (scCode === null) return;
+                    growInfo.done = true;
+                    if (that._growingFiles) delete that._growingFiles[path.normalize(streamingFlvPath)];
+
+                    var scElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+                    if (scCode === 0) {
+                        // 半拷贝成功！转换为 MP4 缓存并切换原生播放
+                        that._log('_transcodeFlvStreamCopy: 半拷贝完成！' + scElapsed + 's');
+                        try {
+                            execSync('ffmpeg -i "' + streamingFlvPath + '" -c copy -movflags faststart -y "' + cachedMp4Path + '"', { timeout: 30000, encoding: 'utf8' });
+                        } catch(_) {}
+                        try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                        that._streamingFlvPath = null;
+                        if (showProgress) showProgress('半拷贝完成', 100, scElapsed + 's ✓');
+                        if (!that._videoPlayerClosed) {
+                            setTimeout(function() {
+                                // ★ 再次确认视频未切换（200ms 延迟窗口）
+                                if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) return;
+                                if (hideProgress) hideProgress();
+                                if (!that._videoPlayerClosed) that._switchToFullPlayback(videoEl, cachedMp4Path, autoPlay);
+                            }, 200);
+                        }
+                    } else {
+                        // ★ 第二层回退：全量 FLV 重编码（边转边播，最后手段）
+                        that._log('_transcodeFlvStreamCopy: 半拷贝也失败(exit=' + scCode + ')，回退到FLV流式重编码');
+                        try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                        that._streamingFlvPath = null;
+                        that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4Path, showProgress, hideProgress);
+                    }
+                });
+
+                semiProc.on('error', function(scErr) {
+                    clearInterval(that._transcodePollInterval);
+                    that._flvTranscodeProc = null;
+                    that._log('_transcodeFlvStreamCopy: 半拷贝 ffmpeg 启动错误:', scErr.message);
+                    // 最终回退到重编码
+                    try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                    that._streamingFlvPath = null;
+                    that._transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, cachedMp4Path, showProgress, hideProgress);
+                });
+
+                return; // ★ 异步处理，不执行后面的正常完成逻辑
+            }
+
+            // 验证输出
+            try {
+                var flvStat = fs.statSync(streamingFlvPath);
+                if (flvStat.size < 1024) {
+                    that._log('_transcodeFlvStreamCopy: 输出无效 (' + flvStat.size + ' bytes)');
+                    if (hideProgress) hideProgress();
+                    try { fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                    return;
+                }
+                growInfo.writtenBytes = flvStat.size;
+                that._log('_transcodeFlvStreamCopy: 拷贝完成！' + elapsed + 's, 输出=' + (flvStat.size / 1024 / 1024).toFixed(1) + 'MB');
+            } catch(_) {
+                if (hideProgress) hideProgress();
+                return;
+            }
+
+            if (showProgress) showProgress('拷贝完成', 100, elapsed + 's ✓');
+
+            // ★ 转换为 MP4 缓存（供下次直接 file:// 播放）
+            that._log('_transcodeFlvStreamCopy: 转换 FLV→MP4 缓存...');
+            try {
+                execSync('ffmpeg -i "' + streamingFlvPath + '" -c copy -movflags faststart -y "' + cachedMp4Path + '"', { timeout: 30000, encoding: 'utf8' });
+                that._log('_transcodeFlvStreamCopy: MP4 缓存已保存: ' + cachedMp4Path);
+            } catch(e) {
+                that._log('_transcodeFLvStreamCopy: FLV→MP4 缓存失败（不影响当前播放）');
+            }
+
+            // 清理临时 FLV
+            try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+            that._streamingFlvPath = null;
+
+            // 切换到原生 MP4 播放
+            if (!playerWasClosed && !that._videoPlayerClosed) {
+                setTimeout(function() {
+                    if (hideProgress) hideProgress();
+                    if (!that._videoPlayerClosed) {
+                        that._switchToFullPlayback(videoEl, cachedMp4Path, autoPlay);
+                    }
+                }, 200);
+            } else {
+                if (hideProgress) hideProgress();
+            }
+        });
+
+        proc.on('error', function(err) {
+            that._flvTranscodeProc = null;
+            clearInterval(that._transcodePollInterval);
+            that._log('_transcodeFlvStreamCopy: ffmpeg 启动错误:', err.message);
+            if (showProgress) showProgress('错误', 0, err.message);
+        });
+    }
+
+    /**
+     * 重编码模式：当 -c copy 无法处理时使用（如 H.263 → H.264）
+     * ★ 边转码边播放：输出 FLV 格式 → mpegts.js 流式播放 → 转码完成后转 MP4 缓存
+     *    FLV 无 moov 头依赖，mpegts.js 可实时读取写入中的 FLV 文件实现边转边播
+     */
+    _transcodeFlvReencode(videoEl, filePath, autoPlay, codecInfo, outputPath, showProgress, hideProgress) {
+        var that = this;
+        var { spawn, execSync } = require('child_process');
+        var fs = require('fs');
+        var path = require('path');
+
+        // ★★★ 关键优化：源编码已是浏览器原生格式时，跳过耗时的重编解码循环！★★★
+        //    H.264→H.264 重编码既慢（50s+）又损质（代际损失），完全无意义
+        //    原因：走到这里说明 -c copy 之前失败了（exit code≠0 / 文件头异常 / 编码检测失败等）
+        //    但这些失败往往是网络抖动或文件临时锁定导致，换一组 ffmpeg 参数重试即可
+        //
+        // ★★ 例外：.ts/.m2ts 源容器不走此优化 ★★
+        //    原因：_robustCopyAndPlay 输出 MP4（非流式，需等全部完成才播）
+        //    而 _transcodeFlvReencode 本身支持 FLV 流式输出（边转边播）
+        //    对 .ts 文件，流式重编码（虽损质但能秒开）优于等待完整拷贝
+        var srcCodec = (codecInfo.videoCodec || '').toLowerCase();
+        var srcContainer = (codecInfo.container || '').toLowerCase();
+        // 从 filePath 补充 container（防止回退路径丢失）
+        if (!srcContainer && filePath) {
+            try { srcContainer = require('path').extname(filePath).toLowerCase().replace('.', ''); } catch(_) {}
+        }
+        var nativeCodecs = ['h264', 'vp8', 'vp9', 'av1', 'theora'];
+        var isTsSource = (srcContainer === 'ts' || srcContainer === 'm2ts' || srcContainer === 'mts');
+        if (nativeCodecs.indexOf(srcCodec) >= 0 && !isTsSource) {
+            that._log('_transcodeFlvReencode: 源编码=' + srcCodec + ' 已是浏览器原生格式（非TS容器），跳过重编码，用健壮 -c copy 重试');
+            that._robustCopyAndPlay(videoEl, filePath, autoPlay, codecInfo, outputPath, showProgress, hideProgress);
+            return;
+        }
+        if (isTsSource && nativeCodecs.indexOf(srcCodec) >= 0) {
+            that._log('_transcodeFlvReencode: TS容器+' + srcCodec + ' 原生编码，FLV流式拷贝已失败，走流式重编码(保留边转边播)');
+        }
+
+        // ★ 获取视频真实时长用于进度估算（优先用 ffprobe，回退用文件大小估算）
+        var videoDuration = 0;
+        try {
+            var probeOut = execSync('ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "' + filePath + '"', { timeout: 5000, encoding: 'utf8' });
+            videoDuration = parseFloat(probeOut.trim());
+            if (isNaN(videoDuration) || videoDuration <= 0) videoDuration = 0;
+            if (videoDuration > 0) {
+                that._log('_transcodeFlvReencode: ffprobe 获取时长=' + videoDuration.toFixed(1) + 's');
+                that._videoEstimatedDuration = videoDuration;
+            }
+        } catch(_) {
+            // ffprobe 不可用或获取失败，回退用文件大小粗略估算
+            try {
+                var stat2 = fs.statSync(filePath);
+                videoDuration = stat2.size / (500 * 1024); // 假设 ~500KB/s 码率
+                that._log('_transcodeFlvReencode: ffprobe 不可用，用时大小估算=' + videoDuration.toFixed(1) + 's');
+            } catch(_2) {}
+        }
+
+        // ★ 边转码边播放核心：FFmpeg 输出 FLV 格式
+        //    FLV 格式每个 tag 独立可解析，无 moov 头依赖
+        //    mpegts.js 可实时播放正在写入的 FLV 文件
+        var streamingFlvPath = require('path').join(require('os').tmpdir(), 'siyuan-video-transcode', require('path').basename(outputPath).replace(/\.mp4$/, '.streaming.flv'));
+        // 确保临时目录存在
+        try { require('fs').mkdirSync(require('path').join(require('os').tmpdir(), 'siyuan-video-transcode'), { recursive: true }); } catch(_) {}
+        that._streamingFlvPath = streamingFlvPath;  // 保存引用以便关闭时清理
+
+        // ★ 注册为 growing file（HTTP 代理检测此标记后自动切换流式传输模式）
+        if (!that._growingFiles) that._growingFiles = {};
+        var growInfo = {
+            writtenBytes: 0,
+            done: false,
+            estimatedDuration: 0,
+            estimatedTotalSize: videoDuration > 0 ? Math.round(videoDuration * 500 * 1024) : 0  // 粗略估算
+        };
+        that._growingFiles[path.normalize(streamingFlvPath)] = growInfo;
+
+        // ★ FFmpeg 输出 FLV（-f flv），边写边可播放
+        var reencArgs = [
+            '-i', filePath,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-f', 'flv',
+            '-y',
+            streamingFlvPath
+        ];
+
+        var startTime2 = Date.now();
+        var reencFormat = codecInfo.videoCodec || '视频';
+        // ★★★ 改进进度文案：明确标注"FLV 流式"让用户知道是边转边播 ★★★
+        if (showProgress) showProgress(reencFormat + ' FLV流式转码 (→H.264)', 5, '边转边播准备中...');
+
+        var proc2 = spawn('ffmpeg', reencArgs, {
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        that._flvTranscodeProc = proc2; // 保存引用以便关闭时能终止
+
+        var reencDone = false;
+        var streamingStarted = false;
+        var stderrBuf = '';
+        proc2.stderr.on('data', function(data) {
+            stderrBuf += data.toString();
+            // 解析 time= 来估算进度
+            var timeMatches = stderrBuf.match(/time=(\d+):(\d+):(\d+\.\d+)/g);
+            if (timeMatches && timeMatches.length > 0 && videoDuration > 0) {
+                var last = timeMatches[timeMatches.length - 1];
+                var m = last.match(/time=(\d+):(\d+):(\d+\.\d+)/);
+                if (m) {
+                    var secs = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+                    var pct = Math.min(95, Math.round((secs / videoDuration) * 100));
+                    var elapsed = ((Date.now() - startTime2) / 1000).toFixed(0);
+                    growInfo.estimatedDuration = secs;
+                    if (showProgress) showProgress(reencFormat + ' FLV流式转码 (→H.264)', pct, elapsed + 's');
+                }
+            }
+        });
+
+        // ★ 轮询文件大小，更新 growInfo.writtenBytes，并在数据足够时启动流式播放
+        that._transcodePollInterval = setInterval(function() {
+            if (reencDone) {
+                clearInterval(that._transcodePollInterval);
+                return;
+            }
+            try {
+                var flvStat = fs.statSync(streamingFlvPath);
+                growInfo.writtenBytes = flvStat.size;
+
+                // ★ 数据足够时启动流式播放（≥512KB，约1-2秒视频，快速响应）
+                if (!streamingStarted && flvStat.size >= 512 * 1024) {
+                    streamingStarted = true;
+                    that._log('_transcodeFlvReencode: FLV 流式播放启动 (' + (flvStat.size / 1024 / 1024).toFixed(1) + 'MB 已写入)');
+                    that._startFlvStreamingPlayback(videoEl, streamingFlvPath, autoPlay, growInfo);
+                }
+            } catch(_) {}
+        }, 500);
+
+        proc2.on('close', function(code) {
+            // ★ 视频已切换 → 静默退出旧转码回调（防止切换到新视频后旧转码覆盖播放）
+            if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                that._log('_transcodeFlvReencode: 视频已切换，静默退出旧转码');
+                // 清理残留文件
+                try { if (require('fs').existsSync(streamingFlvPath)) require('fs').unlinkSync(streamingFlvPath); } catch(_) {}
+                return;
+            }
+            clearInterval(that._transcodePollInterval);
+            that._flvTranscodeProc = null;
+            if (reencDone) return;
+            reencDone = true;
+
+            // ★ 播放器已关闭：转码完成但不再播放（仅保存 MP4 缓存）
+            var playerWasClosed = that._videoPlayerClosed;
+
+            // ★ 转码完成：标记文件不再增长
+            growInfo.done = true;
+            // 清理 growing file 注册
+            if (that._growingFiles) {
+                delete that._growingFiles[path.normalize(streamingFlvPath)];
+            }
+
+            var el2 = ((Date.now() - startTime2) / 1000).toFixed(1);
+            if (code !== null && code !== 0) {
+                that._error('_transcodeFlvReencode: 重编码失败(', el2 + 's), exit code:', code);
+                if (showProgress) showProgress('转码失败', 0, '错误代码 ' + code);
+                setTimeout(function() {
+                    if (hideProgress) hideProgress();
+                    that.showToastMsg('⚠️ 视频重编码失败 (exit ' + code + ')');
+                }, 2000);
+                // 清理临时 FLV
+                try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                return;
+            }
+
+            // 验证 FLV 输出
+            try {
+                var flvStat = fs.statSync(streamingFlvPath);
+                if (flvStat.size < 1024) {
+                    if (hideProgress) hideProgress();
+                    that.showToastMsg('⚠️ 视频重编码输出无效');
+                    try { fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                    return;
+                }
+                growInfo.writtenBytes = flvStat.size;
+            } catch(_) {
+                if (hideProgress) hideProgress();
+                that.showToastMsg('⚠️ 视频重编码输出文件不存在');
+                return;
+            }
+
+            that._log('_transcodeFlvReencode: FLV 转码完成(', el2 + 's, ' + (flvStat.size / 1024 / 1024).toFixed(1) + 'MB)');
+            if (showProgress) showProgress('保存缓存中', 98, '→MP4');
+
+            // ★ FLV → MP4 缓存转换（-c copy 仅容器格式转换，极快）
+            var cacheProc = spawn('ffmpeg', [
+                '-i', streamingFlvPath,
+                '-c', 'copy',
+                '-movflags', 'faststart',
+                '-y',
+                outputPath
+            ], { stdio: 'pipe' });
+
+            cacheProc.on('close', function(cacheCode) {
+                // ★ 视频已切换 → 仅清理临时 FLV（MP4 缓存已由 ffmpeg 写入磁盘，下次可直接复用）
+                if (that._videoCurrentPath && that._videoCurrentPath.split('?')[0] !== filePath) {
+                    that._log('_transcodeFlvReencode(cacheProc): 视频已切换，清理临时文件');
+                    try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                    return;
+                }
+                // 清理临时 FLV
+                try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+
+                if (cacheCode !== 0 || !fs.existsSync(outputPath)) {
+                    that._error('_transcodeFlvReencode: FLV→MP4 缓存转换失败 (code=' + cacheCode + ')');
+                    // 缓存转换失败不影响当前播放，但下次需要重新转码
+                } else {
+                    that._log('_transcodeFlvReencode: MP4 缓存保存完成');
+                }
+
+                if (hideProgress) hideProgress();
+
+                // ★ 播放器已关闭：仅保存缓存，不触发播放
+                if (playerWasClosed) {
+                    that._log('_transcodeFlvReencode: 播放器已关闭，仅保存 MP4 缓存');
+                    return;
+                }
+
+                if (streamingStarted) {
+                    // ★ 已在流式播放 → 切换到 MP4 原生播放（支持完整 seek）
+                    that._log('_transcodeFlvReencode: 转码完成，切换到 MP4 原生播放');
+                    that._switchToFullPlayback(videoEl, outputPath);
+                } else {
+                    // ★ 未启动流式播放（视频太短或转码太快）→ 直接播放 MP4
+                    that._playNativeVideo(videoEl, outputPath, autoPlay);
+                }
+            });
+
+            cacheProc.on('error', function(cacheErr) {
+                that._error('_transcodeFlvReencode: FLV→MP4 缓存转换启动失败:', cacheErr.message);
+                try { if (fs.existsSync(streamingFlvPath)) fs.unlinkSync(streamingFlvPath); } catch(_) {}
+                if (hideProgress) hideProgress();
+                // 即使缓存失败，如果流式播放已启动就让用户继续看
+                if (!streamingStarted) {
+                    that.showToastMsg('⚠️ 视频转码缓存失败');
+                }
+            });
+        });
+
+        proc2.on('error', function(err) {
+            clearInterval(that._transcodePollInterval);
+            that._error('_transcodeFlvReencode: ffmpeg 错误:', err.message);
+            if (showProgress) showProgress('ffmpeg 不可用', 0, err.message);
+            // 清理 growing file 注册
+            if (that._growingFiles) {
+                delete that._growingFiles[path.normalize(streamingFlvPath)];
+            }
+            setTimeout(function() {
+                if (hideProgress) hideProgress();
+                that.showToastMsg('⚠️ ffmpeg 不可用: ' + err.message);
+            }, 2000);
+        });
+    }
+
+    /**
+     * ★ 边转码边播放：使用 mpegts.js 流式播放正在写入的 FLV 文件
+     * FLV 格式无 moov 头依赖，mpegts.js 可通过 HTTP 代理实时读取增长中的文件
+     * @param {HTMLVideoElement} videoEl - 视频 DOM 元素
+     * @param {string} flvPath - 正在写入的 FLV 临时文件路径
+     * @param {boolean} autoPlay - 是否自动播放
+     * @param {object} growInfo - _growingFiles 中的流信息
+     */
+    _startFlvStreamingPlayback(videoEl, flvPath, autoPlay, growInfo) {
+        var that = this;
+        try {
+            // ★ 播放器已关闭时不再启动流式播放
+            if (that._videoPlayerClosed) {
+                that._log('_startFlvStreamingPlayback: 播放器已关闭，跳过');
+                return;
+            }
+            // 清理旧的 mpegts.js 播放器
+            if (that._flvPlayer) {
+                try { that._flvPlayer.destroy(); } catch(_) {}
+                that._flvPlayer = null;
+            }
+
+            // ★ 标记正在流式播放中
+            that._isStreamingPlayback = true;
+            that._streamingVideoEl = videoEl;
+
+            // ★★★ 关键修复：mpegts.js 是动态 CDN 加载的，可能还没加载完 ★★★
+            //    之前直接 return 导致流式播放静默失败（用户看到转码进度但视频不播）
+            if (typeof mpegts === 'undefined') {
+                that._log('_startFlvStreamingPlayback: mpegts.js 尚未加载，开始动态加载...');
+                that._loadMpegts(function() {
+                    that._log('_startFlvStreamingPlayback: mpegts.js 加载完成，重新启动流式播放');
+                    // 重新检查状态后重试
+                    if (that._videoPlayerClosed) return;
+                    if (!mpegts.isSupported()) {
+                        that._log('_startFlvStreamingPlayback: mpegts.js 加载后仍不支持，等待转码完成');
+                        return;
+                    }
+                    // ★ 重试：调用自己重新执行（但跳过 _loadMpegts 检查，因为已加载）
+                    that._startFlvStreamingPlayback(videoEl, flvPath, autoPlay, growInfo);
+                });
+                return;
+            }
+            if (!mpegts.isSupported()) {
+                that._log('_startFlvStreamingPlayback: mpegts.js 已加载但不被浏览器支持，等待转码完成后原生播放');
+                return;
+            }
+
+            // ★ 使用 HTTP 代理 URL（代理检测到 _growingFiles 后自动切换流式传输模式）
+            var proxyUrl = that.toProxyUrl(flvPath);
+
+            // 清理旧的 Blob URL
+            if (that._flvBlobUrl) {
+                try { URL.revokeObjectURL(that._flvBlobUrl); } catch(_) {}
+                that._flvBlobUrl = null;
+            }
+
+            var player = mpegts.createPlayer({
+                type: 'flv',
+                url: proxyUrl
+            }, {
+                enableWorker: false,
+                enableStashBuffer: true,
+                stashInitialSize: 1024 * 384,  // 384KB 初始缓冲
+                lazyLoadMaxDuration: 300,
+                seekType: 'range',
+                autoCleanupSourceBuffer: true
+            });
+
+            player.attachMediaElement(videoEl);
+            player.load();
+
+            // ★ 时间戳跳转（流式播放）— 缓冲到达后再 seek，seek 完成后再 play
+            var flvSeekTime = that._videoPendingSeek;
+            var _flvSeekPlayed = false; // ★ seek 完成后播放标记（防止重复 play）
+            if (flvSeekTime && flvSeekTime > 0) {
+                that._videoPendingSeek = 0;
+                var _flvSeekRetries = 0;
+                var _flvSeekMaxRetries = 60; // 60 × 500ms = 30 秒
+                var _flvSeekTimer = null;
+                function doFlvSeek() {
+                    _flvSeekRetries++;
+                    var seekDone = false;
+                    // 检查缓冲区是否已包含目标时间
+                    if (videoEl.buffered && videoEl.buffered.length > 0) {
+                        var bufEnd = videoEl.buffered.end(videoEl.buffered.length - 1);
+                        if (bufEnd >= flvSeekTime) {
+                            videoEl.currentTime = flvSeekTime;
+                            console.log('[LocalBrowse] mpegts seek 成功:', flvSeekTime, 's (bufferedEnd=' + bufEnd.toFixed(1) + ')');
+                            seekDone = true;
+                        }
+                    }
+                    // duration 已知且 seekTime 在范围内，直接 seek（常规视频）
+                    if (!seekDone && videoEl.duration && isFinite(videoEl.duration) && flvSeekTime < videoEl.duration) {
+                        videoEl.currentTime = flvSeekTime;
+                        console.log('[LocalBrowse] mpegts seek (duration 已知):', flvSeekTime, 's');
+                        seekDone = true;
+                    }
+                    if (seekDone) {
+                        // ★ seek 完成 → 播放
+                        if (autoPlay && !_flvSeekPlayed) {
+                            _flvSeekPlayed = true;
+                            player.play().catch(function() {});
+                        }
+                        return;
+                    }
+                    // 缓冲区还没到，继续等待
+                    if (_flvSeekRetries < _flvSeekMaxRetries) {
+                        _flvSeekTimer = setTimeout(doFlvSeek, 500);
+                    } else {
+                        console.warn('[LocalBrowse] mpegts seek 超时，放弃 (target=' + flvSeekTime + 's)');
+                        // ★ seek 超时也尝试播放
+                        if (autoPlay && !_flvSeekPlayed) {
+                            _flvSeekPlayed = true;
+                            player.play().catch(function() {});
+                        }
+                    }
+                }
+                // canplay 时开始第一次尝试
+                videoEl.addEventListener('canplay', function onFlvSeekStart() {
+                    videoEl.removeEventListener('canplay', onFlvSeekStart);
+                    doFlvSeek();
+                }, { once: true });
+                // ★ seek 超时兜底（8秒）
+                setTimeout(function() {
+                    if (!_flvSeekPlayed && autoPlay) {
+                        that._log('_startFlvStreamingPlayback: seek 8秒超时兜底，尝试播放');
+                        _flvSeekPlayed = true;
+                        player.play().catch(function() {});
+                    }
+                }, 8000);
+            }
+
+            if (autoPlay && !(flvSeekTime && flvSeekTime > 0)) {
+                // 无 seek 目标：canplay 后直接播放
+                var doPlay = function() {
+                    player.play().catch(function(err) {
+                        that._log('流式 FLV 自动播放失败:', err.message || err);
+                        videoEl.muted = true;
+                        player.play().then(function() {
+                            setTimeout(function() { videoEl.muted = false; }, 300);
+                        }).catch(function() {});
+                    });
+                };
+                videoEl.addEventListener('canplay', doPlay, { once: true });
+                // 3秒超时兜底
+                setTimeout(function() {
+                    if (!videoEl.paused) return;
+                    that._log('_startFlvStreamingPlayback: 3秒超时兜底，尝试直接播放');
+                    doPlay();
+                }, 3000);
+            }
+
+            // ★ 处理播放错误
+            player.on(mpegts.Events.ERROR, function(errType, errDetail, errInfo) {
+                that._error('流式 FLV 播放错误:', errType, errDetail);
+                // 不销毁播放器 — 转码可能还在进行，_switchToFullPlayback 完成后会接管
+                // 仅在严重错误时回退
+                if (errType === mpegts.ErrorTypes.NETWORK_ERROR) {
+                    that._log('_startFlvStreamingPlayback: 网络错误，可能是代理问题');
+                }
+            });
+
+            that._flvPlayer = player;
+            that._log('_startFlvStreamingPlayback: mpegts.js 流式播放已启动');
+
+            // ★ 流式播放期间限制 seek 范围（只能 seek 到已转码位置）
+            var seekHandler = function() {
+                if (!growInfo.done && growInfo.estimatedDuration > 0) {
+                    if (videoEl.currentTime > growInfo.estimatedDuration - 1) {
+                        that._log('边转边播: seek 超出已转码范围，回退到 ' + (growInfo.estimatedDuration - 1).toFixed(1) + 's');
+                        videoEl.currentTime = Math.max(0, growInfo.estimatedDuration - 2);
+                    }
+                }
+                if (growInfo.done) {
+                    videoEl.removeEventListener('seeking', seekHandler);
+                }
+            };
+            videoEl.addEventListener('seeking', seekHandler);
+
+        } catch(e) {
+            that._error('_startFlvStreamingPlayback:', e.message || e);
+            that._isStreamingPlayback = false;
+            that._streamingVideoEl = null;
+        }
+    }
+
+    /**
+     * 用原生 HTML5 <video> 播放本地 MP4 文件
+     * 用于转码后的 MP4 缓存播放，统一使用 file:// 协议（零内存拷贝、秒开）
+     */
+    _playNativeVideo(videoEl, mp4Path, autoPlay) {
+        var that = this;
+        try {
+            // ★ 播放器已关闭时不再播放（防止转码完成回调触发）
+            if (that._videoPlayerClosed) {
+                that._log('_playNativeVideo: 播放器已关闭，跳过播放');
+                return;
+            }
+            // 清理旧的 mpegts.js 播放器
+            if (that._flvPlayer) {
+                try { that._flvPlayer.destroy(); } catch(_) {}
+                that._flvPlayer = null;
+            }
+
+            // 先暂停并清除旧 src
+            videoEl.pause();
+            videoEl.removeAttribute('src');
+
+            // ★ 统一使用 file:// 协议（Electron 原生支持，零内存拷贝、零 fd、秒开）
+            that._log('_playNativeVideo: 使用 file:// 协议');
+            videoEl.src = 'file:///' + mp4Path.replace(/\\/g, '/');
+
+            // ★ 时间戳跳转：canplay 后 seek 到目标时间
+            var seekTime = that._videoPendingSeek;
+            if (seekTime && seekTime > 0) {
+                that._videoPendingSeek = 0;
+                videoEl.addEventListener('canplay', function onCanSeek() {
+                    videoEl.removeEventListener('canplay', onCanSeek);
+                    if (seekTime < videoEl.duration) videoEl.currentTime = seekTime;
+                }, { once: true });
+            }
+
+            if (autoPlay) {
+                // ★ 等 canplay 事件再播放，避免 play() interrupted
+                var onCanPlay3 = function() {
+                    videoEl.removeEventListener('canplay', onCanPlay3);
+                    that._autoPlayWithFallback(videoEl, 'MP4(file://)');
+                };
+                videoEl.addEventListener('canplay', onCanPlay3);
+                // 5秒超时兜底
+                setTimeout(function() {
+                    if (!videoEl.paused) return;
+                    videoEl.removeEventListener('canplay', onCanPlay3);
+                    that._log('_playNativeVideo: 5秒超时兜底播放');
+                    that._autoPlayWithFallback(videoEl, 'MP4-timeout');
+                }, 5000);
+            }
+
+        } catch(e) {
+            that._error('_playNativeVideo:', e.message || e);
+            // ★ file:// 失败 → 回退到 HTTP 代理
+            try {
+                videoEl.src = that.toProxyUrl(mp4Path);
+                if (autoPlay) {
+                    that._autoPlayWithFallback(videoEl, 'MP4(Proxy-Fallback)');
+                }
+            } catch(e2) {
+                that.showToastMsg('⚠️ 播放失败: ' + (e2.message || ''));
+            }
+        }
+    }
+
+    /**
+     * 边转码边播放：当 ffmpeg 已输出足够数据时，开始流式播放
+     * 使用 fragmented MP4 格式，浏览器可以在文件未写完时播放
+     * @param {HTMLVideoElement} videoEl - 视频 DOM 元素
+     * @param {string} mp4Path - 正在写入的 MP4 临时文件路径
+     * @param {boolean} autoPlay - 是否自动播放
+     * @param {object} growInfo - _growingFiles 中的流信息
+     */
+    _startStreamingPlayback(videoEl, mp4Path, autoPlay, growInfo) {
+        var that = this;
+        try {
+            // 清理旧的 mpegts.js 播放器
+            if (that._flvPlayer) {
+                try { that._flvPlayer.destroy(); } catch(_) {}
+                that._flvPlayer = null;
+            }
+
+            // ★ 防重入：标记正在流式播放中，防止 error 监听器等重复触发转码
+            that._isStreamingPlayback = true;
+            that._streamingVideoEl = videoEl;
+
+            // ★ 走 HTTP 代理的流式模式（代理会检测 _growingFiles 自动切换）
+            var proxyUrl = that.toProxyUrl(mp4Path);
+
+            // ★ 设置新 src：先暂停 → 清除旧 src → 设置新 src
+            //    注意：不调用 load()，避免触发两次加载导致 play() interrupt
+            videoEl.pause();
+            videoEl.removeAttribute('src');
+            videoEl.src = proxyUrl;
+
+            if (autoPlay) {
+                // ★ 关键修复：不再立即调用 play()！
+                //    Chrome 在设置 src 后需要时间处理内部状态（abort 旧 load → 开始新 load）
+                //    如果在状态切换期间调用 play()，Chrome 会报 "play() interrupted by new load request"
+                //
+                //    新策略：使用 loadeddata 事件驱动播放
+                //    loadeddata 表示浏览器已加载到足够渲染第一帧的数据，此时调用 play() 是安全的
+                //    同时设置超时兜底：如果 loadeddata 迟迟不触发（如文件数据不足），3秒后尝试直接 play()
+                var playScheduled = false;
+                var schedulePlay = function(reason) {
+                    if (playScheduled) return;
+                    playScheduled = true;
+                    that._log('_startStreamingPlayback: 触发播放 (' + reason + ')');
+                    that._autoPlayWithFallback(videoEl, 'StreamingPlayback');
+                };
+
+                // 方案A（主路径）：等待 loadeddata 事件 — 浏览器确认数据就绪
+                videoEl.addEventListener('loadeddata', function onLoadedData() {
+                    videoEl.removeEventListener('loadeddata', onLoadedData);
+                    schedulePlay('loadeddata事件');
+                }, { once: true });
+
+                // 方案B（兜底）：3秒超时 — 防止 loadeddata 不触发的情况
+                setTimeout(function() {
+                    schedulePlay('3s超时兜底');
+                }, 3000);
+            }
+
+            // ★ 限制 seek 范围：转码期间只能 seek 到已转码的位置
+            var seekHandler = function() {
+                if (!growInfo.done && growInfo.estimatedDuration > 0) {
+                    // 如果 seek 到还没转码的位置，回退到当前已转码的终点
+                    if (videoEl.currentTime > growInfo.estimatedDuration - 1) {
+                        that._log('边转边播: seek 超出已转码范围，回退到 ' + (growInfo.estimatedDuration - 1).toFixed(1) + 's');
+                        videoEl.currentTime = Math.max(0, growInfo.estimatedDuration - 2);
+                    }
+                }
+                // ★ 转码完成后自动移除此监听器
+                if (growInfo.done) {
+                    videoEl.removeEventListener('seeking', seekHandler);
+                }
+            };
+            videoEl.addEventListener('seeking', seekHandler);
+
+            // ★ 缓冲区欠载处理：视频因数据不足暂停时，等待后刷新数据源
+            var waitingHandler = function() {
+                if (growInfo.done) {
+                    // 转码已完成但仍然缓冲不足，可能是网络/解码问题，不再处理
+                    videoEl.removeEventListener('waiting', waitingHandler);
+                    return;
+                }
+                that._log('边转边播: 缓冲区欠载，等待转码数据...');
+                // 等待 1 秒让 ffmpeg 写入更多数据，然后刷新视频源
+                setTimeout(function() {
+                    if (growInfo.done || !videoEl.parentNode) {
+                        videoEl.removeEventListener('waiting', waitingHandler);
+                        return;
+                    }
+                    // ★ 刷新代理 URL，触发浏览器重新请求数据
+                    var curTime = videoEl.currentTime;
+                    var wasPaused = videoEl.paused;
+                    // 更新 src 强制浏览器重新获取文件信息（此时文件更大了）
+                    var freshUrl = proxyUrl + (proxyUrl.indexOf('?') >= 0 ? '&' : '?') + '_t=' + Date.now();
+                    videoEl.src = freshUrl;
+                    videoEl.addEventListener('loadedmetadata', function onMeta() {
+                        videoEl.removeEventListener('loadedmetadata', onMeta);
+                        videoEl.currentTime = curTime;
+                        if (!wasPaused) videoEl.play().catch(function() {});
+                    }, { once: true });
+                }, 1000);
+            };
+            videoEl.addEventListener('waiting', waitingHandler);
+
+            videoEl.addEventListener('loadeddata', function() {
+                that._log('_startStreamingPlayback: 流式播放开始');
+            }, { once: true });
+
+            videoEl.addEventListener('error', function() {
+                that._error('_startStreamingPlayback: 流式播放失败');
+                // ★ 重置流式播放标志，让上层 error 监听器知道可以启动回退（如转码/Blob）
+                that._isStreamingPlayback = false;
+                that._streamingVideoEl = null;
+            }, { once: true });
+
+        } catch(e) {
+            that._error('_startStreamingPlayback:', e.message || e);
+            that._isStreamingPlayback = false;
+            that._streamingVideoEl = null;
+        }
+    }
+
+    /**
+     * 转码完成后，从流式播放切换为完整播放（支持任意 seek）
+     * ★ 统一使用 file:// 协议（零内存拷贝、零 fd、秒开）
+     * ★ 销毁 mpegts.js 播放器，切换到原生 HTML5 video
+     * @param {HTMLVideoElement} videoEl - 视频 DOM 元素
+     * @param {string} mp4Path - 已完成的 MP4 文件路径
+     */
+    _switchToFullPlayback(videoEl, mp4Path) {
+        var that = this;
+        try {
+            // ★ 播放器已关闭时不再切换（防止转码完成回调触发）
+            if (that._videoPlayerClosed) {
+                that._log('_switchToFullPlayback: 播放器已关闭，跳过切换');
+                return;
+            }
+            var currentTime = videoEl.currentTime || 0;
+            var wasPlaying = !videoEl.paused;
+
+            // ★ 销毁 mpegts.js 播放器（从流式模式切换到原生播放）
+            if (that._flvPlayer) {
+                try { that._flvPlayer.destroy(); } catch(_) {}
+                that._flvPlayer = null;
+            }
+
+            // 清理流式播放标记
+            that._isStreamingPlayback = false;
+            that._streamingVideoEl = null;
+            that._videoEstimatedDuration = 0;  // ★ 切换到原生 MP4 后不再需要估算时长
+
+            // 清理旧 Blob URL
+            if (that._flvBlobUrl) {
+                try { URL.revokeObjectURL(that._flvBlobUrl); } catch(_) {}
+                that._flvBlobUrl = null;
+            }
+
+            // ★ 统一使用 file:// 协议（零内存拷贝、零 fd、秒开）
+            videoEl.pause();
+            videoEl.removeAttribute('src');
+            videoEl.src = 'file:///' + mp4Path.replace(/\\/g, '/');
+            that._log('_switchToFullPlayback: 使用 file://');
+
+            // ★ 恢复播放位置（无缝切换）
+            videoEl.addEventListener('loadedmetadata', function() {
+                if (currentTime > 0 && currentTime < videoEl.duration) {
+                    videoEl.currentTime = currentTime;
+                }
+                if (wasPlaying) {
+                    videoEl.play().catch(function() {});
+                }
+                that._log('_switchToFullPlayback: 切换完成，恢复到 ' + currentTime.toFixed(1) + 's');
+            }, { once: true });
+
+        } catch(e) {
+            that._error('_switchToFullPlayback:', e.message || e);
         }
     }
 
@@ -7671,10 +11319,20 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 同步音量 UI（音量滑条 + localStorage 持久化）
+     * 供键盘快捷键调用，保持与鼠标拖拽一致的 UI 状态
+     */
+    _syncVolumeUI(vol) {
+        try { localStorage.setItem('cd-video-volume', Math.round(vol * 100)); } catch(e) {}
+        var slider = document.getElementById('cd-video-volume-slider');
+        if (slider) slider.value = Math.round(vol * 100);
+    }
+
+    /**
      * 格式化为时长显示（自动显示小时：>=1h 显示 HH:MM:SS，否则 MM:SS）
      */
     _formatDuration(sec) {
-        if (!sec || isNaN(sec)) return '0:00';
+        if (sec == null || isNaN(sec)) return '0:00';
         var h = Math.floor(sec / 3600);
         var m = Math.floor((sec % 3600) / 60);
         var s = Math.floor(sec % 60);
@@ -7688,7 +11346,7 @@ class LocalBrowsePlugin extends Plugin {
      * 格式化秒数为 mm:ss（用于时间戳链接显示）
      */
     _formatTimestampTime(sec) {
-        if (!sec || isNaN(sec)) return '00:00';
+        if (sec == null || isNaN(sec)) return '00:00';
         var m = Math.floor(sec / 60);
         var s = Math.floor(sec % 60);
         return (m < 10 ? '0' : '') + m + ':' + (s < 10 ? '0' : '') + s;
@@ -7716,8 +11374,8 @@ class LocalBrowsePlugin extends Plugin {
      */
     _insertVideoTimestamp(currentTime) {
         var that = this;
-        var filePath = that._videoCurrentPath;
-        var fileName = that._videoCurrentName;
+        var filePath = that._videoCurrentPath || that._standaloneVideoPath;
+        var fileName = that._videoCurrentName || that._standaloneVideoName;
         if (!filePath || !fileName) {
             that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
             return;
@@ -7846,9 +11504,18 @@ class LocalBrowsePlugin extends Plugin {
                 if (format === 'jpeg' || format === 'jpg') mimeType = 'image/jpeg';
                 else if (format === 'webp') mimeType = 'image/webp';
                 var q = (typeof quality === 'number' && quality > 0) ? quality : 0.92;
-                canvas.toBlob(function(blob) {
-                    resolve(blob);
-                }, mimeType, q);
+                // ★ 添加超时兜底，防止 tainted canvas 导致 Promise 永久挂起
+                var _screenshotResolved = false;
+                var _ssTimer = setTimeout(function() {
+                    if (!_screenshotResolved) { _screenshotResolved = true; resolve(null); }
+                }, 3000);
+                try {
+                    canvas.toBlob(function(blob) {
+                        if (!_screenshotResolved) { _screenshotResolved = true; clearTimeout(_ssTimer); resolve(blob); }
+                    }, mimeType, q);
+                } catch(_) {
+                    if (!_screenshotResolved) { _screenshotResolved = true; clearTimeout(_ssTimer); resolve(null); }
+                }
             } catch (e) {
                 resolve(null);
             }
@@ -7903,8 +11570,14 @@ class LocalBrowsePlugin extends Plugin {
             that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
             return;
         }
-        // 截图：使用 JPEG 格式 + 限制最大宽度，大幅减小体积
-        that._getScreenshotBlob('jpeg', 0.8, 1920).then(function(blob) {
+        // 截图：使用 WebP 格式 + 限制最大宽度 960 + 质量 0.6，大幅减小体积
+        that._getScreenshotBlob('webp', 0.6, 960).then(function(blob) {
+            if (!blob) {
+                // WebP 不支持时降级到 JPEG
+                return that._getScreenshotBlob('jpeg', 0.6, 960);
+            }
+            return blob;
+        }).then(function(blob) {
             if (!blob) {
                 that.showToastMsg('⚠️ 截图失败，可能视频格式不支持', 2000, 'warning');
                 return;
@@ -8017,8 +11690,77 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
-     * 一键转换：将当前文档标题中的时间戳转为可点击的视频跳转链接
+     * 浮窗视频循环片段处理（复用面板的 _handleLoopSegment 两步标记逻辑）
+     * 面板版本直接操作面板状态（_loopSegMarkStart/_videoCurrentPath/cd-video-loop-seg），
+     * 浮窗版本需要适配浮窗状态（_standaloneVideoPath/_standaloneVideoName/cd-sa-loop）
+     */
+    _handleStandaloneLoopSegment(video, loopBtn) {
+        var that = this;
+        var filePath = that._standaloneVideoPath || that._videoCurrentPath;
+        var fileName = that._standaloneVideoName || that._videoCurrentName;
+        if (!filePath || !video) {
+            that.showToastMsg('⚠️ 未在播放视频', 2000, 'warning');
+            return;
+        }
+        var currentTime = video.currentTime;
+
+        // 正在循环播放中：点击取消循环
+        if (that._loopPlayStart !== null && that._loopPlayEnd !== null && that._loopSegMarkStart === null) {
+            that._loopPlayStart = null;
+            that._loopPlayEnd = null;
+            if (loopBtn) { loopBtn.style.color = '#fff'; loopBtn.title = '循环片段'; }
+            return;
+        }
+
+        if (that._loopSegMarkStart === null) {
+            // 第一次点击：记录起点
+            that._loopSegMarkStart = currentTime;
+            if (loopBtn) {
+                loopBtn.style.color = 'var(--b3-theme-primary,#4285f4)';
+                loopBtn.title = '2️⃣点击标记终点';
+            }
+        } else {
+            // 第二次点击：记录终点，立即开始循环播放 + 生成链接插入笔记
+            var startTime = that._loopSegMarkStart;
+            var endTime = currentTime;
+            // 确保 start <= end
+            if (endTime < startTime) {
+                var tmp = startTime;
+                startTime = endTime;
+                endTime = tmp;
+            }
+            that._loopSegMarkStart = null;
+
+            // ★ 设置循环起终点（循环检查由 updateProgress timeupdate 处理器执行，无需额外绑定）
+            that._loopPlayStart = startTime;
+            that._loopPlayEnd = endTime;
+            video.currentTime = startTime;
+            video.play().catch(function() {});
+
+            if (loopBtn) {
+                loopBtn.style.color = 'var(--b3-theme-primary,#4285f4)';
+                loopBtn.title = '点击取消循环';
+            }
+
+            // 同时生成链接插入笔记
+            var timeStr = that._formatTimestampTime(startTime) + '-' + that._formatTimestampTime(endTime);
+            var url = that.toFileUrl(filePath) + '?t=' + Math.floor(startTime) + '-' + Math.floor(endTime);
+            var markdown = '[' + fileName + ' ' + timeStr + '](' + url + ')';
+
+            that._insertMarkdownAtCursor(markdown, function(success) {
+                if (!success) {
+                    that._copyToClipboard(markdown, function(ok) {
+                        if (!ok) that.showToastMsg('⚠️ 插入失败，请手动复制: ' + markdown, 3000, 'warning');
+                    });
+                }
+            });
+        }
+    }
+
+    /**
+     * 一键转换：将当前文档中的时间戳转为可点击的视频跳转链接
      * 例如 "某某内容 00:05" → "某某内容 [00:05](file://path?t=5)"
+     * 使用智能正则：保留已有视频链接/块引用/超链接/行内代码，只转换裸时间戳
      */
     _handleChapterJump() {
         var that = this;
@@ -8043,8 +11785,8 @@ class LocalBrowsePlugin extends Plugin {
 
         var baseUrl = that.toFileUrl(filePath);
 
-        // 查询文档中所有标题块(h)、列表项(i)和段落(p)
-        var sql = "SELECT id, content, markdown, type FROM blocks WHERE type IN ('h', 'i', 'p') AND root_id='" + docId + "'";
+        // 查询文档中所有标题块(h)、列表项(i)、段落(p)、表格(t)和引用块(b)
+        var sql = "SELECT id, content, markdown, type, subtype FROM blocks WHERE type IN ('h', 'i', 'p', 't', 'b') AND root_id='" + docId + "'";
         that._log('_handleChapterJump SQL:', sql);
         fetch('/api/query/sql', {
             method: 'POST',
@@ -8058,102 +11800,166 @@ class LocalBrowsePlugin extends Plugin {
 
             that._log('_handleChapterJump found blocks:', res.data.length);
 
+            // ★ 诊断：打印前5个 heading 块的 content 和 markdown，帮助排查问题
+            var diagBlocks = res.data.filter(function(b) { return b.type === 'h'; }).slice(0, 5);
+            diagBlocks.forEach(function(b) {
+                that._log('DIAG heading block', b.id, 'type=' + b.type, 'subtype=' + b.subtype,
+                    'content:', JSON.stringify(b.content), 'markdown:', JSON.stringify(b.markdown));
+            });
+
             // 时间戳正则：匹配 MM:SS 或 H:MM:SS
             var tsRegex = /\b((?:[0-5]?\d):(?:[0-5]\d)(?::(?:[0-5]\d))?)\b/g;
             var toUpdate = [];
             var toCheckRefs = []; // 需要进一步检查块引的块
 
+            // 智能正则：优先匹配已有视频链接、块引用（含别名）、超链接、行内代码（保留不动），
+            // 只转换裸时间戳为视频链接
+            // 顺序很重要：更具体的模式在前，避免子串被后面的模式误匹配
+            var smartRegex = /\[[^\]]*\]\([^)]*\?t=\d+\)|\(\(\d{14}-[a-zA-Z0-9]{7}(?:\s+["'][^"']*["'])?\)\)|\[[^\]]*\]\([^)]*\)|`[^`]+`|\b((?:[0-5]?\d):(?:[0-5]\d)(?::(?:[0-5]\d))?)\b/g;
+
+            // 辅助函数：统计文本中的时间戳数量
+            function countTimestamps(text) {
+                var count = 0;
+                tsRegex.lastIndex = 0;
+                while (tsRegex.exec(text) !== null) count++;
+                tsRegex.lastIndex = 0;
+                return count;
+            }
+
+            // 辅助函数：统计 markdown 中视频链接里包含的时间戳数量
+            function countConvertedTs(md) {
+                var count = 0;
+                var vlReg = /\[[^\]]*\]\([^)]*\?t=\d+\)/g;
+                var vlm;
+                while ((vlm = vlReg.exec(md)) !== null) {
+                    // 提取链接文字部分
+                    var linkText = vlm[0].substring(1, vlm[0].indexOf(']('));
+                    tsRegex.lastIndex = 0;
+                    if (tsRegex.test(linkText)) count++;
+                    tsRegex.lastIndex = 0;
+                }
+                return count;
+            }
+
             res.data.forEach(function(block) {
                 var md = block.markdown || '';
                 var content = block.content || '';
 
-                // 检查是否已包含视频链接（避免重复转换）
-                // 检查是否已包含视频链接（避免重复转换）
-                // 只检查 markdown 中的链接格式，content 中的纯文本 URL（如系统播放器附加的路径）不算
-                if (/\[.*?\]\([^)]*\?t=\d+\)/.test(md)) return;
+                // 清理 markdown
+                var cleanMd = md.replace(/\uFEFF/g, '');
 
-                // 检查 content（纯文本，块引已展开）中是否有时间戳
-                // content 中可能包含 \uFEFF，需要清理
+                // ★ 检测时间戳：使用 content（展开块引后的纯文本）作为主要来源
+                // content 会展开 ((id)) → 显示被引块的实际文字，能检测到无别名块引内的时间戳
                 var cleanContent = content.replace(/\uFEFF/g, '');
-                tsRegex.lastIndex = 0;
-                var contentMatch = tsRegex.exec(cleanContent);
-                tsRegex.lastIndex = 0;
+                var contentTsCount = countTimestamps(cleanContent);
 
-                // 如果 content 中没有时间戳，尝试从 md 的清理版本中提取
-                // 某些 heading 块中 content 字段可能为空或不全
-                if (!contentMatch && md) {
-                    var cleanMd = md.replace(/^#+\s*/, '').replace(/\uFEFF/g, '');
-                    tsRegex.lastIndex = 0;
-                    contentMatch = tsRegex.exec(cleanMd);
-                    tsRegex.lastIndex = 0;
-                    if (contentMatch) {
+                // 如果 content 为空（某些 heading 块），从 markdown 中检测
+                if (contentTsCount === 0 && md) {
+                    var cleanMdFallback = md.replace(/^#+\s*/, '').replace(/\uFEFF/g, '');
+                    contentTsCount = countTimestamps(cleanMdFallback);
+                    if (contentTsCount > 0) {
                         that._log('  -> found timestamp in cleaned md fallback');
                     }
                 }
 
-                if (!contentMatch) return; // content 里没有时间戳，跳过
+                if (contentTsCount === 0) return; // 没有时间戳，跳过
 
-                var tsStr = contentMatch[1];
-                var tsSeconds = that._parseTimestampStr(tsStr);
-                if (tsSeconds === null || tsSeconds < 0) return;
-
-                // 检查 markdown 中是否有直接的时间戳文本
-                // 先清理 \uFEFF，否则时间戳可能被包裹在 \uFEFF 中导致匹配问题
-                var cleanMdForCheck = md.replace(/\uFEFF/g, '');
-                var hasTsInMd = tsRegex.test(cleanMdForCheck);
-                tsRegex.lastIndex = 0;
-
-                that._log('_handleChapterJump block', block.id, 'type=' + block.type, 'hasTsInMd=' + hasTsInMd);
-                that._log('  md:', md);
-                that._log('  content:', content);
-
-                if (hasTsInMd) {
-                    // markdown 中有直接的时间戳文本，直接替换
-                    // 需要在清理了 \uFEFF 的 md 上替换，否则 \uFEFF 包裹的时间戳可能匹配不到
-                    var cleanMdForReplace = md.replace(/\uFEFF/g, '');
-                    var newMd = cleanMdForReplace.replace(tsRegex, function(fullMatch) {
-                        var seconds = that._parseTimestampStr(fullMatch);
-                        if (seconds === null || seconds < 0) return fullMatch;
-                        return '[' + fullMatch + '](' + baseUrl + '?t=' + seconds + ')';
-                    });
-                    if (newMd !== cleanMdForReplace) {
-                        toUpdate.push({ id: block.id, markdown: newMd });
-                        that._log('  -> direct update queued');
-                    }
+                // ★ 防重复：统计 markdown 中已转换为视频链接的时间戳数
+                var alreadyConvertedCount = countConvertedTs(cleanMd);
+                if (alreadyConvertedCount >= contentTsCount) {
+                    console.warn('[LocalBrowse] SKIP already-converted:', block.id, 'already=' + alreadyConvertedCount, 'contentTs=' + contentTsCount, 'md=' + md.substring(0, 80));
                     return;
                 }
 
-                // content 中有但 markdown 中没有纯文本时间戳 → 时间戳分散在块引/超链接等中
-                // 同时匹配块引用 ((id)) 和超链接 [text](url)
-                var inlineRefRegex = /\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["'][^"']*["'])?\)\)|\[([^\]]*)\]\([^)]*\)/g;
+                // ★ 诊断：打印即将处理的块信息（确保用户能看到）
+                console.warn('[LocalBrowse] PROCESS block', block.id, 'type=' + block.type, 'subtype=' + (block.subtype || 'null'),
+                    'contentTs=' + contentTsCount, 'already=' + alreadyConvertedCount,
+                    'md=' + md.substring(0, 100));
+
+                // 提取块引用（同时提取别名）
+                var inlineRefRegex = /\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["']([^"']*)["'])?\)\)/g;
                 var refs = [];
-                var hasInlineElement = false;
                 var m;
                 while ((m = inlineRefRegex.exec(md)) !== null) {
-                    hasInlineElement = true;
-                    if (m[1]) {
-                        // 块引用 ((id))
-                        refs.push({ full: m[0], id: m[1], type: 'ref' });
-                    }
-                    // 超链接 [text](url) 也标记为有内联元素，策略2段解析器会处理
+                    refs.push({ full: m[0], id: m[1], alias: m[2] || null, type: 'ref' });
                 }
-                that._log('  -> content has ts, block refs found:', refs.length, 'hasInlineElement:', hasInlineElement);
+                inlineRefRegex.lastIndex = 0;
 
-                if (refs.length > 0 || hasInlineElement) {
-                    toCheckRefs.push({ block: block, refs: refs, tsStr: tsStr, tsSeconds: tsSeconds });
-                } else {
-                    // 没有内联元素，fallback 在末尾追加链接
-                    var newMd = md + ' [' + tsStr + '](' + baseUrl + '?t=' + tsSeconds + ')';
+                // 使用智能正则替换：保留已有视频链接/块引用/超链接/行内代码，只转换裸时间戳
+                smartRegex.lastIndex = 0;
+                var newMd = cleanMd.replace(smartRegex, function(fullMatch, tsText) {
+                    if (tsText) {
+                        // 裸时间戳 → 转换为视频链接
+                        var seconds = that._parseTimestampStr(tsText);
+                        if (seconds !== null && seconds >= 0) {
+                            return '[' + tsText + '](' + baseUrl + '?t=' + seconds + ')';
+                        }
+                    }
+                    // 已有视频链接 / 块引用 / 超链接 / 行内代码 → 原样保留
+                    return fullMatch;
+                });
+
+                var smartReplaced = (newMd !== cleanMd);
+
+                // ★ 注意：此处已删除基于 content 的 fallback。
+                // 原 fallback 使用 cleanContent（块引用展开后的纯文本）作为替换基础，
+                // 会导致原始 markdown 格式丢失（块引用、行内代码、粗体等被抹除）。
+                // 当前逻辑：
+                //   - smartReplaced=true → 直接更新（裸时间戳成功替换）
+                //   - smartReplaced=false, 有块引用, contentTsCount > 0 → 交给 toCheckRefs（策略1/2）
+                //   - smartReplaced=false, 无块引用 → 时间戳在不可转换元素中，跳过（保护格式）
+
+                // 转换后统计已转换数
+                var newConvertedCount = countConvertedTs(newMd);
+
+                that._log('_handleChapterJump block', block.id, 'type=' + block.type,
+                    'smartReplaced=' + smartReplaced,
+                    'contentTs=' + contentTsCount,
+                    'alreadyConverted=' + alreadyConvertedCount,
+                    'newConverted=' + newConvertedCount);
+                that._log('  md:', md);
+                that._log('  content:', content);
+
+                // 判断是否需要走块引用检查路径：
+                // 有块引用，且智能替换后仍有未覆盖的时间戳
+                var needCheckRefs = (refs.length > 0) && (contentTsCount > newConvertedCount);
+
+                if (smartReplaced && !needCheckRefs) {
+                    // 只有智能替换，没有块引用需要处理
                     toUpdate.push({ id: block.id, markdown: newMd });
-                    that._log('  -> fallback append update queued (no refs)');
+                    console.warn('[LocalBrowse] QUEUE smart-only:', block.id, 'newMd=' + newMd.substring(0, 100));
+                } else if (needCheckRefs) {
+                    // 有块引用内的时间戳需要处理（可能同时有智能替换结果）
+                    toCheckRefs.push({ block: block, refs: refs, baseMd: newMd, smartReplaced: smartReplaced, contentTsCount: contentTsCount });
+                    console.warn('[LocalBrowse] QUEUE ref-check:', block.id, 'refs=' + refs.length, 'smart=' + smartReplaced);
+                } else if (smartReplaced) {
+                    // 没有块引用但有智能替换结果
+                    toUpdate.push({ id: block.id, markdown: newMd });
+                    console.warn('[LocalBrowse] QUEUE smart-no-refs:', block.id);
+                } else {
+                    // smartReplaced=false, 无块引用, 但通过了"全部已转换"检查
+                    // → 时间戳在超链接/行内代码等中，不转换
+                    console.warn('[LocalBrowse] SKIP protected:', block.id, 'ts in non-convertible element (link/code)');
                 }
             });
 
-            that._log('_handleChapterJump toUpdate:', toUpdate.length, 'toCheckRefs:', toCheckRefs.length);
+            console.warn('[LocalBrowse] SUMMARY toUpdate=' + toUpdate.length + ' toCheckRefs=' + toCheckRefs.length + ' totalBlocks=' + res.data.length);
 
             // 如果没有直接可替换的，也没有需要检查块引的
             if (toUpdate.length === 0 && toCheckRefs.length === 0) {
-                that.showToastMsg('⚠️ 当前文档中没有可转换的时间戳', 2000, 'warning');
+                // ★ 诊断：显示检测详情帮助排查
+                var diagInfo = '共' + res.data.length + '块';
+                var headBlocks = res.data.filter(function(b) { return b.type === 'h'; });
+                if (headBlocks.length > 0) {
+                    var sampleH = headBlocks[0];
+                    var sampleContent = (sampleH.content || '').replace(/\uFEFF/g, '').substring(0, 50);
+                    var sampleMd = (sampleH.markdown || '').replace(/\uFEFF/g, '').substring(0, 50);
+                    diagInfo += '|标题' + headBlocks.length + '个';
+                    diagInfo += '|样例content:' + sampleContent;
+                    diagInfo += '|样例md:' + sampleMd;
+                }
+                that.showToastMsg('⚠️ 未发现可转换的时间戳 - ' + diagInfo, 5000, 'warning');
+                that._log('DIAG: no timestamps found. Total blocks:', res.data.length, 'heading blocks:', headBlocks.length);
                 return;
             }
 
@@ -8170,27 +11976,35 @@ class LocalBrowsePlugin extends Plugin {
                 var done = 0;
                 var total = toUpdate.length;
 
+                console.warn('[LocalBrowse] UPDATE total=' + total + ' blocks');
                 toUpdate.forEach(function(item) {
+                    console.warn('[LocalBrowse] UPDATE sending:', item.id, 'md=' + item.markdown.substring(0, 120));
                     fetch('/api/block/updateBlock', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ id: item.id, dataType: 'markdown', data: item.markdown })
                     }).then(function(r2) { return r2.json(); }).then(function(res2) {
                         done++;
-                        if (res2 && res2.code === 0) successCount++;
-                        else failCount++;
+                        if (res2 && res2.code === 0) {
+                            successCount++;
+                            console.warn('[LocalBrowse] UPDATE OK:', item.id);
+                        } else {
+                            failCount++;
+                            console.warn('[LocalBrowse] UPDATE FAIL:', item.id, 'res=', res2);
+                        }
                         if (done === total) {
                             if (failCount === 0) {
-                                that.showToastMsg('✅ 已转换 ' + successCount + ' 个时间戳为可点击链接');
+                                that.showToastMsg('✅ 已转换 ' + successCount + ' 个时间戳为可点击链接 (引用检查' + toCheckRefs.length + '个)', 3000);
                             } else {
-                                that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount, 3000, 'warning');
+                                that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount + ' (引用检查' + toCheckRefs.length + '个)', 4000, 'warning');
                             }
                         }
-                    }).catch(function() {
+                    }).catch(function(err) {
                         done++;
                         failCount++;
+                        console.warn('[LocalBrowse] UPDATE ERROR:', item.id, err);
                         if (done === total) {
-                            that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount, 3000, 'warning');
+                            that.showToastMsg('⚠️ 转换完成: 成功 ' + successCount + ' / 失败 ' + failCount + ' (引用检查' + toCheckRefs.length + '个)', 4000, 'warning');
                         }
                     });
                 });
@@ -8221,22 +12035,36 @@ class LocalBrowsePlugin extends Plugin {
                 }
 
                 toCheckRefs.forEach(function(item) {
-                    var md = item.block.markdown;
+                    var md = item.baseMd; // 使用智能替换后的 markdown 作为基础
                     var newMd = md;
                     var replaced = false;
 
-                    // 策略1：逐个检查被引块是否是完整时间戳
+                    // 策略1：逐个检查块引用——优先检查别名，其次检查被引块内容
                     item.refs.forEach(function(ref) {
-                        var refContent = refContentMap[ref.id];
-                        if (!refContent) return;
-                        tsRegex.lastIndex = 0;
-                        var m2 = tsRegex.exec(refContent);
-                        if (m2) {
-                            var fullMatch = m2[1];
-                            var seconds = that._parseTimestampStr(fullMatch);
+                        var tsFound = null;
+                        // 优先检查别名（如 ((id "00:30"))）
+                        if (ref.alias) {
+                            tsRegex.lastIndex = 0;
+                            var aliasMatch = tsRegex.exec(ref.alias);
+                            if (aliasMatch) tsFound = aliasMatch[1];
+                            tsRegex.lastIndex = 0;
+                        }
+                        // 如果别名不是时间戳，检查被引块内容
+                        if (!tsFound) {
+                            var refContent = refContentMap[ref.id];
+                            if (refContent) {
+                                tsRegex.lastIndex = 0;
+                                var refMatch = tsRegex.exec(refContent);
+                                if (refMatch) tsFound = refMatch[1];
+                                tsRegex.lastIndex = 0;
+                            }
+                        }
+                        if (tsFound) {
+                            var seconds = that._parseTimestampStr(tsFound);
                             if (seconds !== null && seconds >= 0) {
-                                newMd = newMd.replace(ref.full, '[' + fullMatch + '](' + baseUrl + '?t=' + seconds + ')');
+                                newMd = newMd.split(ref.full).join('[' + tsFound + '](' + baseUrl + '?t=' + seconds + ')');
                                 replaced = true;
+                                console.warn('[LocalBrowse] REF-STRAT1 ok:', item.block.id, 'ref=' + ref.id, 'ts=' + tsFound);
                             }
                         }
                     });
@@ -8246,22 +12074,28 @@ class LocalBrowsePlugin extends Plugin {
                     // 例如：[03](url) 后面跟着 ":17" 纯文本
                     if (!replaced) {
                         var segments = [];
-                        // 同时匹配块引用 ((id)) 和超链接 [text](url)
-                        var inlineRegex2 = /\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["'][^"']*["'])?\)\)|\[([^\]]*)\]\([^)]*\)/g;
+                        // 同时匹配已有视频链接（保留）、块引用、普通超链接
+                        // 注意：已有视频链接优先匹配，避免其内部文字被误处理
+                        var inlineRegex2 = /\[[^\]]*\]\([^)]*\?t=\d+\)|\(\((\d{14}-[a-zA-Z0-9]{7})(?:\s+["']([^"']*)["'])?\)\)|\[([^\]]*)\]\([^)]*\)/g;
                         var lastIdx = 0;
                         var m2;
                         while ((m2 = inlineRegex2.exec(md)) !== null) {
                             if (m2.index > lastIdx) {
                                 segments.push({ type: 'text', text: md.substring(lastIdx, m2.index) });
                             }
-                            if (m2[1]) {
-                                // 块引用 ((id))
+                            // 判断匹配的是哪种模式：已有视频链接 / 块引用 / 普通超链接
+                            if (/\?t=\d+\)$/.test(m2[0])) {
+                                // 已有视频链接 → 原样保留，不展开文字（避免重复转换）
+                                segments.push({ type: 'videolink', text: '', full: m2[0] });
+                            } else if (m2[1]) {
+                                // 块引用 ((id)) — 展开时优先用别名，没有别名用被引块内容
                                 var rid = m2[1];
-                                var rcontent = refContentMap[rid] || '';
-                                segments.push({ type: 'ref', text: rcontent, full: m2[0] });
+                                var aliasText = m2[2] || null;
+                                var refText = aliasText || refContentMap[rid] || '';
+                                segments.push({ type: 'ref', text: refText, full: m2[0] });
                             } else {
-                                // 超链接 [text](url)
-                                segments.push({ type: 'link', text: m2[2] || '', full: m2[0] });
+                                // 普通超链接 [text](url)
+                                segments.push({ type: 'link', text: m2[3] || '', full: m2[0] });
                             }
                             lastIdx = m2.index + m2[0].length;
                         }
@@ -8349,24 +12183,30 @@ class LocalBrowsePlugin extends Plugin {
                         }
                     }
 
-                    // 策略3：fallback — 在 markdown 末尾追加视频链接
+                    // 不再有 fallback 追加——避免重复转换
+                    // 如果策略1和2都没找到可转换的时间戳，说明时间戳已在视频链接中
+                    // 或在不可转换的内联元素中（超链接/行内代码）
                     if (!replaced) {
-                        newMd = md + ' [' + item.tsStr + '](' + baseUrl + '?t=' + item.tsSeconds + ')';
-                        replaced = true;
-                        that._log('  -> fallback append for', item.tsStr);
+                        that._log('  -> block ref strategies found no convertible timestamps');
                     }
 
                     if (newMd !== md) {
                         toUpdate.push({ id: item.block.id, markdown: newMd });
+                        console.warn('[LocalBrowse] REF-QUEUE:', item.block.id, 'strat1/2 succeeded');
+                    } else {
+                        console.warn('[LocalBrowse] REF-SKIP:', item.block.id, 'no convertible ts found in refs');
                     }
                 });
 
+                console.warn('[LocalBrowse] REF-DONE toUpdate=' + toUpdate.length);
                 doUpdateAll();
             }).catch(function(err) {
                 that._log('_handleChapterJump ref query error:', err);
+                // 查询被引块失败时，直接使用智能替换后的结果，不再追加
                 toCheckRefs.forEach(function(item) {
-                    var newMd = item.block.markdown + ' [' + item.tsStr + '](' + baseUrl + '?t=' + item.tsSeconds + ')';
-                    toUpdate.push({ id: item.block.id, markdown: newMd });
+                    if (item.smartReplaced) {
+                        toUpdate.push({ id: item.block.id, markdown: item.baseMd });
+                    }
                 });
                 doUpdateAll();
             });
@@ -8407,12 +12247,25 @@ class LocalBrowsePlugin extends Plugin {
     _openVideoInDialog(filePath, subtitleUrl) {
         var that = this;
         var fileUrl = this.toFileUrl(filePath);
+        // ★ proxyUrl 不再预计算，按需调用（避免原生播放时无谓的代理初始化）
+        var isHttpUrlDialog = filePath.indexOf('http://') === 0 || filePath.indexOf('https://') === 0;
         var fileName = '';
-        try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        if (isHttpUrlDialog) {
+            try { var u2 = new URL(filePath); fileName = u2.pathname.split('/').pop(); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        } else {
+            try { fileName = require('path').basename(filePath); } catch(e) { fileName = filePath.split(/[\\/]/).pop(); }
+        }
 
         // 检测 FLV 格式
         var videoExt = '';
-        try { videoExt = require('path').extname(filePath).toLowerCase(); } catch(e) {
+        try {
+            if (isHttpUrlDialog) {
+                var dotIdx2 = filePath.lastIndexOf('.');
+                videoExt = dotIdx2 >= 0 ? filePath.substring(dotIdx2).toLowerCase() : '';
+            } else {
+                videoExt = require('path').extname(filePath).toLowerCase();
+            }
+        } catch(e) {
             var dotIdx = filePath.lastIndexOf('.');
             videoExt = dotIdx >= 0 ? filePath.substring(dotIdx).toLowerCase() : '';
         }
@@ -8440,10 +12293,27 @@ class LocalBrowsePlugin extends Plugin {
                             that.showToastMsg('⚠️ 无法播放 FLV 格式');
                             return;
                         }
+                        // ★ 预检测 FLV 编码格式，提前发现不支持的编码
+                        var dCodecInfo = that._detectFlvCodecs(filePath);
+                        if (dCodecInfo) {
+                            that._log('Dialog FLV 编码检测:', JSON.stringify(dCodecInfo));
+                            // ★ 只有明确检测到不支持的编码才拦截；检测不到时放行
+                            var dHasUnsupported = false;
+                            if (!dCodecInfo.scanComplete) {
+                                that._log('Dialog: FLV 编码扫描未完成(' + dCodecInfo.scannedTags + ' tags)，放行');
+                            } else if (!dCodecInfo.videoSupported || !dCodecInfo.audioSupported) {
+                                dHasUnsupported = true;
+                            }
+                            if (dHasUnsupported) {
+                                // ★ 对话框也走自动转码回退
+                                that._transcodeFlvAndPlay(video, filePath, true, dCodecInfo);
+                                return;
+                            }
+                        }
                         try {
                             var dPlayer = mpegts.createPlayer({
                                 type: 'flv',
-                                url: fileUrl
+                                url: that.toProxyUrl(filePath) // 按需调用
                             }, {
                                 enableWorker: false,
                                 enableStashBuffer: true,
@@ -8457,12 +12327,29 @@ class LocalBrowsePlugin extends Plugin {
                                     setTimeout(function() { video.muted = false; }, 300);
                                 }).catch(function() {});
                             });
-                            dPlayer.on(mpegts.Events.ERROR, function(errType) {
-                                if (errType === mpegts.ErrorTypes.NETWORK_ERROR) {
-                                    // 回退到 fs 读取
+                            dPlayer.on(mpegts.Events.ERROR, function(errType, errDetail) {
+                                that._error('Dialog FLV 错误:', errType, errDetail);
+                                // ★ 网络错误和媒体解码错误都尝试 Blob 回退
+                                if (errType === mpegts.ErrorTypes.NETWORK_ERROR || errType === mpegts.ErrorTypes.MEDIA_ERROR) {
                                     try {
                                         var fs = require('fs');
-                                        var buf = fs.readFileSync(filePath);
+                                        var stat = fs.statSync(filePath);
+                                        var fileSize = stat.size;
+                                        var CHUNK_SIZE = 64 * 1024 * 1024;
+                                        var chunks = [];
+                                        var totalLen = 0;
+                                        var fd = fs.openSync(filePath, 'r');
+                                        try {
+                                            var readBuf = Buffer.alloc(CHUNK_SIZE);
+                                            while (totalLen < fileSize) {
+                                                var toRead = Math.min(CHUNK_SIZE, fileSize - totalLen);
+                                                var rd = fs.readSync(fd, readBuf, 0, toRead, totalLen);
+                                                if (rd <= 0) break;
+                                                chunks.push(Buffer.from(readBuf.slice(0, rd)));
+                                                totalLen += rd;
+                                            }
+                                        } finally { fs.closeSync(fd); }
+                                        var buf = Buffer.concat(chunks, totalLen);
                                         var blob = new Blob([buf], { type: 'video/x-flv' });
                                         var blobUrl = URL.createObjectURL(blob);
                                         dPlayer.destroy();
@@ -8470,14 +12357,32 @@ class LocalBrowsePlugin extends Plugin {
                                         dPlayer2.attachMediaElement(video);
                                         dPlayer2.load();
                                         dPlayer2.play().catch(function() {});
+                                        // ★ Blob mpegts.js 也失败时，尝试原生 HTML5 video
+                                        dPlayer2.on(mpegts.Events.ERROR, function() {
+                                            that._log('Dialog FLV(Blob) 也失败，尝试原生 video...');
+                                            try { dPlayer2.destroy(); } catch(_) {}
+                                            that._dialogFlvPlayer = null;
+                                            var nativeUrl2 = blobUrl;
+                                            video.removeAttribute('src');
+                                            video.load();
+                                            video.src = nativeUrl2;
+                                            video.play().catch(function() { video.muted = true; video.play().catch(function() {}); });
+                                            video.addEventListener('error', function() {
+                                                var ch = '';
+                                                try { var _ci = that._detectFlvCodecs(filePath); if (_ci) ch = ' [视频:' + _ci.videoCodec + ' 音频:' + _ci.audioCodec + ']'; } catch(_) {}
+                                                that.showToastMsg('⚠️ FLV 所有方式均失败' + ch + '，建议 ffmpeg 转码: ffmpeg -i input.flv -c copy output.mp4');
+                                            }, { once: true });
+                                        });
                                         // 保存引用，对话框关闭时清理
                                         that._dialogFlvPlayer = dPlayer2;
                                         that._dialogFlvBlobUrl = blobUrl;
                                     } catch(e2) {
-                                        that.showToastMsg('⚠️ FLV 播放失败');
+                                        var codecHint = '';
+                                        try { var _ci = that._detectFlvCodecs(filePath); if (_ci) codecHint = ' (视频:' + _ci.videoCodec + ' 音频:' + _ci.audioCodec + ')'; } catch(_) {}
+                                        that.showToastMsg('⚠️ FLV 播放失败' + codecHint + '，建议转码为 MP4');
                                     }
                                 } else {
-                                    that.showToastMsg('⚠️ FLV 解码失败');
+                                    that.showToastMsg('⚠️ FLV 播放失败: 未知错误类型');
                                 }
                             });
                         } catch(e) {
@@ -8485,7 +12390,47 @@ class LocalBrowsePlugin extends Plugin {
                         }
                     });
                 } else {
-                    video.src = fileUrl;
+                    // 普通视频：走 HTTP 代理 + 智能缓冲
+                    var isHttpUrlDialog = filePath.indexOf('http://') === 0 || filePath.indexOf('https://') === 0;
+                    if (isHttpUrlDialog) {
+                        console.warn('[LocalBrowse] _openVideoInDialog: 检测到 http URL，直接使用思源服务器地址播放');
+                        video.preload = 'auto';
+                        video.autoplay = false;
+                    } else {
+                        video.preload = 'auto';
+                        var isSlowDialog = that._isSlowStorage(filePath);
+                        if (isSlowDialog) {
+                            console.warn('[LocalBrowse] Dialog 检测到网盘/慢速存储，启用智能缓冲');
+                            video.autoplay = false;
+                            that._setupSmartBuffer(video, true, 0);
+                        }
+                    }
+                    // ★ 统一使用 file:// 协议（Electron 原生支持，零内存拷贝、零 fd、秒开）
+                    try {
+                        video.src = 'file:///' + filePath.replace(/\\/g, '/');
+                        that._log('_openVideoInDialog: 原生播放使用 file://');
+                    } catch(_dReadErr) {
+                        that._error('_openVideoInDialog: file:// 失败，回退代理:', _dReadErr.message);
+                        video.src = that.toProxyUrl(filePath); // 按需调用
+                    }
+                    console.warn('[LocalBrowse] _openVideoInDialog: video src =', (video.src || '').substring(0, 120));
+                    // ★ 视频加载错误监听：解码错误/格式不支持时自动转码回退
+                    video.addEventListener('error', function onDialogVideoError() {
+                        video.removeEventListener('error', onDialogVideoError);
+                        var dErr = video.error;
+                        if (dErr && (dErr.code === 3 || dErr.code === 4)) {
+                            that._log('Dialog 视频播放失败(错误码' + dErr.code + ')，尝试自动转码为 MP4...');
+                            var dTransCodecInfo = { videoCodec: videoExt.replace('.', '').toUpperCase(), audioCodec: 'unknown', videoSupported: false, audioSupported: true, scanComplete: true };
+                            that._transcodeFlvAndPlay(video, filePath, true, dTransCodecInfo);
+                        }
+                    });
+                    // ★ 自动播放逻辑（http URL 和本地视频都支持）
+                    if (isHttpUrlDialog || !isSlowDialog) {
+                        video.addEventListener('canplay', function onCanPlay() {
+                            video.removeEventListener('canplay', onCanPlay);
+                            that._autoPlayWithFallback(video, 'Dialog');
+                        });
+                    }
                 }
                 if (subtitleUrl) {
                     // Dialog 中也使用 VTT Blob URL
@@ -8522,12 +12467,1140 @@ class LocalBrowsePlugin extends Plugin {
                         }
                     }
                 });
-                dialogObs.observe(document.body, { childList: true, subtree: true });
+                dialogObs.observe(dEl.parentNode || document.body, { childList: true });
             }, 100);
         } else {
             // 最终降级：用系统播放器
             that.openFile(filePath);
         }
+    }
+
+    /**
+     * 面板→浮窗迁移：直接把面板的 video-wrap 搬到浮窗，不重建视频
+     * DOM 元素移动不会打断视频播放，零延迟零卡顿
+     */
+    _migratePanelToStandalone(subtitleUrl) {
+        var that = this;
+        this._log('[MigratePanel→Standalone] start, _videoCurrentPath=' + !!this._videoCurrentPath);
+        // ★ 清理旧浮窗（只清理 DOM 和状态，不触发面板操作）
+        var oldWrap = document.getElementById('cd-standalone-video-wrap');
+        if (oldWrap) {
+            if (oldWrap._resizeObserver) { oldWrap._resizeObserver.disconnect(); }
+            try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: oldWrap.offsetLeft, top: oldWrap.offsetTop, w: oldWrap.offsetWidth, h: oldWrap.offsetHeight })); } catch(e) {}
+            oldWrap.remove();
+        }
+        if (that._standaloneKeyHandler) {
+            document.removeEventListener('keydown', that._standaloneKeyHandler);
+            that._standaloneKeyHandler = null;
+        }
+        that._standaloneVideoPath = null;
+        that._standaloneSubtitleUrl = null;
+        that._standaloneSeekTime = 0;
+        that._standaloneIsMigrated = false;
+
+        var videoWrap = document.getElementById('cd-video-wrap');
+        var videoEl = document.getElementById('cd-video-el');
+        var videoBar = document.getElementById('cd-video-bar');
+        if (!videoWrap || !videoEl) return;
+
+        // 保存当前视频状态（面板播放器的所有变量保持不变）
+        var currentPath = that._videoCurrentPath;
+        if (!currentPath) return;
+
+        // 恢复上次保存的位置和大小
+        var savedPos = null;
+        try { savedPos = JSON.parse(localStorage.getItem('cd-standalone-pos') || 'null'); } catch(e) {}
+        var initLeft = (savedPos && typeof savedPos.left === 'number') ? savedPos.left : 10;
+        var initTop = (savedPos && typeof savedPos.top === 'number') ? savedPos.top : (window.innerHeight - 430);
+        var initW = (savedPos && savedPos.w) ? savedPos.w : 300;
+        var initH = (savedPos && savedPos.h) ? savedPos.h : 350;
+
+        // 创建浮窗容器
+        var wrap = document.createElement('div');
+        wrap.id = 'cd-standalone-video-wrap';
+        wrap.style.cssText = 'position:fixed;left:' + initLeft + 'px;top:' + initTop + 'px;width:' + initW + 'px;height:' + initH + 'px;z-index:9999;background:#000;display:flex;flex-direction:column;border-radius:6px;box-shadow:0 4px 20px rgba(0,0,0,0.3);overflow:hidden;resize:both;min-width:200px;min-height:120px';
+
+        // 顶部拖拽条
+        var dragBar = document.createElement('div');
+        dragBar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:20px;z-index:30;cursor:move;opacity:0;transition:opacity 0.2s;background:linear-gradient(to bottom,rgba(0,0,0,0.4),transparent)';
+        wrap.addEventListener('mouseenter', function() { dragBar.style.opacity = '1'; });
+        wrap.addEventListener('mouseleave', function() { dragBar.style.opacity = '0'; });
+
+        // 关闭按钮
+        var closeBtn = document.createElement('span');
+        closeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z" fill="#fff"/></svg>';
+        closeBtn.style.cssText = 'position:absolute;top:6px;right:6px;z-index:31;cursor:pointer;opacity:0;transition:opacity 0.2s;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;background:rgba(0,0,0,0.4)';
+        closeBtn.title = '关闭';
+        closeBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            that._closeStandalonePlayer();
+        });
+        wrap.addEventListener('mouseenter', function() { closeBtn.style.opacity = '1'; });
+        wrap.addEventListener('mouseleave', function() { closeBtn.style.opacity = '0'; });
+
+        // 拖拽移动
+        dragBar.addEventListener('mousedown', function(e) {
+            e.preventDefault();
+            var startX = e.clientX;
+            var startY = e.clientY;
+            var startLeft = wrap.offsetLeft;
+            var startTop = wrap.offsetTop;
+            function onMove(ev) {
+                wrap.style.left = (startLeft + ev.clientX - startX) + 'px';
+                wrap.style.top = (startTop + ev.clientY - startY) + 'px';
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+        wrap.appendChild(dragBar);
+        wrap.appendChild(closeBtn);
+
+        // resize 监听
+        var resizeObserver = new ResizeObserver(function() {
+            try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+        });
+        resizeObserver.observe(wrap);
+        wrap._resizeObserver = resizeObserver;
+
+        // ★ 核心：把面板的 video-wrap 整体搬到浮窗
+        // DOM reparenting 不会打断视频播放——同一个 <video> 元素、同一个 mpegts player、同一个 MediaSource
+        var videoArea = document.createElement('div');
+        videoArea.id = 'cd-standalone-video-area';
+        videoArea.style.cssText = 'flex:1;min-height:0;background:#000;position:relative;overflow:hidden';
+
+        // 把 video-wrap 从面板移到浮窗的 videoArea
+        // 修改 video-wrap 的样式使其适应浮窗布局
+        videoWrap.style.position = 'absolute';
+        videoWrap.style.top = '0';
+        videoWrap.style.left = '0';
+        videoWrap.style.width = '100%';
+        videoWrap.style.height = '100%';
+        videoWrap.style.flex = '';
+        videoWrap.style.minHeight = '';
+        videoArea.appendChild(videoWrap);
+
+        // 自建控制栏（浮窗专用，和面板控制栏独立）
+        var ctrlBar = document.createElement('div');
+        ctrlBar.id = 'cd-standalone-ctrl';
+        ctrlBar.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 12px;background:rgba(0,0,0,0.85);flex-shrink:0;font-size:13px';
+        ctrlBar.innerHTML += '<span id="cd-sa-play" title="播放/暂停" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="18" height="18"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-time-cur" style="font-size:11px;color:#ccc;min-width:36px;text-align:right">0:00</span>';
+        ctrlBar.innerHTML += '<div id="cd-sa-progress-wrap" style="flex:1;height:5px;background:rgba(255,255,255,0.2);border-radius:3px;cursor:pointer;position:relative"><div id="cd-sa-progress" style="position:absolute;top:0;left:0;height:100%;background:var(--b3-theme-primary,#4285f4);border-radius:3px;width:0%"></div></div>';
+        ctrlBar.innerHTML += '<span id="cd-sa-time-total" style="font-size:11px;color:#ccc;min-width:36px">0:00</span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-timestamp" title="插入时间戳" style="cursor:pointer;display:flex;align-items:center;color:#fff;margin-left:2px"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" fill="currentColor"/></svg></span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-loop" title="循环片段" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" fill="currentColor"/></svg></span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-screenshot" title="截图" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 15.2a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4zM9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z" fill="currentColor"/></svg></span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-speed" title="播放速度" style="cursor:pointer;color:#ccc;font-size:12px;min-width:28px;text-align:center;user-select:none">1x</span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-volume-btn" title="音量" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/></svg></span>';
+        ctrlBar.innerHTML += '<span id="cd-sa-fullscreen" title="全屏" style="cursor:pointer;display:flex;align-items:center;color:#fff;margin-left:2px"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" fill="currentColor"/></svg></span>';
+
+        // 播放中遮罩图标
+        var overlay = document.createElement('div');
+        overlay.id = 'cd-standalone-play-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;transition:opacity 0.3s';
+        overlay.innerHTML = '<svg viewBox="0 0 24 24" width="48" height="48" style="opacity:0.8"><polygon points="8,5 19,12 8,19" fill="#fff"/></svg>';
+        videoArea.appendChild(overlay);
+
+        wrap.appendChild(videoArea);
+        wrap.appendChild(ctrlBar);
+        document.body.appendChild(wrap);
+
+        // 隐藏面板视频控制栏（不调 _closeVideoPlayer，因为视频还在播）
+        if (videoBar) {
+            videoBar.style.display = 'none';
+        }
+
+        // 记录浮窗状态
+        that._standaloneVideoPath = currentPath;
+        that._standaloneSubtitleUrl = subtitleUrl;
+        // ★ 标记：浮窗中的视频是面板搬迁来的，不是独立创建的
+        that._standaloneIsMigrated = true;
+
+        // ★ 拦截面板遗留的 click/dblclick 处理器（_openVideoInPanel 绑定的 250ms 延迟 toggle 和全屏）
+        // 迁移模式下 cd-video-el 上的面板 click 处理器仍在，点击会与浮窗处理器冲突导致双 toggle 抵消
+        // capture 阶段拦截 → 阻止面板处理器触发，同时在此处直接处理浮窗的播放/暂停和全屏
+        var _saClickCapture = function(e) {
+            e.stopImmediatePropagation(); // 阻止面板的 click/dblclick 处理器触发
+            if (e.type === 'click') {
+                if (videoEl.paused) { videoEl.play(); } else { videoEl.pause(); }
+                // 显示大播放/暂停图标
+                var saOverlay = document.getElementById('cd-standalone-play-overlay');
+                if (saOverlay) {
+                    var saSvg = saOverlay.querySelector('svg');
+                    if (saSvg) {
+                        if (videoEl.paused) {
+                            saSvg.innerHTML = '<polygon points="8,5 19,12 8,19" fill="#fff"/>';
+                        } else {
+                            saSvg.innerHTML = '<rect x="6" y="5" width="4" height="14" rx="1" fill="#fff"/><rect x="14" y="5" width="4" height="14" rx="1" fill="#fff"/>';
+                        }
+                    }
+                    saOverlay.style.opacity = '0.8';
+                    setTimeout(function() { saOverlay.style.opacity = '0'; }, 600);
+                }
+            } else if (e.type === 'dblclick') {
+                if (videoEl.requestFullscreen) { videoEl.requestFullscreen(); }
+                else if (videoEl.webkitRequestFullscreen) { videoEl.webkitRequestFullscreen(); }
+            }
+        };
+        videoEl.addEventListener('click', _saClickCapture, true);
+        videoEl.addEventListener('dblclick', _saClickCapture, true);
+        that._standaloneClickCapture = _saClickCapture;
+        that._standaloneClickCaptureEl = videoEl;
+        // ★ 把面板视频状态转移到浮窗专属变量，清空面板状态（面板不再有视频）
+        that._standaloneFlvPlayer = that._flvPlayer;
+        that._flvPlayer = null;
+        that._standaloneIsFlvMode = that._isFlvMode;
+        that._isFlvMode = false;
+        that._standaloneVideoName = that._videoCurrentName;
+        that._videoCurrentPath = null;
+        that._videoCurrentName = null;
+        that._log('[MigratePanel→Standalone] 面板视频状态已清空，_videoCurrentPath=null, _flvPlayer已转移到_standaloneFlvPlayer');
+
+        // 绑定浮窗控制栏事件
+        that._bindStandaloneControls(videoEl, currentPath);
+    }
+
+    /**
+     * 浮窗→面板迁移：直接把浮窗的 video-wrap 搬回面板，不重建视频
+     */
+    _migrateStandaloneToPanel() {
+        var that = this;
+
+        var wrap = document.getElementById('cd-standalone-video-wrap');
+        var videoWrap = document.getElementById('cd-video-wrap');
+        var videoBar = document.getElementById('cd-video-bar');
+        var videoEl = document.getElementById('cd-video-el');
+
+        if (!videoWrap || !videoBar) {
+            // 面板 DOM 不存在，走原来的重建路径
+            if (that._standaloneVideoPath) {
+                var vp = that._standaloneVideoPath;
+                var vs = that._standaloneSubtitleUrl;
+                var saVideo = document.getElementById('cd-video-el') || document.getElementById('cd-standalone-video-el');
+                if (saVideo && saVideo.currentTime > 0) {
+                    that._migrationSeekTime = saVideo.currentTime;
+                    vp = vp + '?t=' + Math.floor(saVideo.currentTime);
+                }
+                that._closeStandalonePlayer();
+                setTimeout(function() {
+                    that._videoPlayerClosed = false;
+                    that._openVideoInPanel(vp, vs, true);
+                }, 100);
+            }
+            return;
+        }
+
+        // ★ 核心：把 video-wrap 从浮窗移回面板
+        // 先恢复 video-wrap 的面板样式
+        videoWrap.style.position = 'relative';
+        videoWrap.style.top = '';
+        videoWrap.style.left = '';
+        videoWrap.style.width = '';
+        videoWrap.style.height = '';
+        videoWrap.style.minHeight = '150px';
+        // 恢复之前保存的高度
+        var savedH = null;
+        try { savedH = localStorage.getItem('cd-video-bar-height'); } catch(e) {}
+        if (savedH && parseInt(savedH) > 50) {
+            videoWrap.style.height = savedH + 'px';
+            videoWrap.style.flex = 'none';
+        } else {
+            videoWrap.style.height = '350px';
+            videoWrap.style.flex = 'none';
+        }
+
+        // 将 video-wrap 放回 videoBar
+        // videoBar 的结构：<div#cd-video-bar> → <div#cd-video-wrap> + 控制栏div
+        // video-wrap 应该是 videoBar 的第一个子元素
+        if (videoBar.firstChild) {
+            videoBar.insertBefore(videoWrap, videoBar.firstChild);
+        } else {
+            videoBar.appendChild(videoWrap);
+        }
+
+        // 显示面板视频控制栏
+        videoBar.style.display = 'flex';
+        videoBar.style.visibility = '';
+        videoBar.style.opacity = '';
+
+        // 清理浮窗容器
+        if (wrap) {
+            if (wrap._resizeObserver) { wrap._resizeObserver.disconnect(); }
+            try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+            wrap.remove();
+        }
+        if (that._standaloneKeyHandler) {
+            document.removeEventListener('keydown', that._standaloneKeyHandler);
+            that._standaloneKeyHandler = null;
+        }
+        // ★ 清理面板遗留 click/dblclick 处理器的 capture 拦截
+        if (that._standaloneClickCapture && that._standaloneClickCaptureEl) {
+            that._standaloneClickCaptureEl.removeEventListener('click', that._standaloneClickCapture, true);
+            that._standaloneClickCaptureEl.removeEventListener('dblclick', that._standaloneClickCapture, true);
+            that._standaloneClickCapture = null;
+            that._standaloneClickCaptureEl = null;
+        }
+
+        // 清理浮窗状态（但不销毁视频，因为视频已迁回面板）
+        // ★ 先恢复面板视频状态（从浮窗专属变量）
+        that._videoCurrentPath = that._standaloneVideoPath;
+        that._videoCurrentName = that._standaloneVideoName;
+        that._videoSubtitleUrl = that._standaloneSubtitleUrl;
+        that._flvPlayer = that._standaloneFlvPlayer;
+        that._isFlvMode = that._standaloneIsFlvMode;
+        that._standaloneFlvPlayer = null;
+        that._standaloneIsFlvMode = false;
+        that._standaloneVideoName = null;
+        that._standaloneVideoPath = null;
+        that._standaloneSubtitleUrl = null;
+        that._standaloneIsMigrated = false;
+        // 不清理 _isStreamingPlayback/_streamingVideoEl —— 它们和视频绑定，迁回面板后继续有效
+
+        // ★ DOM reparenting 后确保视频继续播放（Chromium 有时会在 DOM 移动后暂停视频）
+        if (videoEl) {
+            try {
+                if (videoEl.paused && videoEl.src) {
+                    videoEl.play().catch(function() {});
+                }
+            } catch(e) {}
+        }
+        // ★ 重置播放器关闭标记
+        that._videoPlayerClosed = false;
+    }
+
+    /**
+     * 独立视频播放器 — 面板未打开时在文档下方弹出
+     * 点击插件面板后自动迁移到面板内
+     */
+    _showStandalonePlayer(filePath, subtitleUrl) {
+        var that = this;
+        that._closeStandalonePlayer();
+
+        // ★ 重置面板播放器关闭标记，确保 _startFlvStreamingPlayback 不跳过
+        that._videoPlayerClosed = false;
+
+        // 解析时间戳参数 ?t=XX（秒数或 mm:ss 格式）或 ?t=start-end（循环片段）
+        var seekTime = 0;
+        var cleanPath = filePath;
+        var tsMatch = filePath.match(/[?&]t=([^&#]+)/);
+        if (tsMatch) {
+            cleanPath = filePath.split('?')[0];
+            var raw = decodeURIComponent(tsMatch[1]);
+            // ★ 循环片段格式 ?t=30-75 或 ?t=00:30-01:15
+            var rangeMatch = raw.match(/^(.+?)-(.+)$/);
+            if (rangeMatch) {
+                seekTime = that._parseTimestampParam(rangeMatch[1]);
+                that._loopPlayStart = seekTime;
+                that._loopPlayEnd = that._parseTimestampParam(rangeMatch[2]);
+                if (that._loopPlayEnd < that._loopPlayStart) {
+                    var _ltmp = that._loopPlayStart;
+                    that._loopPlayStart = that._loopPlayEnd;
+                    that._loopPlayEnd = _ltmp;
+                    seekTime = that._loopPlayStart;
+                }
+                that._log('[Standalone] 循环片段播放: start=' + seekTime + ', end=' + that._loopPlayEnd);
+            } else {
+                // mm:ss 格式
+                var mmss = raw.match(/^(\d+):(\d{2})$/);
+                if (mmss) {
+                    seekTime = parseInt(mmss[1], 10) * 60 + parseInt(mmss[2], 10);
+                } else {
+                    seekTime = parseFloat(raw) || 0;
+                }
+            }
+        }
+
+        // ★ 优先使用实例变量（面板迁移时保存的精确进度），否则用 ?t= 参数
+        // 必须在调用 _setupStandaloneVideoSrc 之前处理，因为 TS/FLV 的 seek 时间需要传递进去
+        if (that._migrationSeekTime && that._migrationSeekTime > 0) {
+            seekTime = that._migrationSeekTime;
+            that._migrationSeekTime = 0;
+        }
+
+        // 恢复上次保存的位置和大小
+        var savedPos = null;
+        try { savedPos = JSON.parse(localStorage.getItem('cd-standalone-pos') || 'null'); } catch(e) {}
+        var initLeft = (savedPos && typeof savedPos.left === 'number') ? savedPos.left : 10;
+        var initTop = (savedPos && typeof savedPos.top === 'number') ? savedPos.top : (window.innerHeight - 430);
+        var initW = (savedPos && savedPos.w) ? savedPos.w : 300;
+        var initH = (savedPos && savedPos.h) ? savedPos.h : 350;
+
+        // 创建浮窗播放器 — 无标题栏，纯视频窗口，可拖拽+缩放
+        var wrap = document.createElement('div');
+        wrap.id = 'cd-standalone-video-wrap';
+        wrap.style.cssText = 'position:fixed;left:' + initLeft + 'px;top:' + initTop + 'px;width:' + initW + 'px;height:' + initH + 'px;z-index:9999;background:#000;display:flex;flex-direction:column;border-radius:6px;box-shadow:0 4px 20px rgba(0,0,0,0.3);overflow:hidden;resize:both;min-width:200px;min-height:120px';
+
+        // 顶部拖拽条（半透明，hover 显示）
+        var dragBar = document.createElement('div');
+        dragBar.style.cssText = 'position:absolute;top:0;left:0;right:0;height:20px;z-index:30;cursor:move;opacity:0;transition:opacity 0.2s;background:linear-gradient(to bottom,rgba(0,0,0,0.4),transparent)';
+        wrap.addEventListener('mouseenter', function() { dragBar.style.opacity = '1'; });
+        wrap.addEventListener('mouseleave', function() { dragBar.style.opacity = '0'; });
+
+        // 关闭按钮（右上角，hover 显示）
+        var closeBtn = document.createElement('span');
+        closeBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M19 6.41L17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z" fill="#fff"/></svg>';
+        closeBtn.style.cssText = 'position:absolute;top:6px;right:6px;z-index:31;cursor:pointer;opacity:0;transition:opacity 0.2s;width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;background:rgba(0,0,0,0.4)';
+        closeBtn.title = '关闭';
+        closeBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            that._closeStandalonePlayer();
+        });
+        wrap.addEventListener('mouseenter', function() { closeBtn.style.opacity = '1'; });
+        wrap.addEventListener('mouseleave', function() { closeBtn.style.opacity = '0'; });
+
+        // 拖拽移动
+        dragBar.addEventListener('mousedown', function(e) {
+            e.preventDefault();
+            var startX = e.clientX;
+            var startY = e.clientY;
+            var startLeft = wrap.offsetLeft;
+            var startTop = wrap.offsetTop;
+            function onMove(ev) {
+                wrap.style.left = (startLeft + ev.clientX - startX) + 'px';
+                wrap.style.top = (startTop + ev.clientY - startY) + 'px';
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                // 保存位置
+                try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+        wrap.appendChild(dragBar);
+        wrap.appendChild(closeBtn);
+
+        // 监听窗口 resize 保存尺寸
+        var resizeObserver = new ResizeObserver(function() {
+            try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+        });
+        resizeObserver.observe(wrap);
+        wrap._resizeObserver = resizeObserver;
+
+        // 视频区域
+        var videoArea = document.createElement('div');
+        videoArea.id = 'cd-standalone-video-area';
+        videoArea.style.cssText = 'flex:1;min-height:0;background:#000;position:relative';
+
+        // 视频元素
+        var video = document.createElement('video');
+        video.id = 'cd-standalone-video-el';
+        video.style.cssText = 'width:100%;height:100%;outline:none;background:#000;object-fit:contain';
+        video.setAttribute('preload', seekTime > 0 ? 'metadata' : 'auto');
+        video.setAttribute('playsinline', '');
+        video.setAttribute('webkit-playsinline', '');
+        // ★ 有 seek 进度时不要 autoplay，避免先从 0:00 播再跳转
+        video.autoplay = (seekTime <= 0);
+        videoArea.appendChild(video);
+
+        // 自建控制栏：播放/暂停 | 时间 进度条 时间 | 音量 滑块 | 时间戳 循环片段 截图 | 全屏
+        var ctrlBar = document.createElement('div');
+        ctrlBar.id = 'cd-standalone-ctrl';
+        ctrlBar.style.cssText = 'display:flex;align-items:center;gap:10px;padding:6px 12px;background:rgba(0,0,0,0.85);flex-shrink:0;font-size:13px';
+        // 播放/暂停
+        ctrlBar.innerHTML += '<span id="cd-sa-play" title="播放/暂停" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="18" height="18"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg></span>';
+        // 当前时间
+        ctrlBar.innerHTML += '<span id="cd-sa-time-cur" style="font-size:11px;color:#ccc;min-width:36px;text-align:right">0:00</span>';
+        // 进度条
+        ctrlBar.innerHTML += '<div id="cd-sa-progress-wrap" style="flex:1;height:5px;background:rgba(255,255,255,0.2);border-radius:3px;cursor:pointer;position:relative"><div id="cd-sa-progress" style="position:absolute;top:0;left:0;height:100%;background:var(--b3-theme-primary,#4285f4);border-radius:3px;width:0%"></div></div>';
+        // 总时间
+        ctrlBar.innerHTML += '<span id="cd-sa-time-total" style="font-size:11px;color:#ccc;min-width:36px">0:00</span>';
+        // 时间戳
+        ctrlBar.innerHTML += '<span id="cd-sa-timestamp" title="插入时间戳" style="cursor:pointer;display:flex;align-items:center;color:#fff;margin-left:2px"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67V7z" fill="currentColor"/></svg></span>';
+        // 循环片段
+        ctrlBar.innerHTML += '<span id="cd-sa-loop" title="循环片段" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M7 7h10v3l4-4-4-4v3H5v6h2V7zm10 10H7v-3l-4 4 4 4v-3h12v-6h-2v4z" fill="currentColor"/></svg></span>';
+        // 截图
+        ctrlBar.innerHTML += '<span id="cd-sa-screenshot" title="截图" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 15.2a3.2 3.2 0 100-6.4 3.2 3.2 0 000 6.4zM9 2L7.17 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2h-3.17L15 2H9zm3 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z" fill="currentColor"/></svg></span>';
+        // 播放速度
+        ctrlBar.innerHTML += '<span id="cd-sa-speed" title="播放速度" style="cursor:pointer;color:#ccc;font-size:12px;min-width:28px;text-align:center;user-select:none">1x</span>';
+        // 音量
+        ctrlBar.innerHTML += '<span id="cd-sa-volume-btn" title="音量" style="cursor:pointer;display:flex;align-items:center;color:#fff"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M3 9v6h4l5 5V4L7 9H3z" fill="currentColor"/></svg></span>';
+        // 全屏
+        ctrlBar.innerHTML += '<span id="cd-sa-fullscreen" title="全屏" style="cursor:pointer;display:flex;align-items:center;color:#fff;margin-left:2px"><svg viewBox="0 0 24 24" width="16" height="16"><path d="M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z" fill="currentColor"/></svg></span>';
+
+        // 播放中遮罩图标
+        var overlay = document.createElement('div');
+        overlay.id = 'cd-standalone-play-overlay';
+        overlay.style.cssText = 'position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;pointer-events:none;opacity:0;transition:opacity 0.3s';
+        overlay.innerHTML = '<svg viewBox="0 0 24 24" width="48" height="48" style="opacity:0.8"><polygon points="8,5 19,12 8,19" fill="#fff"/></svg>';
+        videoArea.appendChild(overlay);
+        wrap.appendChild(videoArea);
+        // 控制栏在视频下方
+        wrap.appendChild(ctrlBar);
+
+        document.body.appendChild(wrap);
+
+        // 判断是否为流式格式（TS/FLV），需要特殊的 seek 机制
+        var ext2 = '';
+        try { ext2 = require('path').extname(cleanPath).toLowerCase(); } catch(e) {
+            var _dot = cleanPath.lastIndexOf('.');
+            ext2 = _dot >= 0 ? cleanPath.substring(_dot).toLowerCase() : '';
+        }
+        var _isStreamingFmt = (ext2 === '.ts' || ext2 === '.flv');
+
+        // ★ 设置视频源（使用剥离 ?t= 的干净路径）
+        // 对于 TS/FLV：_setupStandaloneVideoSrc 内部会使用 _standaloneSeekTime 进行缓冲区感知的 seek
+        if (seekTime > 0 && _isStreamingFmt) {
+            that._standaloneSeekTime = seekTime;
+        }
+        that._setupStandaloneVideoSrc(video, cleanPath);
+
+        // ★ Seek 机制：常规视频用简单 seek，TS/FLV 由 _setupStandaloneVideoSrc 内部处理
+        if (!_isStreamingFmt) {
+            // 常规格式：loadedmetadata 时 seek + play，避免先播 0:00 再跳转
+            var _saSeekDone = false;
+            function doNativeSeek() {
+                if (_saSeekDone) return;
+                if (seekTime > 0) {
+                    // ★ 先 seek 再 play：不用等 duration，直接设 currentTime，浏览器会自动 clamp
+                    video.currentTime = seekTime;
+                    _saSeekDone = true;
+                    video.removeEventListener('loadedmetadata', doNativeSeek);
+                    video.removeEventListener('canplay', doNativeSeek);
+                }
+                video.play().catch(function() {});
+            }
+            if (seekTime > 0) {
+                // ★ 有 seek 时：等 loadedmetadata 再 seek+play，确保不先播 0:00
+                video.addEventListener('loadedmetadata', doNativeSeek);
+            } else {
+                // 无 seek：直接播放
+                video.addEventListener('canplay', function onNoSeekPlay() {
+                    video.removeEventListener('canplay', onNoSeekPlay);
+                    video.play().catch(function() {});
+                }, { once: true });
+            }
+        } else {
+            // TS/FLV 格式：seek 由 _setupStandaloneVideoSrc 内部通过 _startFlvStreamingPlayback 处理
+            // _startFlvStreamingPlayback 内部会处理 canplay + play()，此处不再重复
+        }
+
+        // 记录状态 —— 存储干净路径用于播放，原始路径（含?t=）用于时间戳链接生成
+        that._standaloneVideoPath = cleanPath;
+        that._standaloneSubtitleUrl = subtitleUrl;
+        that._videoCurrentPath = cleanPath;
+        try { that._videoCurrentName = require('path').basename(cleanPath); } catch(e) { that._videoCurrentName = cleanPath.split(/[\\/]/).pop(); }
+
+        // 绑定事件
+        that._bindStandaloneControls(video, cleanPath);
+    }
+
+    /**
+     * 设置独立播放器的视频源
+     */
+    _setupStandaloneVideoSrc(video, filePath) {
+        var that = this;
+        var ext = '';
+        try { ext = require('path').extname(filePath).toLowerCase(); } catch(e) {
+            var dot = filePath.lastIndexOf('.');
+            ext = dot >= 0 ? filePath.substring(dot).toLowerCase() : '';
+        }
+
+        // TS/FLV 格式：复用面板的 _startFlvStreamingPlayback 播放逻辑
+        if (ext === '.flv') {
+            // FLV：复用面板的 _startFlvStreamingPlayback（统一 seek 机制，避免闪播 0:00）
+            // 先构建播放 URL：大文件用 Blob URL（避免代理 EMFILE），小文件用代理
+            var flvUrl = filePath;
+            try {
+                var fstat = require('fs').statSync(filePath);
+                if (fstat.size < 50 * 1024 * 1024) {
+                    var buf = require('fs').readFileSync(filePath);
+                    flvUrl = URL.createObjectURL(new Blob([buf]));
+                    that._standaloneBlobUrl = flvUrl;
+                }
+            } catch(e) {}
+            // 将 _standaloneSeekTime 传递给 _videoPendingSeek（和面板一致的 seek 机制）
+            var flvSeekTime = that._standaloneSeekTime || 0;
+            that._standaloneSeekTime = 0;
+            if (flvSeekTime > 0) {
+                that._videoPendingSeek = flvSeekTime;
+            }
+            // growInfo = {done: true} 表示非边转边播，不限制 seek 范围
+            that._startFlvStreamingPlayback(video, flvUrl, true, {done: true});
+            return;
+        }
+        if (ext === '.ts' || ext === '.mts' || ext === '.m2ts') {
+            // ★★★ 先检查伴随 MP4 缓存（和面板播放逻辑一致）★★★
+            // 有缓存时直接播放原生 MP4（file://），无需 ffmpeg 转码+mpegts.js 流式播放
+            // 这样浮窗播放也和面板一样流畅，无 "Large audio timestamp gap" 日志
+            var _saSidecarDirectPlay = false;
+            var _saSidecarMp4 = filePath + '.transcoded.mp4';
+            try {
+                if (require('fs').existsSync(_saSidecarMp4)) {
+                    var _saScStat = require('fs').statSync(_saSidecarMp4);
+                    if (_saScStat.size > 1024) {
+                        var _saScValid = true;
+                        try {
+                            var _saScFd = require('fs').openSync(_saSidecarMp4, 'r');
+                            var _saScBuf = Buffer.alloc(8);
+                            require('fs').readSync(_saScFd, _saScBuf, 0, 8, 0);
+                            require('fs').closeSync(_saScFd);
+                            if (_saScBuf.slice(4, 8).toString() !== 'ftyp') {
+                                that._log('_setupStandaloneVideoSrc: 伴随缓存 MP4 头无效，删除并重新转码');
+                                try { require('fs').unlinkSync(_saSidecarMp4); } catch(_) {}
+                                _saScValid = false;
+                            }
+                        } catch(_) {}
+                        if (_saScValid) {
+                            that._log('_setupStandaloneVideoSrc: 伴随缓存命中 → ' + _saSidecarMp4 + ' (' + (_saScStat.size / 1024 / 1024).toFixed(1) + 'MB)');
+                            _saSidecarDirectPlay = true;
+                        }
+                    }
+                }
+            } catch(_) {}
+
+            if (_saSidecarDirectPlay) {
+                // ★ 有缓存：直接播放 MP4（file:// 协议，零转码，流畅无日志）
+                video.src = 'file:///' + _saSidecarMp4.replace(/\\/g, '/');
+                // seek 处理：有 _standaloneSeekTime 时等 loadedmetadata 再 seek + play
+                var _saSeekTime = that._standaloneSeekTime || 0;
+                that._standaloneSeekTime = 0;
+                if (_saSeekTime > 0) {
+                    video.addEventListener('loadedmetadata', function onSaSeek() {
+                        video.removeEventListener('loadedmetadata', onSaSeek);
+                        if (_saSeekTime < video.duration) video.currentTime = _saSeekTime;
+                        video.play().catch(function() {});
+                    }, { once: true });
+                } else {
+                    // 无 seek：canplay 后直接播放
+                    video.addEventListener('canplay', function onSaPlay() {
+                        video.removeEventListener('canplay', onSaPlay);
+                        video.play().catch(function() {});
+                    }, { once: true });
+                }
+                return;
+            }
+
+            // 无缓存：复用面板的转码+流式播放
+            var codecInfo = { videoCodec: 'h264', audioCodec: 'aac', videoSupported: true, audioSupported: true, reason: 'ts_standalone' };
+            var cachedMp4Path = require('path').join(require('os').tmpdir(), 'siyuan-video-transcode', 'sa_ts_' + Date.now() + '.mp4');
+            try { require('fs').mkdirSync(require('path').join(require('os').tmpdir(), 'siyuan-video-transcode'), { recursive: true }); } catch(_) {}
+            // ★ TS 的 seek 由 _startFlvStreamingPlayback 通过 _videoPendingSeek 处理
+            // 把 _standaloneSeekTime 传递给 _videoPendingSeek（_transcodeFlvStreamCopy 异步启动，_videoPendingSeek 会被后续消费）
+            var tsSeekTime = that._standaloneSeekTime || 0;
+            that._standaloneSeekTime = 0;
+            if (tsSeekTime > 0) {
+                that._videoPendingSeek = tsSeekTime;
+            }
+            that._transcodeFlvStreamCopy(video, filePath, true, codecInfo, cachedMp4Path, null, null);
+            return;
+        }
+
+        // 常规格式：优先思源 HTTP 代理
+        try {
+            var dataDir = window.siyuan && window.siyuan.config && window.siyuan.config.system && window.siyuan.config.system.dataDir;
+            if (dataDir) {
+                var rel = require('path').relative(dataDir, filePath).replace(/\\/g, '/');
+                if (rel.indexOf('..') !== 0 && rel.indexOf(':') === -1) {
+                    var port = window.siyuan.config.system.networkServePort || 6806;
+                    video.src = 'http://127.0.0.1:' + port + '/' + rel;
+                    return;
+                }
+            }
+        } catch(e) {}
+        video.src = this.toFileUrl(filePath);
+    }
+
+    /**
+     * 绑定独立播放器的控件事件
+     */
+    _bindStandaloneControls(video, filePath) {
+        var that = this;
+
+        // 播放/暂停图标
+        var overlay = document.getElementById('cd-standalone-play-overlay');
+        video.addEventListener('play', function() {
+            if (overlay) { overlay.style.opacity = '0.8'; setTimeout(function() { overlay.style.opacity = '0'; }, 400); }
+        });
+        video.addEventListener('pause', function() {
+            if (overlay) { overlay.style.opacity = '0.8'; }
+        });
+
+        // 单击暂停/播放，双击全屏
+        var videoArea = document.getElementById('cd-standalone-video-area');
+        if (videoArea) {
+            videoArea.addEventListener('click', function(e) {
+                if (e.target === videoArea || e.target === video) {
+                    if (video.paused) { video.play(); } else { video.pause(); }
+                }
+            });
+            videoArea.addEventListener('dblclick', function(e) {
+                if (e.target === videoArea || e.target === video) {
+                    if (video.requestFullscreen) { video.requestFullscreen(); }
+                    else if (video.webkitRequestFullscreen) { video.webkitRequestFullscreen(); }
+                }
+            });
+        }
+
+        // 播放/暂停按钮
+        var playBtn = document.getElementById('cd-sa-play');
+        if (playBtn) {
+            playBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (video.paused) { video.play(); } else { video.pause(); }
+            });
+            video.addEventListener('play', function() { playBtn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" fill="currentColor"/></svg>'; });
+            video.addEventListener('pause', function() { playBtn.innerHTML = '<svg viewBox="0 0 24 24" width="18" height="18"><polygon points="8,5 19,12 8,19" fill="currentColor"/></svg>'; });
+        }
+
+        // 循环片段（复用面板的 _handleLoopSegment 逻辑：两步标记→生成链接插入笔记）
+        var loopBtn = document.getElementById('cd-sa-loop');
+        if (loopBtn) {
+            loopBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._handleStandaloneLoopSegment(video, loopBtn);
+            });
+        }
+
+        // 播放速度（弹出面板挂载到 body 避免 CSS 继承问题）
+        var speedBtn = document.getElementById('cd-sa-speed');
+        if (speedBtn) {
+            // 创建弹出面板
+            var speedPopup = document.createElement('div');
+            speedPopup.id = 'cd-sa-speed-popup';
+            speedPopup.style.cssText = 'position:fixed;background:rgba(0,0,0,0.88);border-radius:6px;padding:4px 0;display:none;z-index:10000;min-width:64px;pointer-events:auto';
+            var speedValues = [0.5, 0.75, 1, 1.25, 1.5, 2];
+            for (var vi = 0; vi < speedValues.length; vi++) {
+                var opt = document.createElement('div');
+                opt.textContent = speedValues[vi] + 'x';
+                opt.style.cssText = 'display:block;padding:4px 12px;font-size:11px;color:#ccc;cursor:pointer;text-align:center';
+                if (speedValues[vi] === 1) { opt.style.color = 'var(--b3-theme-primary,#4285f4)'; opt.style.fontWeight = 'bold'; }
+                opt.setAttribute('data-speed', speedValues[vi]);
+                opt.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    var s = parseFloat(this.getAttribute('data-speed'));
+                    video.playbackRate = s;
+                    speedBtn.textContent = s + 'x';
+                    speedPopup.style.display = 'none';
+                });
+                speedPopup.appendChild(opt);
+            }
+            document.body.appendChild(speedPopup);
+
+            // hover 显示/隐藏
+            var _speedTimer = null;
+            speedBtn.addEventListener('mouseenter', function() {
+                clearTimeout(_speedTimer);
+                var rect = speedBtn.getBoundingClientRect();
+                speedPopup.style.display = 'block';
+                speedPopup.style.left = (rect.left + rect.width / 2) + 'px';
+                speedPopup.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+                speedPopup.style.transform = 'translateX(-50%)';
+            });
+            speedBtn.addEventListener('mouseleave', function() {
+                _speedTimer = setTimeout(function() { speedPopup.style.display = 'none'; }, 200);
+            });
+            speedPopup.addEventListener('mouseenter', function() { clearTimeout(_speedTimer); });
+            speedPopup.addEventListener('mouseleave', function() { speedPopup.style.display = 'none'; });
+        }
+
+        // 进度条点击 → 定位到面板
+        var nameEl = document.getElementById('cd-sa-name');
+        if (nameEl) {
+            nameEl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that.locateFileInPanel(filePath);
+            });
+        }
+
+        // 关闭按钮
+        var closeBtnCtrl = document.getElementById('cd-sa-close');
+        if (closeBtnCtrl) {
+            closeBtnCtrl.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._closeStandalonePlayer();
+            });
+        }
+
+        // 速度切换 (0.5x → 0.75x → 1x → 1.25x → 1.5x → 2x)
+        var speedBtn = document.getElementById('cd-sa-speed');
+        if (speedBtn) {
+            var speeds = [0.5, 0.75, 1, 1.25, 1.5, 2];
+            var speedIdx = 2; // default 1x
+            speedBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                speedIdx = (speedIdx + 1) % speeds.length;
+                video.playbackRate = speeds[speedIdx];
+                speedBtn.textContent = speeds[speedIdx] + 'x';
+            });
+        }
+
+        // 进度条点击
+        var progWrap = document.getElementById('cd-sa-progress-wrap');
+        var progBar = document.getElementById('cd-sa-progress');
+        if (progWrap && progBar) {
+            progWrap.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (!video.duration || !isFinite(video.duration)) return;
+                var rect = progWrap.getBoundingClientRect();
+                var pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                video.currentTime = pct * video.duration;
+            });
+        }
+        // 更新进度和时间
+        var timeCur = document.getElementById('cd-sa-time-cur');
+        var timeTotal = document.getElementById('cd-sa-time-total');
+        function updateProgress() {
+            // ★ 循环片段检查（在 duration 检查之前，确保 FLV/TS 流式播放也能循环）
+            if (that._loopPlayEnd !== null && that._loopPlayStart !== null && video.currentTime >= that._loopPlayEnd) {
+                video.currentTime = that._loopPlayStart;
+            }
+            if (!video.duration || !isFinite(video.duration)) return;
+            var pct = (video.currentTime / video.duration) * 100;
+            if (progBar) progBar.style.width = pct + '%';
+            if (timeCur) timeCur.textContent = that._formatDuration(video.currentTime);
+            if (timeTotal) timeTotal.textContent = that._formatDuration(video.duration);
+        }
+        video.addEventListener('timeupdate', updateProgress);
+        video.addEventListener('loadedmetadata', updateProgress);
+
+        // ★ 面板可见性检测（非迁移模式）
+        // 浮窗视频播放时检测面板是否打开，打开则迁回面板播放
+        // 注意：面板首次打开时 renderFileTree() 也会处理迁回，此处需要避免双重触发
+        video.addEventListener('timeupdate', function() {
+            if (!that._standaloneVideoPath || that._standaloneIsMigrated) return; // 迁移模式由面板 video-el 的 timeupdate 处理
+            if (video.readyState < 2) return;
+            var _panelVisible = that._isPanelVisible();
+            // 延迟初始化
+            if (typeof that._lastPanelVisible === 'undefined') {
+                that._lastPanelVisible = _panelVisible;
+            }
+            // 面板从不可见变为可见 → 浮窗迁回面板
+            if (!that._lastPanelVisible && _panelVisible) {
+                that._lastPanelVisible = true;
+                var _vp3 = that._standaloneVideoPath;
+                var _vs3 = that._standaloneSubtitleUrl;
+                if (!_vp3) return; // 已经被其他路径处理了（如 renderFileTree）
+                var _savedTime3 = video.currentTime > 0 ? video.currentTime : 0;
+                that._closeStandalonePlayer();
+                setTimeout(function() {
+                    that._videoPlayerClosed = false;
+                    if (_savedTime3 > 0) { that._videoPendingSeek = _savedTime3; }
+                    that._openVideoInPanel(_vp3, _vs3, true);
+                }, 150);
+            }
+            if (that._lastPanelVisible && !_panelVisible) {
+                that._lastPanelVisible = false;
+            }
+        });
+        // 迁移模式的面板→浮窗弹出由面板 cd-video-el 的 timeupdate 处理（不在此处）
+
+        // 音量（hover 弹出竖向滑条面板）
+        var volBtn = document.getElementById('cd-sa-volume-btn');
+        if (volBtn) {
+            // 创建弹出面板
+            var volPopup = document.createElement('div');
+            volPopup.id = 'cd-sa-volume-popup';
+            volPopup.style.cssText = 'position:fixed;background:rgba(0,0,0,0.88);border-radius:6px;padding:10px 8px;display:none;z-index:10000;pointer-events:auto;text-align:center';
+            var volLabel = document.createElement('span');
+            volLabel.style.cssText = 'display:block;font-size:10px;color:#ccc;text-align:center;margin-bottom:4px';
+            volLabel.textContent = '100';
+            volPopup.appendChild(volLabel);
+            // 自建竖向滑块容器
+            var volTrack = document.createElement('div');
+            volTrack.style.cssText = 'width:6px;height:100px;background:rgba(255,255,255,0.2);border-radius:3px;cursor:pointer;position:relative;margin:0 auto';
+            var volFill = document.createElement('div');
+            volFill.style.cssText = 'position:absolute;bottom:0;left:0;width:100%;background:var(--b3-theme-primary,#4285f4);border-radius:3px;height:100%';
+            volTrack.appendChild(volFill);
+            volPopup.appendChild(volTrack);
+            document.body.appendChild(volPopup);
+
+            // 音量控制逻辑
+            var updateVol = function(clientY) {
+                var rect = volTrack.getBoundingClientRect();
+                var pct = 1 - Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+                video.volume = pct;
+                volFill.style.height = (pct * 100) + '%';
+                volLabel.textContent = Math.round(pct * 100);
+            };
+            volTrack.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                updateVol(e.clientY);
+                function onMove(ev) { updateVol(ev.clientY); }
+                function onUp() { document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp); }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+
+            // hover 显示
+            var _volTimer = null;
+            volBtn.addEventListener('mouseenter', function() {
+                clearTimeout(_volTimer);
+                var rect = volBtn.getBoundingClientRect();
+                volPopup.style.display = 'block';
+                volPopup.style.left = (rect.left + rect.width / 2) + 'px';
+                volPopup.style.bottom = (window.innerHeight - rect.top + 4) + 'px';
+                volPopup.style.transform = 'translateX(-50%)';
+            });
+            volBtn.addEventListener('mouseleave', function() {
+                _volTimer = setTimeout(function() { volPopup.style.display = 'none'; }, 200);
+            });
+            volPopup.addEventListener('mouseenter', function() { clearTimeout(_volTimer); });
+            volPopup.addEventListener('mouseleave', function() { volPopup.style.display = 'none'; });
+
+            // 静音切换
+            volBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (video.volume > 0) { video._lastVol = video.volume; video.volume = 0; volFill.style.height = '0%'; volLabel.textContent = '0'; }
+                else { var lv = video._lastVol || 1; video.volume = lv; volFill.style.height = (lv * 100) + '%'; volLabel.textContent = Math.round(lv * 100); }
+            });
+        }
+
+        // 全屏 (F键)插入
+        var tsBtn = document.getElementById('cd-sa-timestamp');
+        if (tsBtn) {
+            tsBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                that._insertVideoTimestamp(video.currentTime || 0);
+            });
+        }
+
+        // 截图
+        var ssBtn = document.getElementById('cd-sa-screenshot');
+        if (ssBtn) {
+            ssBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (!video.videoWidth || video.readyState < 2) {
+                    that.showToastMsg('⚠️ 视频尚未加载，无法截图', 2000, 'warning');
+                    return;
+                }
+                var tryScreenshot = function(fmt, q) {
+                    try {
+                        var canvas = document.createElement('canvas');
+                        var maxW = 960;
+                        var scale = video.videoWidth > maxW ? maxW / video.videoWidth : 1;
+                        canvas.width = Math.round(video.videoWidth * scale);
+                        canvas.height = Math.round(video.videoHeight * scale);
+                        var ctx = canvas.getContext('2d');
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        canvas.toBlob(function(blob) {
+                            if (!blob) {
+                                if (fmt === 'webp') { tryScreenshot('jpeg', 0.6); }
+                                else { that.showToastMsg('⚠️ 截图失败', 2000, 'warning'); }
+                                return;
+                            }
+                            that._uploadScreenshotToAssets(blob).then(function(assetPath) {
+                                var ct = video.currentTime || 0;
+                                var ts = that._formatTimestampTime(ct);
+                                var filePath2 = that._standaloneVideoPath;
+                                var fileName2 = that._standaloneVideoName || that._videoCurrentName || '';
+                                var url2 = that.toFileUrl(filePath2) + '?t=' + Math.floor(ct);
+                                var markdown;
+                                if (assetPath) {
+                                    markdown = '[' + fileName2 + ' ' + ts + '](' + url2 + ')\n![' + fileName2 + ' ' + ts + '](' + assetPath + ')';
+                                } else {
+                                    markdown = '[' + fileName2 + ' ' + ts + '](' + url2 + ')';
+                                }
+                                that._insertMarkdownAtCursor(markdown, function(success) {
+                                    if (!success) {
+                                        that._copyToClipboard(markdown, function(ok) {
+                                            if (!ok) that.showToastMsg('⚠️ 插入失败，请手动复制', 2000, 'warning');
+                                        });
+                                    }
+                                });
+                            });
+                        }, 'image/' + fmt, q);
+                    } catch(e) {
+                        that.showToastMsg('⚠️ 截图失败', 2000, 'warning');
+                    }
+                };
+                tryScreenshot('webp', 0.6);
+            });
+        }
+
+        // 全屏按钮
+        var fsBtn = document.getElementById('cd-sa-fullscreen');
+        if (fsBtn) {
+            fsBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                if (video.requestFullscreen) { video.requestFullscreen(); }
+                else if (video.webkitRequestFullscreen) { video.webkitRequestFullscreen(); }
+            });
+        }
+
+        // 键盘控制
+        var keyHandler = function(e) {
+            if (!that._standaloneVideoPath) return;
+            switch(e.key) {
+                case 'ArrowLeft': e.preventDefault(); if (video.duration) video.currentTime = Math.max(0, video.currentTime - 5); break;
+                case 'ArrowRight': e.preventDefault(); if (video.duration) video.currentTime = Math.min(video.duration, video.currentTime + 5); break;
+                case 'ArrowUp': e.preventDefault(); video.volume = Math.min(1, video.volume + 0.1); break;
+                case 'ArrowDown': e.preventDefault(); video.volume = Math.max(0, video.volume - 0.1); break;
+                case 'f': case 'F': e.preventDefault();
+                    if (video.requestFullscreen) { video.requestFullscreen(); }
+                    else if (video.webkitRequestFullscreen) { video.webkitRequestFullscreen(); }
+                    break;
+            }
+        };
+        document.addEventListener('keydown', keyHandler);
+        that._standaloneKeyHandler = keyHandler;
+    }
+
+    _closeStandalonePlayer(switchToPanel) {
+        var wasMigrated = this._standaloneIsMigrated;
+        var wrap = document.getElementById('cd-standalone-video-wrap');
+
+        // ★ 迁移模式下：先把 cd-video-wrap 搬回面板 videoBar（保留 DOM 结构），再销毁视频内容
+        // 不能让 wrap.remove() 把 cd-video-wrap 也移除，否则下次开视频找不到 cd-video-el
+        if (wasMigrated && wrap) {
+            var videoWrap = document.getElementById('cd-video-wrap');
+            var videoBar = document.getElementById('cd-video-bar');
+            if (videoWrap && videoBar) {
+                // 恢复 video-wrap 的面板样式
+                videoWrap.style.position = 'relative';
+                videoWrap.style.top = '';
+                videoWrap.style.left = '';
+                videoWrap.style.width = '';
+                videoWrap.style.height = '';
+                videoWrap.style.minHeight = '150px';
+                videoWrap.style.flex = 'none';
+                // 暂停视频、清空 src（销毁视频内容，但保留 DOM 结构）
+                var ve = document.getElementById('cd-video-el');
+                if (ve) { try { ve.pause(); ve.removeAttribute('src'); ve.load(); } catch(e) {} }
+                // 放回 videoBar
+                if (videoBar.firstChild) {
+                    videoBar.insertBefore(videoWrap, videoBar.firstChild);
+                } else {
+                    videoBar.appendChild(videoWrap);
+                }
+            }
+        }
+
+        if (wrap) {
+            // 保存当前位置再移除，避免 ResizeObserver 覆盖错误值
+            try { localStorage.setItem('cd-standalone-pos', JSON.stringify({ left: wrap.offsetLeft, top: wrap.offsetTop, w: wrap.offsetWidth, h: wrap.offsetHeight })); } catch(e) {}
+            if (wrap._resizeObserver) { wrap._resizeObserver.disconnect(); }
+            wrap.remove();
+        }
+        if (this._standaloneKeyHandler) {
+            document.removeEventListener('keydown', this._standaloneKeyHandler);
+            this._standaloneKeyHandler = null;
+        }
+        // ★ 清理面板遗留 click/dblclick 处理器的 capture 拦截
+        if (this._standaloneClickCapture && this._standaloneClickCaptureEl) {
+            this._standaloneClickCaptureEl.removeEventListener('click', this._standaloneClickCapture, true);
+            this._standaloneClickCaptureEl.removeEventListener('dblclick', this._standaloneClickCapture, true);
+            this._standaloneClickCapture = null;
+            this._standaloneClickCaptureEl = null;
+        }
+
+        // ★ 迁移模式：关闭浮窗 → 直接销毁视频（不切回隐藏面板继续播放）
+        if (wasMigrated) {
+            // 销毁浮窗专属的 flvPlayer
+            if (this._standaloneFlvPlayer) {
+                try { this._standaloneFlvPlayer.destroy(); } catch(e) {}
+                this._standaloneFlvPlayer = null;
+            }
+            if (this._flvPlayer) {
+                try { this._flvPlayer.destroy(); } catch(e) {}
+                this._flvPlayer = null;
+            }
+            this._isStreamingPlayback = false;
+            this._streamingVideoEl = null;
+            this._isFlvMode = false;
+            this._standaloneIsFlvMode = false;
+            this._standaloneVideoName = null;
+            this._standaloneIsMigrated = false;
+            // ★ 保存视频播放位置（迁移模式下视频是从面板搬来的，需要记录位置以便下次恢复）
+            var _migratedVe = document.getElementById('cd-video-el');
+            if (this._videoCurrentPath && _migratedVe && _migratedVe.currentTime > 2) {
+                try {
+                    localStorage.setItem('cd-video-pos:' + this._videoCurrentPath, _migratedVe.currentTime);
+                } catch(e) {}
+            }
+            this._videoCurrentPath = null;
+            this._videoCurrentName = null;
+            this._videoSubtitleUrl = null;
+            // ★ 清理转码进程和流式播放临时文件（迁移前的面板播放可能启动了 ffmpeg 转码）
+            if (this._flvTranscodeProc) {
+                try { this._flvTranscodeProc.kill(); } catch(e) {}
+                this._flvTranscodeProc = null;
+            }
+            if (this._streamingFlvPath) {
+                try { require('fs').unlinkSync(this._streamingFlvPath); } catch(_) {}
+                this._streamingFlvPath = null;
+            }
+            if (this._transcodePollInterval) {
+                clearInterval(this._transcodePollInterval);
+                this._transcodePollInterval = null;
+            }
+            // ★ 清理定时器（音视频同步、缓冲监控等）
+            if (this._videoAvSyncTimer) { clearInterval(this._videoAvSyncTimer); this._videoAvSyncTimer = null; }
+            if (this._avDriftTimer) { clearInterval(this._avDriftTimer); this._avDriftTimer = null; }
+            if (this._bufferMonitorTimer) { clearInterval(this._bufferMonitorTimer); this._bufferMonitorTimer = null; }
+            if (this._smartBufferCleanup) { this._smartBufferCleanup(); this._smartBufferCleanup = null; }
+            this._isAvSyncing = false;
+            this._videoEstimatedDuration = 0;
+            // ★ 释放 Blob URL（面板播放时创建的，迁移到浮窗后仍存在）
+            if (this._flvBlobUrl) {
+                try { URL.revokeObjectURL(this._flvBlobUrl); } catch(e) {}
+                this._flvBlobUrl = null;
+            }
+            if (this._nativeBlobUrl) {
+                try { URL.revokeObjectURL(this._nativeBlobUrl); } catch(e) {}
+                this._nativeBlobUrl = null;
+            }
+            // 隐藏面板内的 videoBar（视频已销毁）
+            var videoBar = document.getElementById('cd-video-bar');
+            if (videoBar) videoBar.style.display = 'none';
+        } else {
+            // 非迁移模式：独立创建的视频，正常清理
+            if (this._standaloneFlvPlayer) {
+                try { this._standaloneFlvPlayer.destroy(); } catch(e) {}
+                this._standaloneFlvPlayer = null;
+            }
+            // ★ 非迁移模式下也需要销毁 _flvPlayer（浮窗创建的 mpegts player，面板没在用）
+            //   之前注释说"面板视频可能还在用"是错的——浮窗弹出时面板根本没打开视频
+            if (this._flvPlayer) {
+                try { this._flvPlayer.destroy(); } catch(e) {}
+                this._flvPlayer = null;
+            }
+            this._isFlvMode = false;
+            this._isStreamingPlayback = false;
+            this._streamingVideoEl = null;
+            // ★ 清理浮窗的转码进程（否则进程继续写临时文件，新的播放无法正常启动）
+            if (this._flvTranscodeProc) {
+                try { this._flvTranscodeProc.kill(); } catch(e) {}
+                this._flvTranscodeProc = null;
+            }
+            if (this._streamingFlvPath) {
+                try { require('fs').unlinkSync(this._streamingFlvPath); } catch(_) {}
+                this._streamingFlvPath = null;
+            }
+            if (this._standaloneTempFile) {
+                try { require('fs').unlinkSync(this._standaloneTempFile); } catch(e) {}
+                this._standaloneTempFile = null;
+            }
+            if (this._standaloneBlobUrl) {
+                try { URL.revokeObjectURL(this._standaloneBlobUrl); } catch(e) {}
+                this._standaloneBlobUrl = null;
+            }
+            if (this._standaloneFfmpeg) {
+                try { this._standaloneFfmpeg.kill(); } catch(e) {}
+                this._standaloneFfmpeg = null;
+            }
+            // ★ 非迁移模式下也清除 _videoCurrentPath/_videoCurrentName/_videoSubtitleUrl
+            // 否则 isSameVideo 条件可能短路（videoBar.style.display !== 'none' && currentPath === filePath）
+            // 导致 _openVideoInPanel 走 seek 分支而不重新加载视频（但视频已被 _closeStandalonePlayer destroy）
+            this._videoCurrentPath = null;
+            this._videoCurrentName = null;
+            this._videoSubtitleUrl = null;
+        }
+        this._standaloneVideoPath = null;
+        this._standaloneSubtitleUrl = null;
+        this._standaloneSeekTime = 0;
+        this._standaloneIsMigrated = false;
+        // ★ 清理循环片段状态
+        this._loopSegMarkStart = null;
+        this._loopPlayStart = null;
+        this._loopPlayEnd = null;
+        this._videoPendingSeek = 0;
     }
 
     /**
@@ -9084,7 +14157,7 @@ class LocalBrowsePlugin extends Plugin {
                     return;
                 }
                 if (fileMode === 'smp') {
-                    // 思源默认（思播）：同步在插件面板中定位，然后不拦截，让思源/思播自己处理
+                    // 思源默认（思播）：不拦截，让思源/思播自己处理
                     that.locateFileInPanel(localPath);
                     return;
                 }
@@ -9154,40 +14227,49 @@ class LocalBrowsePlugin extends Plugin {
                 }
                 if (isInProtyle) {
                     // 从 data-src 或 src 属性获取媒体路径
-                    // 优先 data-src（原始路径），其次 getAttribute('src')（HTML 属性值），最后 el.src（浏览器解析后的绝对 URL）
                     var mediaSrc = mediaEl.getAttribute('data-src') || mediaEl.getAttribute('src') || '';
-                    // 如果属性值是 blob: 或为空，尝试 el.src（浏览器解析后的绝对 URL，可能为 http://127.0.0.1:*/assets/...）
                     if ((!mediaSrc || mediaSrc.indexOf('blob:') === 0) && mediaEl.src) {
                         mediaSrc = mediaEl.src;
                     }
                     var localMediaPath = mediaSrc ? _resolveMediaPath(mediaSrc) : null;
+                    console.warn('[LocalBrowse] VIDEO点击诊断: mediaSrc=' + mediaSrc + ', localPath=' + localMediaPath + ', tag=' + mediaEl.tagName + ', inProtyle=' + isInProtyle);
                     if (localMediaPath) {
                         var isVid = mediaEl.tagName === 'VIDEO';
                         var mediaMode = that._getFileOpenMode(localMediaPath);
+                        console.warn('[LocalBrowse] VIDEO点击诊断: mediaMode=' + mediaMode + ', isVid=' + isVid);
                         if (mediaMode === 'siyuan') {
-                            // 插件默认：拦截并走插件内嵌播放器
                             e.preventDefault();
                             e.stopPropagation();
                             e.stopImmediatePropagation();
+                            // ★ 使用本地路径传给 _openVideoInPanel（用于状态管理/时间戳/重启恢复）
+                            //    播放时通过 HTTP URL（mediaEl.src）避免 file:// 编码问题
                             if (isVid) {
+                                console.warn('[LocalBrowse] VIDEO点击诊断: 调用 _openVideoInPanel, localPath=' + localMediaPath);
                                 that._openVideoInPanel(localMediaPath, null, true);
                             } else {
                                 var vBar = document.getElementById('cd-video-bar');
                                 if (vBar && vBar.style.display !== 'none') { that._closeVideoPlayer(); }
                                 var mName = require('path').basename(localMediaPath);
-                                that.playAudio(localMediaPath, mName);
+                                // ★ 音频使用 HTTP URL 播放（避免 file:// 编码问题）
+                                var playSrc = mediaEl.src || mediaSrc;
+                                that.playAudio(playSrc, mName);
                             }
-                            that.locateFileInPanel(localMediaPath);
+                            // assets/ 路径的视频不定位到面板（assets 目录文件太多，定位体验差）
+                            var isAssetsPath = mediaSrc.indexOf('assets/') === 0 || mediaSrc.indexOf('assets\\') === 0 || mediaSrc.indexOf('/assets/') === 0;
+                            if (!isAssetsPath) {
+                                that.locateFileInPanel(localMediaPath);
+                            } else {
+                                console.warn('[LocalBrowse] VIDEO点击诊断: assets 路径跳过面板定位');
+                            }
                             return;
                         } else if (mediaMode === 'system') {
-                            // 电脑默认：拦截，用系统播放器
                             e.preventDefault();
                             e.stopPropagation();
                             e.stopImmediatePropagation();
                             that._openVideoWithSubtitle(localMediaPath, null);
                             return;
                         }
-                        // smp（思源默认/思播）：不拦截，让思播自己处理
+                        // smp（思源默认/思播）：不拦截，让思源/思播自己处理
                     }
                 }
             }
@@ -9234,7 +14316,7 @@ class LocalBrowsePlugin extends Plugin {
                                     that._openVideoWithSubtitle(resolvedMediaPath, null);
                                     return;
                                 }
-                                // smp（思源默认/思播）：不拦截，让思播自己处理
+                                // smp（思源默认/思播）：不拦截，让思源/思播自己处理
                             }
                         }
                     }
@@ -9271,7 +14353,7 @@ class LocalBrowsePlugin extends Plugin {
                 }
                 that.locateFileInPanel(localPath);
             } else if (fileMode === 'smp') {
-                // 思源默认（思播）：关闭插件播放器，不拦截，让思播自己处理
+                // 思源默认（思播）：不拦截，让思源/思播自己处理
                 var videoBar = document.getElementById('cd-video-bar');
                 if (videoBar && videoBar.style.display !== 'none') {
                     that._closeVideoPlayer();
@@ -9349,16 +14431,54 @@ class LocalBrowsePlugin extends Plugin {
      * 确保插件面板可见（如果面板被隐藏则显示它）
      */
     ensurePanelVisible() {
-        if (!this.dockPanel || !this.dockPanel.element) return;
-        // 检查面板自身是否可见
-        var panelEl = this.dockPanel.element;
-        var rect = panelEl.getBoundingClientRect();
-        if (rect.width > 0 && rect.height > 0) return; // 已可见
+        // dockPanel 尚未初始化（用户从未打开过面板），直接点 dock 图标触发 init
+        if (!this.dockPanel || !this.dockPanel.element) {
+            var dockIcon = document.querySelector('.dock__item[data-type="cd_filetree"]');
+            if (dockIcon) {
+                try { dockIcon.click(); } catch(e) {}
+            }
+            return;
+        }
+        if (this._isPanelVisible()) return;
         // 面板不可见，模拟点击 dock 图标来显示
         var dockIcon = document.querySelector('.dock__item[data-type="cd_filetree"]');
         if (dockIcon) {
-            dockIcon.click();
+            try { dockIcon.click(); } catch(e) {}
+            // 兜底：如果 click() 没有触发，尝试 dispatchEvent
+            var that = this;
+            setTimeout(function() {
+                if (!that._isPanelVisible() && dockIcon) {
+                    try {
+                        dockIcon.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                        dockIcon.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                        dockIcon.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    } catch(e2) {}
+                }
+            }, 30);
         }
+    }
+
+    /**
+     * 检查插件 Dock 面板当前是否可见（已展开显示）
+     * 沿 DOM 树向上检查所有祖先是否有 display:none（侧栏折叠时整棵树隐藏）
+     */
+    _isPanelVisible() {
+        if (!this.dockPanel || !this.dockPanel.element) return false;
+        var el = this.dockPanel.element;
+        var current = el;
+        while (current && current !== document.documentElement) {
+            try {
+                var style = window.getComputedStyle(current);
+                if (style.display === 'none' || style.visibility === 'hidden') return false;
+            } catch(e) {}
+            current = current.parentElement;
+        }
+        // 检查元素是否在视口内（侧栏折叠时元素可能在屏幕外）
+        var rect = el.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
+        if (rect.bottom < 0 || rect.right < 0 ||
+            rect.top > window.innerHeight || rect.left > window.innerWidth) return false;
+        return true;
     }
 
     /**
@@ -9548,6 +14668,11 @@ class LocalBrowsePlugin extends Plugin {
      * 将本地路径转换为 file:/// URL
      */
     toFileUrl(filePath) {
+        if (!filePath) return '';
+        // ★ 如果传入的已经是 http(s) URL，直接返回（思源本地服务器 assets 路径）
+        if (filePath.indexOf('http://') === 0 || filePath.indexOf('https://') === 0) {
+            return filePath;
+        }
         // Docker 路径映射：容器路径 → 宿主机路径
         var mappedPath = this.containerToHost(filePath);
         var normalizedPath = mappedPath.replace(/\\/g, '/').replace(/\/+/g, '/');
@@ -11080,20 +16205,24 @@ class LocalBrowsePlugin extends Plugin {
         var that = this;
         try {
             var key = 'cd_video_state_' + this.platform;
+            var heightKey = 'cd_video_height_' + this.platform;
             var data = filePath && fileName ? { path: filePath, name: fileName } : null;
-            // 同步保存视频播放器高度（跨重启不丢失）
-            if (data) {
-                try {
-                    var videoWrap = document.getElementById('cd-video-wrap');
-                    if (videoWrap) {
-                        var curH = videoWrap.offsetHeight;
-                        if (curH && curH > 50) {
-                            data.height = curH;
-                            localStorage.setItem('cd-video-bar-height', curH);
+            // ★ 同步保存视频播放器高度（跨重启不丢失）
+            //    即使关闭视频（filePath=null），也要保留高度值供下次使用
+            try {
+                var videoWrap = document.getElementById('cd-video-wrap');
+                if (videoWrap) {
+                    var curH = videoWrap.offsetHeight;
+                    if (curH && curH > 50) {
+                        if (data) data.height = curH;
+                        localStorage.setItem('cd-video-bar-height', curH);
+                        // ★ 持久化高度到 saveData（重启后 localStorage 可能被清空）
+                        if (typeof that.saveData === 'function') {
+                            that.saveData(heightKey, curH).catch(function() {});
                         }
                     }
-                } catch(e) {}
-            }
+                }
+            } catch(e) {}
             // localStorage 即时缓存（同步，_restoreVideoState 优先读取）
             if (data) {
                 localStorage.setItem(key, JSON.stringify(data));
@@ -11147,9 +16276,8 @@ class LocalBrowsePlugin extends Plugin {
                     }
 
                     // 使用 _openVideoInPanel 恢复播放器（不自动播放，已含高度恢复逻辑）
+                    // 注：_openVideoInPanel 内部已设置 _videoCurrentPath/Name，此处不重复
                     that._openVideoInPanel(savedPath, subUrl, false);
-                    that._videoCurrentPath = savedPath;
-                    that._videoCurrentName = savedName;
 
                     that._log('_restoreVideoState: restored', savedName, 'height=' + savedHeight);
                 }).catch(function(e) {
@@ -12065,7 +17193,7 @@ class LocalBrowsePlugin extends Plugin {
 
         var rect = anchorBtn.getBoundingClientRect();
         menu.style.left = rect.left + 'px';
-        menu.style.top = (rect.bottom + 4) + 'px';
+        menu.style.top = (rect.bottom + 20) + 'px';
 
         // 点击外部关闭菜单
         var closeMenu = function(e) {
@@ -12840,7 +17968,7 @@ class LocalBrowsePlugin extends Plugin {
                     try { pathExists = fs.existsSync(normalizedCandidate); } catch(e) {}
                 }
                 if (pathExists) {
-                    that._log('_getMySyncRoot: deviceId mismatch detected, migrating from "' + keys[0] + '" to "' + deviceId + '"');
+                    this._log('_getMySyncRoot: deviceId mismatch detected, migrating from "' + keys[0] + '" to "' + deviceId + '"');
                     platformRoots[deviceId] = normalizedCandidate;
                     delete platformRoots[keys[0]];
                     this.saveSyncRoots();
@@ -12995,7 +18123,7 @@ class LocalBrowsePlugin extends Plugin {
                         try { oldPathExists = fs.existsSync(oldVal); } catch(e) {}
                     }
                     if (oldPathExists) {
-                        that._log('_migrateSyncRoots: migrating deviceId "' + oldKey + '" → "' + deviceId + '" for platform ' + this.platform);
+                        this._log('_migrateSyncRoots: migrating deviceId "' + oldKey + '" → "' + deviceId + '" for platform ' + this.platform);
                         currentRoots[deviceId] = oldVal;
                         delete currentRoots[oldKey];
                         migrated = true;
@@ -13240,7 +18368,7 @@ class LocalBrowsePlugin extends Plugin {
         var pathInput = el.querySelector('#cd-syncroot-path');
         var startPath = (pathInput && pathInput.value && pathInput.value.trim()) || this.currentPath || this.getRootPath();
 
-        // 统一回调：把选中的目录路径传给 onSelect，由调用方决定是否拼接 LocalBrowseSync
+        // 统一回调：把选中的同步文件夹路径原样传给 onSelect
         function done(selectedDir) {
             if (selectedDir && typeof onSelect === 'function') {
                 onSelect(selectedDir);
@@ -14209,6 +19337,16 @@ class LocalBrowsePlugin extends Plugin {
      */
     saveFavorites() {
         var that = this;
+        // ★ 防抖：100ms 内多次调用只执行最后一次，避免快速连续修改时 loadData→saveData 竞态导致数据丢失
+        if (that._saveFavTimer) clearTimeout(that._saveFavTimer);
+        that._saveFavTimer = setTimeout(function() {
+            that._saveFavTimer = null;
+            that._doSaveFavorites();
+        }, 100);
+    }
+
+    _doSaveFavorites() {
+        var that = this;
         try {
             // 清理 _exists 临时标记，避免持久化运行时状态
             var cleanItems = this.favorites.map(function(f) {
@@ -14387,9 +19525,6 @@ class LocalBrowsePlugin extends Plugin {
             }
             if (fixCount > 0) {
                 that.showToastMsg('已自动修复 ' + fixCount + ' 个收藏路径：' + fixedNames.join('、'));
-            }
-            if (failCount > 0) {
-                that.showToastMsg('有 ' + failCount + ' 个收藏路径已失效且无法自动修复，请手动重新收藏');
             }
         } catch (e) {
             that._error('check favorites validity error:', e);
@@ -14705,7 +19840,8 @@ class LocalBrowsePlugin extends Plugin {
                         var movedFav = that.favorites.splice(srcIdx, 1)[0];
                         if (srcIdx < tgtIdx && !isBefore) {
                             // 源在目标前，插入到目标后
-                            that.favorites.splice(tgtIdx, 0, movedFav);
+                            // splice(srcIdx,1) 后 tgtIdx 实际偏移了 -1
+                            that.favorites.splice(tgtIdx - 1, 0, movedFav);
                         } else if (srcIdx > tgtIdx && isBefore) {
                             // 源在目标后，插入到目标前
                             that.favorites.splice(tgtIdx, 0, movedFav);
@@ -15900,7 +21036,7 @@ class LocalBrowsePlugin extends Plugin {
                         for (var csf0 = 0; csf0 < result.crossSyncFixed.length; csf0++) {
                             var csf0Item = result.crossSyncFixed[csf0];
                             try {
-                                await that.replaceLink(docId, csf0Item.oldUrl, csf0Item.newPath, csf0, { silent: true });
+                                await that.replaceLink(docId, csf0Item.oldUrl, csf0Item.newPath, csf0, { silent: true }, '✅');
                                 that._log('autoCheckLinks - cross-sync fixed:', csf0Item.oldUrl, '→', csf0Item.newPath);
                             } catch(e) {
                                 that._error('autoCheckLinks - cross-sync fix failed:', csf0Item.oldUrl, e);
@@ -15934,7 +21070,7 @@ class LocalBrowsePlugin extends Plugin {
                     for (var csf = 0; csf < result.crossSyncFixed.length; csf++) {
                         var csfItem = result.crossSyncFixed[csf];
                         try {
-                            await that.replaceLink(docId, csfItem.oldUrl, csfItem.newPath, csf, { silent: true });
+                            await that.replaceLink(docId, csfItem.oldUrl, csfItem.newPath, csf, { silent: true }, '✅');
                             autoFixed++;
                             that._log('autoCheckLinks - cross-sync fixed:', csfItem.oldUrl, '→', csfItem.newPath);
                         } catch(e) {
@@ -16024,7 +21160,7 @@ class LocalBrowsePlugin extends Plugin {
                 } else if (candidates.length === 1) {
                     // 唯一匹配 → 自动修复
                     try {
-                        await that.replaceLink(docId, item.oldUrl, candidates[0].fullPath, i, { silent: true });
+                        await that.replaceLink(docId, item.oldUrl, candidates[0].fullPath, i, { silent: true }, '✅');
                         autoFixed++;
                         that._log('autoCheckLinks - auto fixed:', item.fileName, '→', candidates[0].fullPath);
                     } catch(e) {
@@ -16039,6 +21175,15 @@ class LocalBrowsePlugin extends Plugin {
                     item._searchResults = candidates;
                     pendingItems.push(item);
                     that._log('autoCheckLinks - need manual:', item.fileName, candidates.length, 'candidates');
+                }
+            }
+
+            // 为自动修复失败的链接添加 ❌ 标记
+            for (var pi = 0; pi < pendingItems.length; pi++) {
+                try {
+                    await that._markBrokenLinkInDoc(docId, pendingItems[pi], '❌');
+                } catch(e) {
+                    that._error('autoCheckLinks - mark broken link failed:', pendingItems[pi].fileName, e);
                 }
             }
 
@@ -16176,7 +21321,7 @@ class LocalBrowsePlugin extends Plugin {
                 if (confirmBtn) {
                     (function(idx, cands) {
                         confirmBtn.addEventListener('click', async function() {
-                            await that.replaceLink(docId, brokenItems[idx].oldUrl, cands[0].fullPath, idx, { dialog: dialog, brokenLinks: brokenItems });
+                            await that.replaceLink(docId, brokenItems[idx].oldUrl, cands[0].fullPath, idx, { dialog: dialog, brokenLinks: brokenItems }, '✅');
                             var s = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
                             if (s) { s.textContent = '✅ 已修复'; s.style.color = 'var(--b3-theme-success,#52c41a)'; }
                             that._cachedBrokenResult = null;
@@ -16227,7 +21372,7 @@ class LocalBrowsePlugin extends Plugin {
                             if (!selectedRadio) return;
                             var candIdx = parseInt(selectedRadio.value, 10);
                             var chosen = cands[candIdx];
-                            await that.replaceLink(docId, brokenItems[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: brokenItems });
+                            await that.replaceLink(docId, brokenItems[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: brokenItems }, '✅');
                             var s = dialog.querySelector('.cd-relink-status[data-index="' + idx + '"]');
                             if (s) { s.textContent = '✅ 已修复'; s.style.color = 'var(--b3-theme-success,#52c41a)'; }
                             that._cachedBrokenResult = null;
@@ -16437,7 +21582,7 @@ class LocalBrowsePlugin extends Plugin {
                     item._searchResults = exactCandidates;
 
                     if (exactCandidates.length === 1) {
-                        await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, { dialog: dialog, brokenLinks: result.broken });
+                        await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, { dialog: dialog, brokenLinks: result.broken }, '✅');
                         if (statusEl) {
                             statusEl.textContent = '✅ 已修复';
                             statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
@@ -16488,7 +21633,7 @@ class LocalBrowsePlugin extends Plugin {
                                 if (!selectedRadio) return;
                                 var candIdx = parseInt(selectedRadio.value, 10);
                                 var chosen = area._candidates[candIdx];
-                                await that.replaceLink(docId, result.broken[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: result.broken });
+                                await that.replaceLink(docId, result.broken[idx].oldUrl, chosen.fullPath, idx, { dialog: dialog, brokenLinks: result.broken }, '✅');
                                 // 刷新底部状态统计
                                 var allStatusEls = dialog.querySelectorAll('.cd-relink-status');
                                 var newFixed = 0, newPending = 0;
@@ -17015,7 +22160,7 @@ class LocalBrowsePlugin extends Plugin {
                     statusEl.textContent = '🔧 修复中...';
                     statusEl.style.color = 'var(--b3-theme-secondary,#999)';
                 }
-                await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, context);
+                await that.replaceLink(docId, item.oldUrl, exactCandidates[0].fullPath, i, context, '✅');
                 if (statusEl) {
                     statusEl.textContent = '✅ 已修复';
                     statusEl.style.color = 'var(--b3-theme-success,#52c41a)';
@@ -17069,7 +22214,7 @@ class LocalBrowsePlugin extends Plugin {
                             if (!selectedRadio) return;
                             var candIdx = parseInt(selectedRadio.value, 10);
                             var chosen = area._candidates[candIdx];
-                            await that.replaceLink(docId, brokenLinks[idx].oldUrl, chosen.fullPath, idx, context);
+                            await that.replaceLink(docId, brokenLinks[idx].oldUrl, chosen.fullPath, idx, context, '✅');
                         });
                     }
                 }
@@ -17205,7 +22350,7 @@ class LocalBrowsePlugin extends Plugin {
                         var candIdx = parseInt(selectedRadio.value, 10);
                         var chosen = candidateArea ? candidateArea._candidates[candIdx] : null;
                         if (chosen) {
-                            that.replaceLink(context.docId, item.oldUrl, chosen.fullPath, itemIndex, context);
+                            that.replaceLink(context.docId, item.oldUrl, chosen.fullPath, itemIndex, context, '✅');
                         }
                     });
                 }
@@ -17835,12 +22980,165 @@ class LocalBrowsePlugin extends Plugin {
     }
 
     /**
+     * 在 markdown 中的链接前添加状态标记（✅ 或 ❌）
+     * 如果链接前已有标记，替换为新标记；如果相同则跳过
+     * @param {string} markdown - 块的 markdown 内容
+     * @param {string} urlInMd - markdown 中实际存在的 URL 格式（不含 title）
+     * @param {string} mark - 标记符号（'✅' 或 '❌'）
+     * @returns {{ markdown: string, changed: boolean }}
+     */
+    _addLinkMarkToMarkdown(markdown, urlInMd, mark) {
+        function escapeRegex(str) {
+            return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+
+        // 在 markdown 中找到包含 urlInMd 的链接，在其前面添加/替换标记
+        var idx = markdown.indexOf(urlInMd);
+        if (idx === -1) {
+            return { markdown: markdown, changed: false };
+        }
+
+        // 从 URL 位置向前搜索 ]( ，定位链接的文本/URL 边界
+        var searchFrom = Math.max(0, idx - 500);
+        var subStr = markdown.substring(searchFrom, idx);
+        var bracketParen = subStr.lastIndexOf('](');
+        if (bracketParen === -1) {
+            return { markdown: markdown, changed: false };
+        }
+
+        // bracketParen 是 ]( 中 ] 的相对位置
+        var absBracketPos = searchFrom + bracketParen; // ] 的绝对位置
+
+        // 从 ] 向前搜索 [ ，定位链接文本的开始
+        var subBefore = markdown.substring(Math.max(0, absBracketPos - 500), absBracketPos);
+        var openBracket = subBefore.lastIndexOf('[');
+        if (openBracket === -1) {
+            return { markdown: markdown, changed: false };
+        }
+        var absOpenBracket = Math.max(0, absBracketPos - 500) + openBracket; // [ 的绝对位置
+
+        // 检查 [ 前面是否有 !（图片链接 ![alt](url)）
+        var isImage = absOpenBracket > 0 && markdown[absOpenBracket - 1] === '!';
+        var linkStart = isImage ? absOpenBracket - 1 : absOpenBracket;
+
+        // 检查链接前是否已有 ✅/❌ 标记
+        var beforeLink = markdown.substring(Math.max(0, linkStart - 6), linkStart);
+        var existingMarkMatch = beforeLink.match(/([✅❌])\s?$/);
+        if (existingMarkMatch) {
+            if (existingMarkMatch[1] === mark) {
+                // 相同标记，不需要修改
+                return { markdown: markdown, changed: false };
+            }
+            // 替换现有标记为新标记
+            var markEnd = linkStart;
+            var markStart = markEnd - existingMarkMatch[0].length;
+            return {
+                markdown: markdown.substring(0, markStart) + mark + ' ' + markdown.substring(linkStart),
+                changed: true
+            };
+        }
+
+        // 插入新标记
+        return {
+            markdown: markdown.substring(0, linkStart) + mark + ' ' + markdown.substring(linkStart),
+            changed: true
+        };
+    }
+
+    /**
+     * 为失效链接添加状态标记（✅/❌），不替换链接URL
+     * 用于自动修复失败（0候选/多候选）的链接
+     * @param {string} docId - 文档ID
+     * @param {object} item - 失效链接项（来自 scanBrokenLinks 结果）
+     * @param {string} mark - 标记符号（'✅' 或 '❌'）
+     */
+    async _markBrokenLinkInDoc(docId, item, mark) {
+        var that = this;
+
+        try {
+            // 步骤1：获取文档的所有子块
+            var childResp = await fetch('/api/block/getChildBlocks', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: docId })
+            });
+            var childData = await childResp.json();
+            if (childData.code !== 0 || !childData.data) {
+                that._log('_markBrokenLinkInDoc: getChildBlocks failed, code=' + childData.code);
+                return;
+            }
+            var childBlocks = childData.data;
+
+            // 步骤2：找到包含旧链接的子块
+            var targetBlock = null;
+            var targetMatchUrl = null;
+            var oldUrl = item.oldUrl;
+
+            // 准备多种 URL 格式用于匹配（与 replaceLink 一致）
+            var oldUrlVariants = [oldUrl];
+            var decodedOldPath = oldUrl.replace(/^file:\/\//, '').replace(/\\/g, '/');
+            try { decodedOldPath = decodeURIComponent(decodedOldPath); } catch(e) {}
+            oldUrlVariants.push(that.localPathToFileUrl(decodedOldPath));
+            oldUrlVariants.push(oldUrl.replace(/ /g, '%20'));
+            oldUrlVariants.push(encodeURI(oldUrl).replace(/%25/g, '%'));
+            oldUrlVariants.push(oldUrl.replace('file:///', ''));
+            oldUrlVariants.push(oldUrl.replace('file:///', '').replace(/\//g, '\\'));
+
+            for (var i = 0; i < childBlocks.length; i++) {
+                var block = childBlocks[i];
+                if (!block.markdown) continue;
+
+                for (var v = 0; v < oldUrlVariants.length; v++) {
+                    if (block.markdown.indexOf(oldUrlVariants[v]) !== -1) {
+                        targetBlock = block;
+                        targetMatchUrl = oldUrlVariants[v];
+                        break;
+                    }
+                }
+                if (targetBlock) break;
+            }
+
+            if (!targetBlock) {
+                that._log('_markBrokenLinkInDoc: no block contains url', oldUrl);
+                return;
+            }
+
+            // 步骤3：在链接前添加标记
+            var oldMarkdown = targetBlock.markdown;
+            var markResult = that._addLinkMarkToMarkdown(oldMarkdown, targetMatchUrl, mark);
+            if (!markResult.changed) {
+                that._log('_markBrokenLinkInDoc: no change needed for', oldUrl);
+                return;
+            }
+
+            // 步骤4：更新子块
+            var updateResp = await fetch('/api/block/updateBlock', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    id: targetBlock.id,
+                    dataType: 'markdown',
+                    data: markResult.markdown
+                })
+            });
+            var updateData = await updateResp.json();
+            if (updateData.code !== 0) {
+                that._log('_markBrokenLinkInDoc: updateBlock failed, code=' + updateData.code);
+                return;
+            }
+            that._log('_markBrokenLinkInDoc: added mark ' + mark + ' for', item.fileName);
+        } catch (e) {
+            that._error('_markBrokenLinkInDoc error:', e);
+        }
+    }
+
+    /**
      * 替换文档中的链接
      * 修复v5：直接修改 block.markdown（思源真正的存储格式），用 dataType:'markdown' 更新
      * 旧版用 dataType:'dom' + DOM字符串替换，但思源内部用 Markdown 存储，
      * DOM 替换后内核从 Markdown 重新渲染会覆盖修改，导致替换不持久
      */
-    async replaceLink(docId, oldUrl, newLocalPath, itemIndex, context) {
+    async replaceLink(docId, oldUrl, newLocalPath, itemIndex, context, mark) {
         var that = this;
         var isSilent = context && context.silent;
 
@@ -17998,6 +23296,15 @@ class LocalBrowsePlugin extends Plugin {
                 return;
             }
             that._log('replaceLink: step3 markdown replacement succeeded');
+
+            // === 步骤3.5：添加链接状态标记（✅/❌） ===
+            if (mark) {
+                var markResult = that._addLinkMarkToMarkdown(newMarkdown, newUrlWithTimestamp, mark);
+                if (markResult.changed) {
+                    newMarkdown = markResult.markdown;
+                    that._log('replaceLink: added mark ' + mark + ' before link');
+                }
+            }
 
             // === 步骤4：用 dataType: 'markdown' 更新该子块 ===
             var updateResp = await fetch('/api/block/updateBlock', {
@@ -18912,6 +24219,15 @@ class LocalBrowsePlugin extends Plugin {
             homeEl.style.cursor = 'default';
             homeEl.style.textDecoration = '';
         }
+    }
+
+    /**
+     * ★ 面包屑自适应：CSS 已通过 flex-shrink + text-overflow:ellipsis 处理截断
+     *     此方法仅确保悬停时能显示完整路径名（title 已在渲染时设置）
+     */
+    _truncateBreadcrumb() {
+        // CSS handles truncation via flex-shrink + text-overflow:ellipsis
+        // Titles are already set during rendering — nothing to do here.
     }
 
     /**
